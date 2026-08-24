@@ -113,11 +113,17 @@ def ggml_moe_a8(
     row: int,
     top_k: int,
     tokens: int,
+    row_pitch_bytes: int = 0,
 ) -> torch.Tensor:
-    """MMQ grouped expert matmul over stacked experts ``weight[E, row, *]``."""
+    """MMQ grouped expert matmul over stacked experts ``weight[E, row, *]``.
+
+    The MMQ path is *not* pitch-aware -- ``row_pitch_bytes`` must stay 0 (rows
+    tightly packed at their native width). Padded-row banks go through
+    :func:`ggml_moe_a8_vec`.
+    """
     return _module().ggml_moe_a8(
         x, weight, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        quant_type, row, top_k, tokens,
+        quant_type, row, top_k, tokens, row_pitch_bytes,
     )
 
 
@@ -129,9 +135,20 @@ def ggml_moe_a8_vec(
     quant_type: int,
     row: int,
     tokens: int,
+    row_pitch_bytes: int = 0,
 ) -> torch.Tensor:
-    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``."""
-    return _module().ggml_moe_a8_vec(x, weight, topk_ids, top_k, quant_type, row, tokens)
+    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``.
+
+    ``row_pitch_bytes`` is the byte distance between consecutive expert rows in
+    ``weight``. The default 0 means "rows are tightly packed at their native
+    width" -- identical addressing to the upstream kernel. Pass a nonzero pitch
+    when the rows live in a bank padded to a uniform stride (e.g. one shared by
+    several quant types); it must be a multiple of ``quant_type``'s block size
+    and no narrower than the native packed row.
+    """
+    return _module().ggml_moe_a8_vec(
+        x, weight, topk_ids, top_k, quant_type, row, tokens, row_pitch_bytes
+    )
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:

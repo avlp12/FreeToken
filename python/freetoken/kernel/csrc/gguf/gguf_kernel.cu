@@ -332,6 +332,12 @@ torch::Tensor ggml_mul_mat_a8(
   return Y;
 }
 
+// NOTE: the MMQ (batched/prefill) grouped-expert path is NOT pitch-aware.
+// Its expert stride already comes from ``W.stride(0)``, but the per-row stride is
+// derived inside ``moe_q`` (moe.cuh) from ``ncols_x / qk`` and handed to the
+// ``load_tiles_*`` helpers that mmq.cuh's plain path shares. Padded-row banks must
+// therefore go through ``ggml_moe_a8_vec``; a nonzero pitch is rejected here
+// rather than silently mis-addressed.
 torch::Tensor ggml_moe_a8(
     torch::Tensor X,  // input
     torch::Tensor W,  // expert weights
@@ -341,7 +347,13 @@ torch::Tensor ggml_moe_a8(
     int64_t type,
     int64_t row,
     int64_t top_k,
-    int64_t tokens) {
+    int64_t tokens,
+    int64_t row_pitch_bytes) {
+  TORCH_CHECK(
+      row_pitch_bytes == 0,
+      "ggml_moe_a8 (MMQ path) does not support a padded row pitch; got row_pitch_bytes=",
+      row_pitch_bytes,
+      ". Use ggml_moe_a8_vec for banks with padded rows.");
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
@@ -538,6 +550,12 @@ torch::Tensor ggml_moe_a8(
   return Y;
 }
 
+// ``row_pitch_bytes`` is the distance in bytes between consecutive expert rows in
+// ``W``. 0 (the default, and what every pre-existing call site passes implicitly)
+// means "rows are tightly packed at their native width", i.e. exactly the
+// upstream behaviour. A nonzero pitch lets the weight live in a bank whose rows
+// are padded out to a uniform stride shared across quant types; it must be a
+// multiple of the dispatched type's block size (checked in moe_vec_resolve_pitch).
 torch::Tensor ggml_moe_a8_vec(
     torch::Tensor X,  // input
     torch::Tensor W,  // expert weights
@@ -545,7 +563,8 @@ torch::Tensor ggml_moe_a8_vec(
     int64_t top_k,
     int64_t type,
     int64_t row,
-    int64_t tokens) {
+    int64_t tokens,
+    int64_t row_pitch_bytes) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
@@ -568,6 +587,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 3:
@@ -581,6 +601,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 6:
@@ -594,6 +615,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 7:
@@ -607,6 +629,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 8:
@@ -620,6 +643,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 10:
@@ -633,6 +657,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 11:
@@ -646,6 +671,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 12:
@@ -659,6 +685,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 13:
@@ -672,6 +699,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 14:
@@ -685,6 +713,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 16:
@@ -698,6 +727,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 17:
@@ -711,6 +741,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 18:
@@ -724,6 +755,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 19:
@@ -737,6 +769,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 20:
@@ -750,6 +783,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 21:
@@ -763,6 +797,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 22:
@@ -776,6 +811,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 23:
@@ -789,6 +825,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
       case 29:
@@ -802,6 +839,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            row_pitch_bytes,
             stream);
         break;
     }
@@ -842,7 +880,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "");
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
-  m.def("ggml_moe_a8", &ggml_moe_a8, "");
-  m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");
+  m.def(
+      "ggml_moe_a8",
+      &ggml_moe_a8,
+      "",
+      py::arg("X"),
+      py::arg("W"),
+      py::arg("sorted_token_ids"),
+      py::arg("expert_ids"),
+      py::arg("num_tokens_post_padded"),
+      py::arg("type"),
+      py::arg("row"),
+      py::arg("top_k"),
+      py::arg("tokens"),
+      py::arg("row_pitch_bytes") = 0);
+  m.def(
+      "ggml_moe_a8_vec",
+      &ggml_moe_a8_vec,
+      "",
+      py::arg("X"),
+      py::arg("W"),
+      py::arg("topk_ids"),
+      py::arg("top_k"),
+      py::arg("type"),
+      py::arg("row"),
+      py::arg("tokens"),
+      py::arg("row_pitch_bytes") = 0);
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
 }
