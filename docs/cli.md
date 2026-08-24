@@ -40,6 +40,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
+| `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard the model over; one scheduler process per rank, rank `i` on `cuda:i` |
+| `--distributed-timeout` | 1800 | Seconds a TP collective waits before failing; sized for the per-rank skew in weight-load time |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |

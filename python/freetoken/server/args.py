@@ -222,6 +222,56 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-dspark",
+        action="store_true",
+        dest="speculative_dspark",
+        default=False,
+        help=(
+            "DeepSeek-V4 only: build the checkpoint's dSpark drafter (the mtp.* stack) "
+            "for block speculative decoding. Off by default because the drafter's own "
+            "routed experts enlarge the host expert banks and the GPU slot cache. Fails "
+            "at config time if the checkpoint ships no dSpark weights."
+        ),
+    )
+
+    parser.add_argument(
+        "--dspark-fallback-acceptance",
+        type=_parse_moe_cache_rate,
+        default=ServerArgs.dspark_fallback_acceptance,
+        help=(
+            "Experimental request-local DSpark fallback threshold in [0, 1]. "
+            "After measured proposal acceptance falls below this value, temporarily "
+            "use ordinary target decode; 0 disables the fallback."
+        ),
+    )
+
+    parser.add_argument(
+        "--dspark-fallback-min-drafted",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_min_drafted,
+        help="Minimum measured DSpark proposals before evaluating the fallback.",
+    )
+
+    parser.add_argument(
+        "--dspark-fallback-steps",
+        type=_positive_int,
+        default=ServerArgs.dspark_fallback_steps,
+        help="Ordinary target-decode steps before probing DSpark again.",
+    )
+
+    parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Seconds a tensor-parallel collective waits before failing. The first one is "
+            "the post-load memory all-reduce, which ranks reach minutes apart on a large "
+            "MoE checkpoint, so the default is sized for that load skew; lower it to make "
+            "a hung rank fail faster."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
