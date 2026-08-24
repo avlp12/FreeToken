@@ -39,7 +39,7 @@ class Gate(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, *, return_scores: bool = False):
         scores = bf16_linear_fp32(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -54,10 +54,28 @@ class Gate(nn.Module):
             indices = self.tid2eid[input_ids]
         else:
             indices = scores.topk(self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+        # Pre-renorm selection score: original_scores (post score_func, PRE the
+        # e-score load-balancing bias) gathered at the chosen indices. This is the
+        # same numerator `weights` below is built from, captured before the
+        # per-step renorm/route_scale -- so it stays >= 0 by construction
+        # (softplus/sigmoid/softmax are all non-negative) and, unlike `weights`
+        # (forced to sum to route_scale every step), is not warped by what else
+        # got selected that step. That is what makes it usable for cross-expert /
+        # cross-step thresholding (e.g. a lookahead prefetcher's "how confident is
+        # this pick" question), whereas `weights` only answers "how much of the
+        # combine does this pick get THIS step". `return_scores` gates the extra
+        # gather (already computed either way, so free) behind an explicit opt-in
+        # so the real per-layer routing call (`MoE.forward`'s `self.gate(x,
+        # flat_ids)`, on the CUDA-graph-captured decode path) is unchanged in
+        # both signature and cost; only the routing tracer's lookahead calls pass
+        # `return_scores=True`. See freetoken/moe/routing_trace.py.
+        sel_scores = original_scores.gather(1, indices)
+        weights = sel_scores
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
+        if return_scores:
+            return weights, indices, sel_scores
         return weights, indices
 
 

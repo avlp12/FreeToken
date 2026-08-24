@@ -41,11 +41,11 @@ Binary format (little endian)
 File header, 32 bytes, written once::
 
     magic         char[8]  b"FTROUTE1"
-    version       uint32   = 1
+    version       uint32   = 2
     n_layers      uint32   number of MoE layers traced (L)
     top_k         uint32   experts selected per layer (K)
     n_experts     uint32   routed experts per layer (for id-range sanity)
-    record_bytes  uint32   = 8 + L * 4 * K * 2
+    record_bytes  uint32   = 8 + L * 6 * K * 2
     reserved      uint32   = 0
 
 Then ``record_bytes``-sized records, one per traced decode step::
@@ -54,7 +54,7 @@ Then ``record_bytes``-sized records, one per traced decode step::
                            RECORDS (ring exhaustion), never reordering
     batch_size    uint16   decode batch size of the step (only row 0 is traced)
     flags         uint16   = 0
-    payload       int16[L][4][K]
+    payload       int16[L][6][K]
                      [L][0] actual top-k expert ids at layer L
                      [L][1] top-k ids predicted by layer L+1's router run on
                             layer L's router input  (-1 when L+1 does not exist)
@@ -62,9 +62,42 @@ Then ``record_bytes``-sized records, one per traced decode step::
                             layer L's router input  (-1 when L+2 does not exist)
                      [L][3] actual top-k gate weights, float16 BIT PATTERN
                             (reinterpret the int16 slots as float16)
+                     [L][4] pred_l1's top-k SCORES, float16 bit pattern,
+                            same (L+1) alignment as [L][1] (-1 int16, which
+                            reads back as NaN in float16, when L+1 does not
+                            exist)
+                     [L][5] pred_l2's top-k SCORES, float16 bit pattern,
+                            same (L+2) alignment as [L][2] (NaN sentinel
+                            when L+2 does not exist)
 
-For DeepSeek-V4-Flash (L=43, K=6) a record is 8 + 2064 = 2072 bytes, so the
-per-step D2H is 2064 bytes -- far below the 100KB budget.
+The score slots ([4]/[5]) hold ``Gate.forward``'s PRE-RENORM selection score
+(``original_scores.gather(indices)`` -- the same numerator the actual
+weight slot [3] is built from AT ITS OWN LAYER, just captured one step
+earlier in that function, before the per-step ``/ sum(...) * route_scale``
+renormalization). It is deliberately NOT the renormalized ``weights`` value
+``Gate.forward`` returns: that quantity is forced to sum to ``route_scale``
+every step, so identical raw affinity would read differently depending on
+what else got selected that step, which breaks the cross-expert /
+cross-step comparability a thresholding policy needs. The pre-renorm score
+is also guaranteed non-negative (softplus/sigmoid/softmax are all
+non-negative ranges), which the post-bias, pre-gather score actually used
+for top-k *selection* is not (the e-score load-balancing bias can go
+negative). See ``Gate.forward``'s ``return_scores`` kwarg in
+``freetoken/models/deepseek_v4/moe.py`` for the exact computation and the
+full comment. For the first ``n_hash_layers`` layers (hash routers: indices
+come from a token-id lookup table, not from any score) the gathered value
+is not a "confidence" for the pick that was made -- it is recorded anyway,
+for a uniform record layout; ``trace_reader.py`` flags this range in its
+sanity report rather than treating it as a selection score.
+
+Format version 1 (superseded) had no score slots: ``int16[L][4][K]`` with
+only actual ids / pred_l1 ids / pred_l2 ids / actual weights, 8 + L*4*K*2
+bytes/record. ``trace_reader.py`` still parses version-1 files (it just
+omits the score arrays for them).
+
+For DeepSeek-V4-Flash (L=43, K=6) a version-2 record is 8 + 3096 = 3104
+bytes, so the per-step D2H is 3096 bytes -- still far below the 100KB
+budget.
 
 See ``/root/trace_reader.py`` for the parser / analysis entry point.
 """
@@ -89,7 +122,7 @@ __all__ = [
 ]
 
 MAGIC = b"FTROUTE1"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # magic, version, n_layers, top_k, n_experts, record_bytes, reserved
 HEADER = struct.Struct("<8s6I")
@@ -101,7 +134,9 @@ SLOT_ACTUAL_IDS = 0
 SLOT_PRED_L1 = 1
 SLOT_PRED_L2 = 2
 SLOT_ACTUAL_W = 3
-N_SLOTS = 4
+SLOT_PRED_L1_SCORE = 4
+SLOT_PRED_L2_SCORE = 5
+N_SLOTS = 6
 
 # Pinned staging buffers. One is consumed per decode step and returned by the
 # writer thread once its copy event has completed; 256 x ~2KB is 0.5MB of pinned
@@ -236,12 +271,23 @@ class RoutingTracer:
         )
         # Which lookahead gates exist is a function of layer_id alone -- a
         # capture-time constant, not a device value. Nothing here branches on data.
-        for ahead, slot in ((1, SLOT_PRED_L1), (2, SLOT_PRED_L2)):
+        # ``return_scores=True`` asks the lookahead gate for its pre-renorm
+        # selection score alongside the ids it already computes -- see the
+        # module docstring and ``Gate.forward`` for why that quantity (rather
+        # than the renormalized weights the gate would normally return) is the
+        # one worth recording.
+        for ahead, id_slot, score_slot in (
+            (1, SLOT_PRED_L1, SLOT_PRED_L1_SCORE),
+            (2, SLOT_PRED_L2, SLOT_PRED_L2_SCORE),
+        ):
             gate = self._gates.get(layer_id + ahead)
             if gate is None:
                 continue
-            _, pred = gate(hidden, input_ids)
-            self._dev_i16[base, slot * k : (slot + 1) * k].copy_(pred[0, :k])
+            _, pred, pred_scores = gate(hidden, input_ids, return_scores=True)
+            self._dev_i16[base, id_slot * k : (id_slot + 1) * k].copy_(pred[0, :k])
+            self._dev_f16[base, score_slot * k : (score_slot + 1) * k].copy_(
+                pred_scores[0, :k]
+            )
 
     # ------------------------------------------------------------------
     # Host drain (post-replay)
