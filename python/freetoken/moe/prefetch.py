@@ -49,10 +49,12 @@ decode, expert rows 9.19 MiB, 43 layers, from ``moe-stats``::
                      real miss   spec     total rows   sustained
                      /layer      pulled   /layer       PCIe        tok/s
     off              2.742       --       2.742        24.2 GB/s   21.3
-    top-2, bpb 4     1.955       0.862    2.818        26.9 GB/s   23.4
-    top-3, bpb 4     1.689       1.226    2.915        28.5 GB/s   24.2   <- default
-    top-4, bpb 4     1.434       1.647    3.081        29.6 GB/s   24.2
+    top-2, bpb 4     1.955       0.862    2.818        27.3 GB/s   23.4
+    top-3, bpb 4     1.689       1.226    2.915        29.2 GB/s   24.2   <- default
+    top-4, bpb 4     1.434       1.647    3.081        30.9 GB/s   24.2
     all 6,  bpb 2    1.080       2.691    3.771        31.9 GB/s   20.4
+
+(bytes/token = 43 layers x rows x 9.19 MiB; GB/s = that over the measured step.)
 
 Read down the columns and the whole mechanism is visible. The lookahead genuinely
 predicts: every extra rank cuts real misses further, and at all six it removes 61% of
