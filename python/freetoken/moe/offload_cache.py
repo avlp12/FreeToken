@@ -357,6 +357,15 @@ class OffloadMoeCache:
 
     def _alloc_prefetch_plan(self) -> None:
         """(Re)allocate the second descriptor set; same shapes as the primary one."""
+        # Speculative counterpart of lru_stats, accumulated by the SAME flashlib
+        # kernel in the same launch: ACTIVE = distinct ids the lookahead predicted,
+        # MISS = how many of them were not resident and therefore actually crossed
+        # PCIe on the forked stream, CALLS = prefetch ensures. Together with the real
+        # path's lru_stats this is what makes realized prefetch value measurable at
+        # the server: rows pulled speculatively vs real misses removed.
+        self.prefetch_stats = torch.zeros(
+            (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
+        )
         plan_slots = max(self.num_experts, self.cache_size)
         self.prefetch_evict_slots = torch.empty(
             (plan_slots,), dtype=torch.int32, device=self.device
@@ -1045,6 +1054,8 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()
+        if self.prefetch_enabled:
+            self.prefetch_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1086,7 +1097,7 @@ class OffloadMoeCache:
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
-        return {
+        out = {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
@@ -1100,6 +1111,24 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+        if self.prefetch_enabled:
+            # Speculation's own ledger. ``pf_pulled_per_layer`` is the rows the forked
+            # stream moved; ``missing_per_layer`` above is what the real path still had
+            # to move. Their SUM is the step's true PCIe cost -- the number that decides
+            # whether prefetch can pay off at all on a bandwidth-bound decode -- and
+            # ``pf_pulled + missing`` compared against a prefetch-off run's
+            # ``missing_per_layer`` is the realized value of the lookahead.
+            p_active, p_miss, p_calls = (int(x) for x in self.prefetch_stats.sum(0))
+            out.update({
+                "pf_calls": p_calls,
+                "pf_predicted_per_layer": (p_active / p_calls) if p_calls else 0.0,
+                "pf_pulled_per_layer": (p_miss / p_calls) if p_calls else 0.0,
+                "pf_rows_per_layer_total": (
+                    (p_miss / p_calls if p_calls else 0.0)
+                    + (missing / calls if calls else 0.0)
+                ),
+            })
+        return out
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.
@@ -1306,6 +1335,14 @@ def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
         layer.offload_cache = cache
         if hasattr(layer, "prefetcher"):
             layer.prefetcher = prefetcher
+    if prefetcher is not None:
+        # Say something even when nothing is skipped: every eligibility term is a
+        # boot-time constant, so this one line is the definitive answer to "is the
+        # feature going to run at all", which silence could not distinguish from
+        # "the code never got as far as evaluating a layer".
+        logger.info_rank0(
+            "MoE prefetch: " + prefetcher.describe(cache, [ly.layer_id for ly in layers])
+        )
     return layers
 
 

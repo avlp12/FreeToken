@@ -40,6 +40,35 @@ Ordering rules the implementation preserves:
 * the real path's single-buffered miss plan is never read or written by the
   prefetch path -- that is what the second descriptor set on the cache is for.
 
+Why a rank limit (FREETOKEN_PREFETCH_TOPK) exists
+-------------------------------------------------
+Measured on this box, DSV4-Flash q2_k_ud, 740 slots, 399-token decode
+(``moe-stats``, expert rows are 9.19 MiB each, 43 layers)::
+
+                       real misses   speculative   total rows   sustained
+                       /layer/step   pulled        /layer/step  PCIe        tok/s
+    prefetch off       2.742         --            2.742        24.2 GB/s   21.3
+    prefetch on (all 6) 1.080        2.691         3.771        31.9 GB/s   20.4
+
+The prediction works: real misses fall 61%, and the fork does overlap -- it pushes
+the link from 24.2 GB/s to 31.9 GB/s, which is this platform's measured zero-copy
+ceiling. Both halves of the design do exactly what they were built to do.
+
+It still nets zero, because decode here is **bandwidth** bound, not latency bound.
+Speculating on all six predictions moves 37.5% more bytes; the fork wins back 32%
+more bandwidth; the two cancel. Of the 2.691 rows pulled speculatively only ~1.66
+were rows the real path would otherwise have fetched -- the other ~1.03 are
+mispredictions, paid for in full at the one resource that is already exhausted.
+
+So the useful knob is not the fork, it is how much speculation to buy. Truncating to
+the highest-scoring predictions keeps the ones most likely to be right and drops the
+tail that costs bytes without removing misses. ``FREETOKEN_PREFETCH_TOPK=N`` pulls
+only the top N of each layer's prediction (0 = all). The break-even is where total
+rows/layer stays at or below the prefetch-off figure while the fork keeps the higher
+bandwidth: at 24.2 -> 31.9 GB/s, moving the OFF byte count at the ON bandwidth would
+be ~28 tok/s, so anything that buys back the overlap without the waste is worth real
+throughput.
+
 Keep-wrong semantics
 --------------------
 A mispredicted admission stays in the cache as an ordinary LRU entry. There is no
@@ -95,6 +124,8 @@ once-logged -- the same decision on every step, so it stays capture-safe.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.utils import init_logger
@@ -102,6 +133,13 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 __all__ = ["MoePrefetcher", "get_prefetcher"]
+
+# How many of the lookahead router's top-k predictions to actually pull, per layer.
+# 0 = all of them. See the "Why a rank limit" section of the module docstring: on a
+# bandwidth-saturated link the low-ranked predictions cost more in wasted bytes than
+# the misses they remove, so this is the knob that decides whether the feature is a
+# win or a wash.
+TOPK_ENV = "FREETOKEN_PREFETCH_TOPK"
 
 
 class MoePrefetcher:
@@ -124,6 +162,13 @@ class MoePrefetcher:
         # popped by the join so an aborted forward cannot leave a stale one.
         self._armed: dict[int, bool] = {}
         self._skipped: set[int] = set()
+        # Layers a fork was actually enqueued for, ever. Under CUDA graphs `schedule`
+        # only runs while the graph is being traced, so a non-empty set is proof the
+        # fork/join nodes are IN the captured decode graph -- the one thing a server
+        # log otherwise cannot tell you.
+        self.scheduled: set[int] = set()
+        raw = os.getenv(TOPK_ENV, "").strip()
+        self.topk_limit = int(raw) if raw else 0
 
     # ------------------------------------------------------------------ registry
     def register_gate(
@@ -156,39 +201,67 @@ class MoePrefetcher:
         self._gates[layer_id] = gate
 
     # ------------------------------------------------------------- eligibility
-    def _eligible(self, cache, src: int, dst: int) -> bool:
-        """Whether layer ``src`` may prefetch layer ``dst``'s experts.
+    def ineligible_reason(self, cache, src: int, dst: int) -> str | None:
+        """Why layer ``src`` may not prefetch layer ``dst``, or None if it may.
 
         Every term is a host-side, capture-time constant (registry membership,
         cache configuration), so the answer is identical on every step of a
-        captured graph -- which is what makes the fork edges static.
+        captured graph -- which is what makes the fork edges static, and what lets
+        :meth:`describe` report the whole picture at attach time, before a single
+        decode has run.
         """
-        if src not in self._gates or dst not in self._gates:
-            return False
+        if src not in self._gates:
+            return f"layer {src} registered no lookahead Gate"
+        if dst not in self._gates:
+            return f"layer {dst} registered no lookahead Gate (last MoE layer?)"
         if cache is None or cache.prefetch_stream is None:
-            return False
+            return "the cache allocated no prefetch stream (feature off, or CPU device)"
         # hybrid caps the real fetch on purpose (the CPU absorbs the overflow); an
         # uncapped speculative pull would spend exactly the PCIe budget that cap
         # exists to protect. CPU layers never touch the slot cache at all.
         if cache.decode_target != "gpu":
-            return False
+            return f"decode_target is {cache.decode_target!r}, not 'gpu'"
         if cache.is_cpu_layer(src) or cache.is_cpu_layer(dst):
-            return False
+            return "one of the two layers decodes on the CPU executor"
         if cache.is_unpinned_layer(dst):
-            return False
+            return f"layer {dst}'s host banks are not pinned"
         # The copy-engine doorbell owns the main stream's copy protocol end to end
         # (staged mirrors + a spin kernel); it has no second-plan equivalent.
         if cache.dma_service is not None:
-            return False
+            return "--moe-copy-engine owns the copy path"
         # blocks_per_bank -- the whole reason the forked pull overlaps at all --
         # only exists on the fused multi-bank kernel.
         if not cache._copy_fused_ok:
-            return False
-        return True
+            return "the fused multi-bank copy plan is unavailable"
+        return None
+
+    def _eligible(self, cache, src: int, dst: int) -> bool:
+        return self.ineligible_reason(cache, src, dst) is None
 
     def prefetches(self, cache, layer_id: int) -> bool:
         """Whether ``layer_id`` schedules a prefetch of ``layer_id + 1``."""
         return self._eligible(cache, layer_id, layer_id + 1)
+
+    def describe(self, cache, layer_ids) -> str:
+        """One-line boot summary: how many layers will prefetch, and why not the rest.
+
+        Logged unconditionally from ``attach_offload_moe_cache`` whenever the feature
+        is enabled. Silence used to be ambiguous -- no skip lines could mean "all
+        good" or "nothing ever got as far as evaluating a layer" -- so the enabled
+        case now always says something.
+        """
+        ok, reasons = [], {}
+        for layer_id in layer_ids:
+            why = self.ineligible_reason(cache, layer_id, layer_id + 1)
+            if why is None:
+                ok.append(layer_id)
+            else:
+                reasons.setdefault(why, []).append(layer_id)
+        parts = [f"{len(ok)}/{len(layer_ids)} MoE layers prefetch L+1"]
+        for why, ids in reasons.items():
+            span = f"{ids[0]}..{ids[-1]}" if len(ids) > 3 else ",".join(map(str, ids))
+            parts.append(f"{len(ids)} skipped ({span}): {why}")
+        return "; ".join(parts)
 
     def _skip_once(self, dst: int, reason: str) -> None:
         if dst not in self._skipped:
@@ -223,7 +296,15 @@ class MoePrefetcher:
             return
 
         # Lookahead router -- MAIN stream, serialized with every other ensure.
-        _weights, predicted = self._gates[dst](hidden, input_ids)
+        gate = self._gates[dst]
+        _weights, predicted = gate(hidden, input_ids)
+        # Rank limit: keep only the highest-scoring predictions, which are the ones
+        # most likely to be right. A hash router is exact by construction (it is a
+        # token-id lookup, not a function of the hidden state) and its ids carry no
+        # score order, so it is never truncated -- every row it names would have been
+        # fetched by the real path anyway.
+        if self.topk_limit and not getattr(gate, "hash", False):
+            predicted = predicted[..., : self.topk_limit]
         k = predicted.numel()
         if cache.cache_size < 4 * k:
             self._skip_once(
@@ -249,6 +330,7 @@ class MoePrefetcher:
             cache.prefetch_copy()
         done_event.record(branch)
         self._armed[dst] = True
+        self.scheduled.add(dst)
 
     def join(self, cache, layer_id: int) -> None:
         """Order this layer's MoE block behind the pull scheduled for it one layer ago.

@@ -66,7 +66,7 @@ class _FakeGate(torch.nn.Module):
         return scores.gather(1, idx), idx.to(torch.int32)
 
 
-def _build(prefetch: bool):
+def _build(prefetch: bool, topk_limit: int = 0):
     from freetoken.moe.offload_cache import MOE_PREFETCH_ENV, OffloadMoeCache
     from freetoken.moe.prefetch import MoePrefetcher
 
@@ -104,6 +104,10 @@ def _build(prefetch: bool):
 
     gates = [_FakeGate(i, dev) for i in range(NUM_LAYERS)]
     pf = MoePrefetcher()
+    # Pinned, not inherited from the ambient FREETOKEN_PREFETCH_TOPK: these tests
+    # assert on how many rows the speculation pulls, so the rank limit has to be a
+    # parameter of the test rather than of whatever environment it runs in.
+    pf.topk_limit = topk_limit
     for i, g in enumerate(gates):
         pf.register_gate(i, g, n_layers=NUM_LAYERS, top_k=TOP_K, n_experts=NUM_EXPERTS)
     return cache, gates, (pf if prefetch else None)
@@ -118,8 +122,9 @@ class _Workload:
         mix: float = 0.0,
         mm_iters: int = 1,
         serial: bool = False,
+        topk_limit: int = 0,
     ) -> None:
-        self.cache, self.gates, self.pf = _build(prefetch)
+        self.cache, self.gates, self.pf = _build(prefetch, topk_limit)
         dev = torch.device("cuda")
         self.dev = dev
         self.hidden = torch.zeros(1, DIM, dtype=torch.bfloat16, device=dev)
@@ -288,6 +293,49 @@ def test_prefetch_removes_real_misses():
     # A mispredicting lookahead must still be a genuine prediction attempt (not a
     # no-op) and must not make the real path worse than not prefetching at all.
     assert sum(wrong[1:]) > sum(exact[1:]), (exact, wrong)
+
+
+@CUDA
+@pytest.mark.slow
+def test_rank_limit_trades_misses_for_bytes():
+    """FREETOKEN_PREFETCH_TOPK must actually reduce the rows the speculation pulls.
+
+    On a bandwidth-saturated link that trade is the whole ballgame -- the server-level
+    finding was that speculating on all six predictions moves 37.5% more bytes and
+    cancels the bandwidth the fork wins back. ``pf_pulled_per_layer`` (real misses
+    removed) and ``missing_per_layer`` (misses left) are the two halves of it, and
+    both come from the same stats path the server dumps.
+    """
+    from flashlib.kernels.slot_cache import Stat
+
+    def measure(topk_limit: int) -> tuple[float, float]:
+        w = _Workload(True, mix=0.5, topk_limit=topk_limit)
+        w.cache.collect_stats = True
+        g = torch.Generator(device="cpu").manual_seed(11)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                w.step()
+            w.cache.reset()
+            w.cache.lru_stats.zero_()
+            w.cache.prefetch_stats.zero_()
+            for _ in range(8):
+                w.hidden.copy_(torch.randn(1, DIM, generator=g).to(w.dev).bfloat16())
+                w.step()
+        torch.cuda.synchronize()
+        stats = w.cache.decode_miss_stats()
+        return stats["missing_per_layer"], stats["pf_pulled_per_layer"]
+
+    full_miss, full_pull = measure(0)
+    lim_miss, lim_pull = measure(2)
+    print(
+        f"\nrank limit: all-{TOP_K} -> misses {full_miss:.2f} + pulled {full_pull:.2f} "
+        f"= {full_miss + full_pull:.2f} rows; "
+        f"top-2 -> {lim_miss:.2f} + {lim_pull:.2f} = {lim_miss + lim_pull:.2f} rows"
+    )
+    assert lim_pull < full_pull, "the rank limit did not reduce speculative pulls"
+    assert lim_miss > full_miss, "fewer predictions must leave more real misses"
+    assert Stat.MISS == 1  # the column pf_pulled_per_layer reads
 
 
 @CUDA

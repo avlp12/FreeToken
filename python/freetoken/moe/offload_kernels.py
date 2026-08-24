@@ -56,8 +56,10 @@ def prefetch_ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> N
     the public ``lru_ensure`` signature already takes as caller-owned outputs. No
     flashlib change is needed and none was made.
 
-    ``stats=None`` compiles the accumulation out: ``lru_stats`` measures the REAL
-    routing's hit/miss rate and must not be polluted by speculative admissions.
+    Stats go to ``prefetch_stats``, never ``lru_stats``: the latter measures the REAL
+    routing's hit/miss rate and has to stay comparable against a prefetch-off run.
+    The former is what makes the speculation itself measurable -- its MISS column is
+    exactly the number of rows the forked pull will move over PCIe.
     """
     lru_ensure(
         expert_ids,
@@ -69,7 +71,7 @@ def prefetch_ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> N
         cache.prefetch_src_indices,
         cache.prefetch_evict_slots,
         cache.prefetch_num_indices,
-        stats=None,
+        stats=cache.prefetch_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
     )
 
