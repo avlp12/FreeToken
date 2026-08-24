@@ -194,6 +194,7 @@ class OffloadMoeCache:
         # must be enabled before capture — see engine graph setup). The only graph artifact
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
+        self.dma_service = None  # --moe-copy-engine: DmaCopyService (see bottom of module)
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
         # the kernel, which accumulates in the same launch. The stat_* tensors below stay
         # for the hybrid path, whose kernel is still ours.
@@ -937,10 +938,20 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def enable_dma_copy(self) -> None:
+        """Switch decode miss copies to the copy-engine DMA doorbell path
+        (--moe-copy-engine). Must run after set_bank_sources and before CUDA-graph
+        capture (the staged D2H mirrors + spin kernel are captured into the graphs)."""
+        assert self.banks, "enable_dma_copy needs the banks registered first"
+        self.dma_service = DmaCopyService(self)
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.dma_service is not None:
+            self.dma_service.stage_and_wait(layer_id)
+            return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -1000,3 +1011,161 @@ def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     for layer in layers:
         layer.offload_cache = cache
     return layers
+
+
+class DmaCopyService:
+    """--moe-copy-engine: replace the zero-copy pull kernel with copy-engine DMA.
+
+    The in-graph side (stage_and_wait) bumps a device epoch, mirrors the staged miss
+    list (evict_slots/src_indices/num_indices/layer) to pinned host memory with the epoch
+    written LAST (same stream => the host sees a consistent snapshot when the doorbell
+    value changes), then holds the compute stream in a spin kernel until the ack. A host
+    daemon polls the doorbell, issues one cudaMemcpyAsync per (bank, row) on a private
+    copy stream, and acks by copying the epoch into the device done-flag on that same
+    stream -- stream order guarantees every row landed before the spin releases. No host
+    sync anywhere; everything in the graph has fixed shapes, so capture/replay is safe.
+
+    Rationale: the pull kernel gathers host rows with SM loads at ~21 GB/s on this class
+    of machine and blocks the SMs while doing it; the copy engines sustain ~39 GB/s and
+    run concurrently with compute (measured; see the fork notes). Protocol overhead is
+    ~75us per layer (doorbell detect + ack), far below the ~0.8ms/layer it saves.
+    """
+
+    def __init__(self, cache: "OffloadMoeCache") -> None:
+        import threading
+
+        self.cache = cache
+        dev = cache.device
+        n = cache.num_experts
+        pin = torch.cuda.is_available()
+        self.d_epoch = torch.zeros(1, dtype=torch.int64, device=dev)
+        self.d_layer = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.d_done = torch.zeros(1, dtype=torch.int64, device=dev)
+        self.h_epoch = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        self.h_layer = torch.zeros(1, dtype=torch.int32, pin_memory=pin)
+        self.h_num = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        self.h_slots = torch.zeros(n, dtype=torch.int32, pin_memory=pin)
+        self.h_rows = torch.zeros(n, dtype=torch.int32, pin_memory=pin)
+        self.h_ack = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        self.copy_stream = torch.cuda.Stream(device=dev)
+        self.stopped = False
+        # Set (with self.dead_error) by the daemon's exception path if it dies; checked
+        # by stage_and_wait so a dead daemon fails loudly on its NEXT call instead of
+        # bumping the epoch and spinning forever against a service that will never ack.
+        self.dead = False
+        self.dead_error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._serve, name="ft-dma-copy", daemon=True)
+        self._thread.start()
+
+    # ---- in-graph side (called under capture and at replay) ----
+    def stage_and_wait(self, layer_id: int) -> None:
+        from freetoken.moe.offload_kernels import dma_epoch_bump, dma_spin_wait
+
+        if self.dead:
+            raise RuntimeError(
+                "ft-dma-copy service thread has died; refusing to stage another DMA "
+                f"doorbell (would spin forever waiting for an ack nobody will send). "
+                f"Original failure: {self.dead_error!r}"
+            ) from self.dead_error
+        c = self.cache
+        dma_epoch_bump(self.d_epoch, self.d_layer, layer_id)
+        # Mirror the staged miss list; the epoch is copied LAST as the doorbell.
+        self.h_slots.copy_(c.evict_slots, non_blocking=True)
+        self.h_rows.copy_(c.src_indices, non_blocking=True)
+        self.h_num.copy_(c.num_indices, non_blocking=True)
+        self.h_layer.copy_(self.d_layer, non_blocking=True)
+        self.h_epoch.copy_(self.d_epoch, non_blocking=True)
+        dma_spin_wait(self.d_done, self.d_epoch)
+        # Eager-only throttle: outside CUDA-graph capture, drain this round before
+        # returning. NOT a workaround for the spin kernel's own correctness (that part
+        # is fine, verified by /root/test_dma_doorbell.py's eager x50 + capture + 3
+        # replays) -- it works around a submission-queue deadlock reproduced on this
+        # platform (RTX 5090 / WSL2 GPU-PV / WDDM) in PURE EAGER mode with no capture
+        # involved at all: a caller that issues many stage_and_wait rounds back to back
+        # with zero host synchronization (exactly what a real, fully-async
+        # model.forward() eager warmup pass does across dozens of MoE layers) can race
+        # far enough ahead of the GPU that the host's own un-drained kernel-launch
+        # backlog starves the daemon thread's tiny ack write of submission-queue space
+        # -- and the ack is the only thing that can ever retire the backlog, so it
+        # deadlocks permanently (see /root/test_stage_wait_debug.py, which catches the
+        # host mid-hang with h_epoch/h_ack pinned at layer 0 forever, 47 more layers
+        # already queued). cuStreamWaitValue64 (a stream memop serviced by the queue
+        # itself, sidestepping this class of backlog) was evaluated and is NOT usable
+        # on this platform: CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS reads 0 here
+        # (verified via /root/test_stream_memop.py) -- a documented WDDM/GeForce (non-
+        # TCC) limitation, not something this fix can route around.
+        #
+        # Once graphs are captured, this branch never runs during replay: a captured
+        # graph replays as ONE atomic driver submission regardless of how many MoE
+        # layers/doorbell rounds it contains, so the "host races ahead across many
+        # separate submissions" precondition for the deadlock does not exist on the
+        # steady-state (replay) path -- only genuinely eager calls (warmup, capture
+        # prep, and any batch size that never gets a captured graph) need throttling.
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize(c.device)
+
+    # ---- host daemon ----
+    def _serve(self) -> None:
+        import time
+
+        # The slot caches are inference tensors (the engine builds everything under
+        # torch.inference_mode()); this thread must enter the same mode to write them.
+        with torch.inference_mode():
+            self._serve_inner(time)
+
+    def _serve_inner(self, time) -> None:
+        last = 0
+        h_epoch = self.h_epoch
+        while not self.stopped:
+            e = int(h_epoch[0])
+            if e == last:
+                time.sleep(0)  # yield the GIL; the poll itself is a pinned-memory read
+                continue
+            last = e
+            try:
+                n = int(self.h_num[0])
+                L = int(self.h_layer[0])
+                with torch.cuda.stream(self.copy_stream):
+                    if n > 0:
+                        slots = self.h_slots[:n].tolist()
+                        rows = self.h_rows[:n].tolist()
+                        for per_layer, slot_cache in self.cache.banks:
+                            src = per_layer[L]
+                            for s, r in zip(slots, rows):
+                                slot_cache[s].copy_(src[r], non_blocking=True)
+                    self.h_ack[0] = e
+                    self.d_done.copy_(self.h_ack, non_blocking=True)
+            except Exception as exc:
+                import logging
+
+                logging.getLogger(__name__).exception("ft-dma-copy service failed")
+                # Mark dead BEFORE attempting recovery: even if the recovery ack below
+                # also fails, stage_and_wait's NEXT call must see this and raise instead
+                # of staging a doorbell nobody will ever answer.
+                self.dead = True
+                self.dead_error = exc
+                try:
+                    # Best-effort: unblock whichever spin kernel is currently waiting
+                    # (this epoch's, mid-flight) so a caller blocked on THIS round
+                    # observes progress and moves on to raise on its next call, rather
+                    # than the compute stream spinning forever. Failure here (e.g. the
+                    # original exception was itself a CUDA error, so the context may
+                    # already be unusable) must not crash this handler -- the `dead`
+                    # flag above already guarantees no future caller re-enters the spin.
+                    with torch.cuda.stream(self.copy_stream):
+                        self.h_ack[0] = e
+                        self.d_done.copy_(self.h_ack, non_blocking=True)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "ft-dma-copy service: recovery ack after failure also failed "
+                        "(a spin kernel already in flight for this epoch may still "
+                        "hang; every subsequent stage_and_wait call will raise)"
+                    )
+                # The service cannot be trusted to keep serving doorbells correctly
+                # after an unexpected failure -- stop instead of looping back into
+                # `while not self.stopped` and potentially masking further errors.
+                return
+
+    def stop(self) -> None:
+        self.stopped = True

@@ -753,6 +753,11 @@ class Engine:
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
         cache.collect_decode_freq = config.moe_collect_stats
+        if getattr(config, "moe_copy_engine", False) and cache.banks:
+            cache.enable_dma_copy()
+            logger.info_rank0(
+                "MoE copy engine enabled: decode miss copies use DMA + doorbell "
+                "instead of the zero-copy pull kernel")
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)

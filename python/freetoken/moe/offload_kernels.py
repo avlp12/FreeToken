@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
+
+if TYPE_CHECKING:
+    from tvm_ffi import Module
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) first fetches misses used by the most routes in THIS
@@ -441,3 +446,50 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+# ---------------------------------------------------------------- DMA copy-engine path
+# Doorbell protocol for --moe-copy-engine (see offload_cache.DmaCopyService): the graph
+# increments a device epoch and mirrors the miss list to pinned host memory; a host
+# service thread issues copy-engine DMAs and acks by writing the epoch to a device flag
+# via the same copy stream (stream order => rows land before the ack); a spin kernel
+# holds the compute stream until the ack. All shapes fixed -> CUDA-graph capturable.
+#
+# Both kernels below are plain CUDA C++ via load_jit, deliberately NOT triton (see
+# kernel/csrc/jit/dma_spin.cuh for the full rationale and the kernels themselves).
+# Summary: the spin kernel must re-read device memory on every iteration to observe a
+# write from a *different host thread's* CUDA stream, which a C++ `volatile` pointer
+# dereference guarantees and triton's `tl.load(ptr, volatile=True)` only conventionally
+# provides; and -- found while reproducing the actual --moe-copy-engine boot hang (see
+# /root/test_stage_wait_debug.py) -- triton kernel LAUNCHES are not safe in this hot
+# path at all: with the spin kernel already converted to C++, the doorbell protocol
+# still deadlocked in plain eager mode (no CUDA graph capture) once enough
+# back-to-back, unsynchronized doorbell rounds queued up that the DmaCopyService daemon
+# thread had real copy backlog. A watchdog thread-stack dump caught the MAIN thread
+# stuck inside triton's `compiler.py:_init_handles` (via `launch_metadata`), invoked
+# from the epoch-bump kernel's launch -- triton's lazy per-launch handle/module
+# (re)initialization does not tolerate this concurrent, backlogged, multi-threaded CUDA
+# usage pattern on this platform (RTX 5090 / WSL2 GPU-PV / WDDM). Swapping that one
+# launch for a non-triton op made the identical repro pass cleanly, so both kernels
+# route through load_jit/tvm-ffi instead (the same launch path already used elsewhere
+# in this codebase for other hot, repeatedly launched kernels).
+@lru_cache(maxsize=None)
+def _jit_dma_doorbell_module() -> "Module":
+    from freetoken.kernel.utils import load_jit
+
+    return load_jit(
+        "dma_doorbell",
+        cuda_files=["dma_spin.cuh"],
+        cuda_wrappers=[
+            ("dma_epoch_bump_cpp", "dma_epoch_bump_cpp"),
+            ("dma_spin_wait_cpp", "dma_spin_wait_cpp"),
+        ],
+    )
+
+
+def dma_epoch_bump(epoch: torch.Tensor, layer_out: torch.Tensor, layer_id: int) -> None:
+    _jit_dma_doorbell_module().dma_epoch_bump_cpp(epoch, layer_out, layer_id)
+
+
+def dma_spin_wait(done: torch.Tensor, epoch: torch.Tensor) -> None:
+    _jit_dma_doorbell_module().dma_spin_wait_cpp(done, epoch)

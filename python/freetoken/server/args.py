@@ -365,6 +365,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-copy-engine",
+        action="store_true",
+        default=ServerArgs.moe_copy_engine,
+        help=(
+            "Experimental: fetch decode expert misses with copy-engine DMA driven by a "
+            "host service thread (doorbell protocol) instead of the SM zero-copy pull "
+            "kernel. ~2x the transfer rate on PCIe zero-copy-slow platforms (WSL2)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-collect-stats",
         action="store_true",
         default=ServerArgs.moe_collect_stats,

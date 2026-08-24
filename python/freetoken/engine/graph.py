@@ -320,7 +320,31 @@ class GraphRunner:
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                #
+                # capture_error_mode="thread_local": torch.cuda.graph()'s default is
+                # "global", which extends capture-safety restrictions to EVERY thread
+                # in the process for as long as this stream is capturing -- not just
+                # this (capturing) thread. --moe-copy-engine's DmaCopyService runs a
+                # persistent background daemon thread that issues real cudaMemcpyAsync
+                # work on its own, uninvolved copy stream whenever it services a
+                # doorbell; if that background activity is still in flight (e.g. from
+                # the eager warmup call directly above, or any other eager MoE forward)
+                # exactly as this capture begins, global mode poisons the capture with
+                # a "previous error during capture" (cudaErrorStreamCaptureInvalidated)
+                # -- confirmed in isolation, see /root/test_capture_mode.py (global/
+                # default mode: fails; thread_local/relaxed: clean). The doorbell
+                # protocol's own DmaCopyService.stage_and_wait() now drains fully
+                # before returning from any genuinely eager call (see the
+                # capture-vs-eager throttle there), which should keep this window
+                # closed in practice for --moe-copy-engine specifically -- but
+                # thread_local is correct regardless: it is what THIS thread's own
+                # capture actually needs (the daemon's independent stream was never
+                # going to be part of the graph anyway), and it removes the hazard for
+                # any other concurrent background CUDA activity in the process, not
+                # just this one caller.
+                with torch.cuda.graph(
+                    graph, pool=pool, stream=self.stream, capture_error_mode="thread_local"
+                ):
                     self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             get_features = getattr(model, "dspark_target_features", None)
@@ -384,7 +408,13 @@ class GraphRunner:
                         else:
                             shared_carry.reset(active_rows)
                             batch.spec_carry_states = shared_carry
-                        with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        # See the capture_error_mode note on the main decode capture
+                        # above: this daemon-thread-vs-capture hazard applies equally
+                        # to the spec-decode capture path.
+                        with torch.cuda.graph(
+                            graph, pool=pool, stream=self.stream,
+                            capture_error_mode="thread_local",
+                        ):
                             self.spec_buffer.logits[:tokens] = model.forward()
                         self._reset_moe_offload_cache()
                     if shared_carry is None and adaptive_single_req:
