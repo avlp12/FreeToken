@@ -23,6 +23,12 @@ class DeepseekV4Args:
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
     expert_dtype: Literal[None, "fp4"] = "fp4"
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
+    # --expert-gguf: serve the routed experts from this GGUF (a single ``.gguf`` or a
+    # split-shard directory) instead of the checkpoint's FP4 safetensors. Set by the
+    # engine at config-resolution time onto the ONE args instance ModelConfig carries,
+    # which is also the instance the expert-bank provider reads -- unlike dspark_enabled,
+    # no other call site's freshly-loaded args needs to see it.
+    expert_gguf_path: str | None = None
 
     # ----- shape -----
     vocab_size: int = 129280

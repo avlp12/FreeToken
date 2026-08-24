@@ -75,6 +75,12 @@ class ExpertBanks:
     down_alpha: torch.Tensor | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
+    # ``{bank name: [ggml type id per layer]}`` for formats whose banks hold rows of
+    # DIFFERENT quant types across layers at one uniform pitch (q2_k_ud). The kernel
+    # takes the type per call, so the layer must know which one its rows decode as; the
+    # engine copies these onto the OffloadMoELayers after attaching the cache. None for
+    # every single-type format (its one type is a constant in the format's wrapper).
+    quant_types: dict[str, list[int]] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -282,6 +288,37 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _q2_k_ud_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q2_k_ud: the experts live in a split-GGUF "
+            "shard set (not safetensors), so the common reader doesn't apply -- it needs a "
+            "GGUF-native parallel reader (parse each shard's tensor table, chunked O_DIRECT)"
+        )
+    from freetoken.models.deepseek_v4.gguf_experts import load_q2k_ud_expert_sources
+
+    args = model_config.dsv4_args
+    assert args is not None, "q2_k_ud expert banks require dsv4_args on the model config"
+    gguf_path = getattr(args, "expert_gguf_path", None)
+    assert gguf_path or dummy, (
+        "q2_k_ud expert banks need the GGUF path in dsv4_args.expert_gguf_path "
+        "(set from --expert-gguf); see engine._apply_expert_gguf"
+    )
+    # Native GGUF IQ2_XS/IQ3_XXS (and Q2_K-re-encoded) routed experts: packed block bytes
+    # streamed to the GPU and dequantized inside the borrowed ggml MoE kernels. Written
+    # as-loaded -> streamable (dummy fabricates in one shot, so it is never streamed).
+    # quant_types travels with the banks: unlike every other format, a layer's rows do NOT
+    # all share one ggml type, so the GEMV's per-call type is per layer, not per format.
+    sink = None if dummy else layer_sink
+    banks, quant_types = load_q2k_ud_expert_sources(
+        gguf_path, args, dummy=dummy, layer_sink=sink
+    )
+    return ExpertBanks(
+        "q2_k_ud", {name: banks[name] for name in _BANK_SCHEMAS["q2_k_ud"]},
+        quant_types=quant_types, streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -355,6 +392,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "q2_k_ud": _q2_k_ud_banks,
 }
 
 
