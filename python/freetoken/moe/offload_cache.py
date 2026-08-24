@@ -45,6 +45,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF unsloth UD-Q2_K_XL DeepSeek-V4 experts: gate/up rows in IQ2_XS
+    # (256-elem block, 74B), down rows in IQ3_XXS (256-elem block, 98B; layers 26/42
+    # are MXFP4 but re-encoded to the same 98B/row IQ3_XXS pitch by a later stage),
+    # packed block bytes per output row, dequantized inside the borrowed ggml MoE
+    # kernels. gate_up [L*E, 2I, H//256*74], down [L*E, H, I//256*98].
+    "q2_k_ud": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -83,6 +89,7 @@ _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + ((2 * I // 128) * (H // 128) + (H // 128) * (I // 128)) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "q2_k_ud": lambda H, I: 2 * I * (H // 256 * 74) + H * (I // 256 * 98),
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
