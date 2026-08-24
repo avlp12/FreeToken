@@ -95,7 +95,10 @@ class Scheduler(SchedulerIOMixin):
             from freetoken.kvcache.host_kv_tier import HostKVTier, host_kv_dir
 
             _p = self.engine.kv_cache
+            import os as _os
+
             _fp = (
+                f"{_os.path.basename(_os.path.normpath(config.model_path))}:"
                 f"{_p.num_layers}:{_p.head_dim}:{_p.index_head_dim}:{_p.P}:"
                 f"{hash(tuple(_p.compress_ratios)) & 0xFFFFFFFF:x}"
             )
