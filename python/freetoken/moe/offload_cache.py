@@ -1194,6 +1194,12 @@ class OffloadMoeCache:
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
+            # blocks_per_bank is FREETOKEN_COPY_BPB (default 8, the kernel's own
+            # value): the serial path's grid is a measured tradeoff between
+            # saturating PCIe and occupying SMs, and the production default was
+            # never swept at these shapes. Exposed so it can be A/B'd without a
+            # code change -- and so the serial and forked pulls have independent
+            # knobs, since they want opposite things (see prefetch_bpb).
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
@@ -1201,6 +1207,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                blocks_per_bank=self.copy_bpb,
             )
             return
 
