@@ -491,5 +491,83 @@ def dma_epoch_bump(epoch: torch.Tensor, layer_out: torch.Tensor, layer_id: int) 
     _jit_dma_doorbell_module().dma_epoch_bump_cpp(epoch, layer_out, layer_id)
 
 
-def dma_spin_wait(done: torch.Tensor, epoch: torch.Tensor) -> None:
-    _jit_dma_doorbell_module().dma_spin_wait_cpp(done, epoch)
+def dma_spin_wait(done_addr: int, epoch: torch.Tensor) -> None:
+    """``done_addr``: the GPU-visible mapped address of the ack flag (a PINNED HOST
+    int64), from ``freetoken.kernel.pinned.device_ptr`` -- NOT a device tensor. See
+    kernel/csrc/jit/dma_spin.cuh's file comment for why the ack must be zero-copy
+    rather than a normal device buffer updated via cudaMemcpyAsync."""
+    _jit_dma_doorbell_module().dma_spin_wait_cpp(int(done_addr), epoch)
+
+
+# ------------------------------------------------------------- DMA copy-engine daemon
+# Round 2: the host side of the doorbell (previously a Python thread, see
+# offload_cache.DmaCopyService._serve) is ALSO not safe to leave in Python. Real-
+# hardware replay of a captured graph carrying many doorbell rounds deadlocked even
+# after round 1's fixes: `cudaGraphLaunch` for a multi-round graph can itself block
+# inside the driver under the same WDDM/GPU-PV submission-queue pressure, and -- unlike
+# a documented blocking call such as cudaStreamSynchronize -- a normally-async graph
+# launch has no established reason for PyTorch's binding to release the GIL around it.
+# If it doesn't, the Python daemon thread can never run again (not even to read a
+# pinned int), so it never sees the doorbell and never acks: spin waits on the ack: the
+# ack needs Python; Python needs the GIL; the GIL is held by the blocked launch; the
+# launch is blocked behind the spin. A plain std::thread never touches the GIL at all,
+# so it can't be starved by it -- see kernel/csrc/jit/dma_service.cuh for the daemon
+# loop itself (same protocol as the old Python one: poll the pinned epoch, issue
+# cudaMemcpyAsync per (bank, row) on its own stream). The GIL fix alone was not
+# sufficient, though: see dma_spin.cuh's file comment for why the ack itself had to
+# stop being a CUDA API call (a bare pinned-host store instead) to actually resolve
+# the real-hardware replay hang.
+@lru_cache(maxsize=None)
+def _jit_dma_service_module() -> "Module":
+    from freetoken.kernel.utils import load_jit
+
+    return load_jit(
+        "dma_service",
+        cuda_files=["dma_service.cuh"],
+        cuda_wrappers=[
+            ("dma_service_start", "dma_service_start"),
+            ("dma_service_stop", "dma_service_stop"),
+        ],
+    )
+
+
+def dma_service_start(
+    host_ptrs: torch.Tensor,
+    row_bytes: torch.Tensor,
+    slot_ptrs: torch.Tensor,
+    h_epoch: torch.Tensor,
+    h_layer: torch.Tensor,
+    h_num: torch.Tensor,
+    h_slots: torch.Tensor,
+    h_rows: torch.Tensor,
+    h_ack: torch.Tensor,
+    h_error: torch.Tensor,
+    num_layers: int,
+    num_banks: int,
+    max_rows: int,
+    device_id: int,
+) -> int:
+    """Start the C++ doorbell daemon; returns an opaque handle for dma_service_stop.
+
+    ``host_ptrs`` is a CPU int64 tensor [num_banks, num_layers] of each bank/layer's
+    host source row-array base address (``per_layer[L].data_ptr()``); ``row_bytes`` a
+    CPU int64 [num_banks] of each bank's per-row byte size; ``slot_ptrs`` a CPU int64
+    [num_banks] of each bank's device slot-cache base address. The pinned h_* tensors
+    are the same mirrors/doorbell machinery DmaCopyService.stage_and_wait writes into;
+    the daemon acks by writing directly into ``h_ack`` (a bare host store -- see
+    dma_spin.cuh, which reads it back through its GPU-visible mapped alias, not a
+    separate device buffer). ``h_error`` is a zero-initialized pinned int64 flag the
+    daemon sets (non-zero) instead of raising in a thread nothing is watching for
+    exceptions.
+    """
+    return int(
+        _jit_dma_service_module().dma_service_start(
+            host_ptrs, row_bytes, slot_ptrs, h_epoch, h_layer, h_num, h_slots, h_rows,
+            h_ack, h_error, int(num_layers), int(num_banks), int(max_rows),
+            int(device_id),
+        )
+    )
+
+
+def dma_service_stop(handle: int) -> None:
+    _jit_dma_service_module().dma_service_stop(int(handle))

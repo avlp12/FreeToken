@@ -754,10 +754,30 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         cache.collect_decode_freq = config.moe_collect_stats
         if getattr(config, "moe_copy_engine", False) and cache.banks:
-            cache.enable_dma_copy()
-            logger.info_rank0(
-                "MoE copy engine enabled: decode miss copies use DMA + doorbell "
-                "instead of the zero-copy pull kernel")
+            from freetoken.moe.offload_cache import moe_copy_engine_safe_with_graphs
+
+            if moe_copy_engine_safe_with_graphs(
+                cuda_graph_bs=getattr(config, "cuda_graph_bs", None),
+                cuda_graph_max_bs=getattr(config, "cuda_graph_max_bs", None),
+                force_env_value=os.getenv("FREETOKEN_MOE_COPY_ENGINE_FORCE_WITH_GRAPHS"),
+            ):
+                cache.enable_dma_copy()
+                logger.info_rank0(
+                    "MoE copy engine enabled: decode miss copies use DMA + doorbell "
+                    "instead of the zero-copy pull kernel")
+            else:
+                # See moe_copy_engine_safe_with_graphs's docstring for the full
+                # WDDM/GPU-PV submission-channel deadlock this avoids.
+                logger.warning_rank0(
+                    "--moe-copy-engine requested but CUDA graphs are enabled: the "
+                    "copy-engine DMA doorbell deadlocks under CUDA-graph replay on "
+                    "this platform (WSL2 GPU-PV / WDDM submission-channel behavior; "
+                    "see offload_cache.moe_copy_engine_safe_with_graphs and "
+                    "/root/test_dma_graph_replay.py). Falling back to the zero-copy "
+                    "pull kernel for the graphed decode path. Set "
+                    "FREETOKEN_MOE_COPY_ENGINE_FORCE_WITH_GRAPHS=1 to force it anyway "
+                    "(NOT recommended -- will hang on capture/replay)."
+                )
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)

@@ -32,6 +32,36 @@
 // replacing it with this kernel (going through the same load_jit/tvm-ffi launch path
 // already used elsewhere in this codebase for exactly this kind of hot, repeatedly
 // launched kernel) removes triton from the doorbell path entirely.
+//
+// Round 2 (found while reproducing a real-hardware graph-REPLAY hang, see
+// /root/test_dma_graph_replay.py): even with a GIL-free C++ daemon (dma_service.cuh),
+// a CAPTURED graph chaining 2+ doorbell rounds together still deadlocks on its SECOND
+// round, every time, regardless of total round count (4 through 48 all fail
+// identically) -- so this was never about queue *depth*/backlog volume. The daemon's
+// ack was correctly computed and its cudaMemcpyAsync issued (h_ack caught up to
+// h_epoch), yet the compute stream never advanced past round 1's spin kernel. The only
+// thing that changed between "ack computed" and "ack visible to the spin kernel" is
+// that writing it required ANOTHER GPU command (a D2H->H2D relay through `d_done`,
+// issued on the daemon's own stream) to actually execute on the device -- and that
+// command was submitted, chronologically, *after* the entire multi-round graph's
+// launch. On this platform's WDDM/GPU-PV submission model that is apparently enough
+// for it to queue behind commands that logically cannot run yet (round 2+'s kernels,
+// already enqueued by the single cudaGraphLaunch call but blocked on round 1), even
+// though those commands live on a completely different stream -- a true circular wait
+// at the driver/queue level, independent of the GIL or which thread issues the ack.
+//
+// The fix: the ack no longer goes through the command queue at all. `done_ptr` here is
+// the GPU-visible alias of a *pinned host* tensor (computed once via
+// freetoken.kernel.pinned.device_ptr, which is exactly the same host/device pointer
+// translation the pre-existing zero-copy pull kernel already relies on for its bulk
+// reads -- proven to work on this platform, just applied here to one 8-byte flag
+// instead of multi-MB expert rows). The daemon acks with a bare host memory store
+// (`h_ack[0] = e`; no cudaMemcpyAsync, no stream, no queue entry whatsoever); this
+// kernel's `volatile` read of the SAME physical memory, from the GPU side, sees it via
+// ordinary PCIe/NVLink host<->device cache coherency -- the same mechanism that makes
+// zero-copy mapped memory work at all. Nothing about the epoch side needed to change:
+// it is bumped by this stream's own dma_epoch_bump kernel and read back by this same
+// kernel, a pure device-to-device dependency with no cross-queue relay involved.
 
 namespace {
 
@@ -43,11 +73,13 @@ __global__ void dma_epoch_bump_kernel(int64_t* epoch_ptr, int32_t* layer_ptr, in
     *layer_ptr = layer_id;
 }
 
-__global__ void dma_spin_wait_kernel(const int64_t* done_ptr, const int64_t* epoch_ptr) {
+__global__ void dma_spin_wait_kernel(int64_t done_addr, const int64_t* epoch_ptr) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
-    auto* done = reinterpret_cast<const volatile int64_t*>(done_ptr);
+    // `done_addr` is a raw address (the mapped-host alias of the daemon's ack flag),
+    // not a tvm-ffi tensor -- see the file comment above for why.
+    auto* done = reinterpret_cast<const volatile int64_t*>(done_addr);
     auto* epoch = reinterpret_cast<const volatile int64_t*>(epoch_ptr);
     // Both sides of the comparison are re-read through `volatile` every iteration
     // (not just `done`): epoch is bumped once by dma_epoch_bump strictly before this
@@ -83,13 +115,11 @@ inline void dma_epoch_bump_cpp(
         dma_epoch_bump_kernel, epoch_ptr, layer_ptr, static_cast<int32_t>(layer_id));
 }
 
-inline void dma_spin_wait_cpp(tvm::ffi::TensorView done, tvm::ffi::TensorView epoch) {
+inline void dma_spin_wait_cpp(int64_t done_addr, tvm::ffi::TensorView epoch) {
     using namespace host;
     auto device = SymbolicDevice{};
     auto dtype = SymbolicDType{};
-    TensorMatcher({1}).with_dtype<int64_t>(dtype).with_device<kDLCUDA>(device).verify(done);
     TensorMatcher({1}).with_dtype<int64_t>(dtype).with_device<kDLCUDA>(device).verify(epoch);
-    const auto* done_ptr = static_cast<const int64_t*>(done.data_ptr());
     const auto* epoch_ptr = static_cast<const int64_t*>(epoch.data_ptr());
-    LaunchKernel(1, 1, device.unwrap())(dma_spin_wait_kernel, done_ptr, epoch_ptr);
+    LaunchKernel(1, 1, device.unwrap())(dma_spin_wait_kernel, done_addr, epoch_ptr);
 }

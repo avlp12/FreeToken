@@ -1006,6 +1006,51 @@ def iter_offload_moe_layers(model) -> Iterator:
                 yield from iter_offload_moe_layers(item)
 
 
+def moe_copy_engine_safe_with_graphs(
+    cuda_graph_bs: list | None,
+    cuda_graph_max_bs: int | None,
+    force_env_value: str | None = None,
+) -> bool:
+    """Whether it is safe to enable_dma_copy() given this run's CUDA-graph settings.
+
+    DmaCopyService's doorbell relies on a host daemon thread servicing a doorbell that
+    is captured, along with everything else, INSIDE the CUDA graph -- and on this
+    platform (WSL2 GPU-PV / WDDM), replaying a graph that chains 2+ such rounds
+    together deadlocks permanently: an in-flight cudaGraphLaunch appears to occupy the
+    whole per-process submission channel until the ENTIRE graph retires, so the
+    daemon's own copy-engine DMA (needed to satisfy round 1's wait, which is what would
+    let the graph advance to round 2) never gets a turn -- GPU pinned at 100% (the spin
+    kernel, still polling) with 0% memory bandwidth (nothing ever actually moves). This
+    reproduces with a from-scratch graph of 4 through 48 chained rounds regardless of
+    round count -- it is not a queue-*depth* problem -- and neither a GIL-independent
+    C++ daemon (dma_service.cuh) nor a zero-copy, no-CUDA-call ack (dma_spin.cuh)
+    resolves it: even the daemon's row-copy cudaMemcpyAsync calls, issued from a stream
+    that has existed and worked fine since before capture, get stuck the same way once
+    a multi-round graph is in flight. See /root/test_dma_graph_replay.py.
+
+    Until CUDA-graph capture can be chunked to at most one doorbell round per graph (a
+    GraphRunner-level change well beyond DmaCopyService), silently enabling
+    --moe-copy-engine whenever CUDA graphs are also enabled reproduces the exact boot
+    hang the copy-engine DMA path exists to fix. ``cuda_graph_bs``/``cuda_graph_max_bs``
+    are the same-named EngineConfig fields; graphs count as "enabled" under the exact
+    default-vs-disabled semantics GraphRunner itself uses
+    (``_determine_cuda_graph_bs``): an explicit empty ``cuda_graph_bs`` list, or a
+    ``cuda_graph_max_bs`` < 1, means disabled; anything else (including the common case
+    of both left at their defaults) means enabled. ``force_env_value`` is the raw
+    ``FREETOKEN_MOE_COPY_ENGINE_FORCE_WITH_GRAPHS`` string (or None); a recognized
+    truthy value overrides the refusal, e.g. once graph chunking exists, or on a
+    platform without this WDDM/GPU-PV submission-channel limitation.
+    """
+    graphs_enabled = not (
+        cuda_graph_bs == []
+        or (cuda_graph_max_bs is not None and cuda_graph_max_bs < 1)
+    )
+    if not graphs_enabled:
+        return True
+    forced = (force_env_value or "").strip().lower() in ("1", "true", "yes", "on")
+    return forced
+
+
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
     for layer in layers:
@@ -1029,6 +1074,29 @@ class DmaCopyService:
     of machine and blocks the SMs while doing it; the copy engines sustain ~39 GB/s and
     run concurrently with compute (measured; see the fork notes). Protocol overhead is
     ~75us per layer (doorbell detect + ack), far below the ~0.8ms/layer it saves.
+
+    Daemon backend: by default the doorbell is served by a C++ std::thread (see
+    kernel/csrc/jit/dma_service.cuh), started once here and never touching Python again
+    -- it cannot be starved of the GIL, which matters because a CUDA-graph REPLAY of a
+    graph carrying many doorbell rounds can itself block for a while inside the driver
+    (WDDM/GPU-PV submission-queue pressure) with no documented reason for PyTorch to
+    release the GIL around a normally-async graph-launch call.
+
+    The GIL fix alone was not enough, though (see /root/test_dma_graph_replay.py): a
+    captured graph chaining 2+ rounds together deadlocked on its SECOND round even with
+    a GIL-free daemon, every time, regardless of total round count. The daemon's ack
+    was being computed correctly, but delivering it via a cudaMemcpyAsync command (on
+    the daemon's own stream) could still get stuck behind the *rest of the same
+    multi-round graph's* command stream, already enqueued by one cudaGraphLaunch call
+    -- a real driver/queue-ordering circular wait, not a host-scheduling one. So the
+    ack (h_ack) is no longer relayed through a device buffer via a CUDA API call at
+    all: the daemon writes it with a bare pinned-host memory store, and the spin kernel
+    reads that SAME memory through its GPU-visible mapped alias (see dma_spin.cuh) --
+    the same host/device pointer mechanism the pre-existing zero-copy pull kernel
+    already relies on, just applied to one 8-byte flag instead of bulk expert rows.
+
+    Set FREETOKEN_DMA_SERVICE_PY=1 to fall back to the plain Python thread (kept for
+    A/B debugging; not safe under CUDA-graph replay with 2+ chained rounds).
     """
 
     def __init__(self, cache: "OffloadMoeCache") -> None:
@@ -1040,33 +1108,90 @@ class DmaCopyService:
         pin = torch.cuda.is_available()
         self.d_epoch = torch.zeros(1, dtype=torch.int64, device=dev)
         self.d_layer = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.d_done = torch.zeros(1, dtype=torch.int64, device=dev)
         self.h_epoch = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
         self.h_layer = torch.zeros(1, dtype=torch.int32, pin_memory=pin)
         self.h_num = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
         self.h_slots = torch.zeros(n, dtype=torch.int32, pin_memory=pin)
         self.h_rows = torch.zeros(n, dtype=torch.int32, pin_memory=pin)
+        # The ack/"done" flag: pinned host memory, acked by a bare host store (no CUDA
+        # API call -- see the class docstring), and read by the spin kernel through its
+        # GPU-visible mapped alias (self._h_ack_addr) rather than a separate device
+        # buffer.
         self.h_ack = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        if dev.type == "cuda":
+            from freetoken.kernel.pinned import device_ptr
+
+            self._h_ack_addr = device_ptr(self.h_ack)
+        else:
+            self._h_ack_addr = 0
+        # Set by the daemon (C++ writes it directly with a plain host store; the Python
+        # fallback thread writes it too, see _serve_inner) if it dies; polled by
+        # stage_and_wait/_refresh_dead so a dead daemon fails loudly on its NEXT call
+        # instead of bumping the epoch and spinning forever against a service that will
+        # never ack. 0 == alive; non-zero == dead (a cudaError_t code, or a small
+        # negative sentinel for a protocol/setup failure -- see dma_service.cuh).
+        self.h_error = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
         self.copy_stream = torch.cuda.Stream(device=dev)
         self.stopped = False
-        # Set (with self.dead_error) by the daemon's exception path if it dies; checked
-        # by stage_and_wait so a dead daemon fails loudly on its NEXT call instead of
-        # bumping the epoch and spinning forever against a service that will never ack.
         self.dead = False
         self.dead_error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._serve, name="ft-dma-copy", daemon=True)
-        self._thread.start()
+        self._thread: "threading.Thread | None" = None
+        self._native_handle = 0
+
+        use_py = os.getenv("FREETOKEN_DMA_SERVICE_PY", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if use_py or dev.type != "cuda":
+            self._thread = threading.Thread(
+                target=self._serve, name="ft-dma-copy", daemon=True)
+            self._thread.start()
+        else:
+            self._start_native(cache, dev, n)
+
+    def _start_native(self, cache: "OffloadMoeCache", dev: torch.device, n: int) -> None:
+        from freetoken.moe.offload_kernels import dma_service_start
+
+        assert cache.banks, "DmaCopyService needs cache.banks populated before start"
+        num_banks = len(cache.banks)
+        num_layers = len(cache.banks[0][0])
+        host_ptrs = torch.zeros(num_banks, num_layers, dtype=torch.int64)
+        row_bytes = torch.zeros(num_banks, dtype=torch.int64)
+        slot_ptrs = torch.zeros(num_banks, dtype=torch.int64)
+        for b, (per_layer, slot_cache) in enumerate(cache.banks):
+            assert len(per_layer) == num_layers, "ragged per-layer bank list"
+            for layer_id, source in enumerate(per_layer):
+                host_ptrs[b, layer_id] = source.data_ptr()
+            row_bytes[b] = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            slot_ptrs[b] = slot_cache.data_ptr()
+        device_id = dev.index if dev.index is not None else torch.cuda.current_device()
+        self._native_handle = dma_service_start(
+            host_ptrs, row_bytes, slot_ptrs,
+            self.h_epoch, self.h_layer, self.h_num, self.h_slots, self.h_rows,
+            self.h_ack, self.h_error,
+            num_layers, num_banks, n, device_id,
+        )
+
+    def _refresh_dead(self) -> None:
+        if self.dead:
+            return
+        if self._native_handle and int(self.h_error[0]) != 0:
+            self.dead = True
+            self.dead_error = RuntimeError(
+                f"ft-dma-copy native service reported error code {int(self.h_error[0])} "
+                "(a cudaError_t, or a negative setup/protocol sentinel -- see "
+                "dma_service.cuh)"
+            )
 
     # ---- in-graph side (called under capture and at replay) ----
     def stage_and_wait(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import dma_epoch_bump, dma_spin_wait
 
+        self._refresh_dead()
         if self.dead:
             raise RuntimeError(
-                "ft-dma-copy service thread has died; refusing to stage another DMA "
-                f"doorbell (would spin forever waiting for an ack nobody will send). "
-                f"Original failure: {self.dead_error!r}"
+                "ft-dma-copy service has died; refusing to stage another DMA doorbell "
+                f"(would spin forever waiting for an ack nobody will send). Original "
+                f"failure: {self.dead_error!r}"
             ) from self.dead_error
         c = self.cache
         dma_epoch_bump(self.d_epoch, self.d_layer, layer_id)
@@ -1076,7 +1201,7 @@ class DmaCopyService:
         self.h_num.copy_(c.num_indices, non_blocking=True)
         self.h_layer.copy_(self.d_layer, non_blocking=True)
         self.h_epoch.copy_(self.d_epoch, non_blocking=True)
-        dma_spin_wait(self.d_done, self.d_epoch)
+        dma_spin_wait(self._h_ack_addr, self.d_epoch)
         # Eager-only throttle: outside CUDA-graph capture, drain this round before
         # returning. NOT a workaround for the spin kernel's own correctness (that part
         # is fine, verified by /root/test_dma_doorbell.py's eager x50 + capture + 3
@@ -1134,8 +1259,17 @@ class DmaCopyService:
                             src = per_layer[L]
                             for s, r in zip(slots, rows):
                                 slot_cache[s].copy_(src[r], non_blocking=True)
-                    self.h_ack[0] = e
-                    self.d_done.copy_(self.h_ack, non_blocking=True)
+                # The ack is a bare host store (see the class docstring: relaying it via
+                # a device buffer + cudaMemcpyAsync is what caused the real-hardware
+                # graph-replay deadlock), which is NOT ordered against the row copies
+                # above the way a same-stream cudaMemcpyAsync ack used to be for free.
+                # Make that ordering explicit: block until every row copy has actually
+                # landed before the ack becomes visible, so a caller unblocked by it can
+                # trust the rows are really there. Only waits on this daemon's own small
+                # copy_stream, not the compute stream's graph, so it isn't exposed to
+                # the same submission-queue pressure this design avoids.
+                self.copy_stream.synchronize()
+                self.h_ack[0] = e
             except Exception as exc:
                 import logging
 
@@ -1145,17 +1279,18 @@ class DmaCopyService:
                 # of staging a doorbell nobody will ever answer.
                 self.dead = True
                 self.dead_error = exc
+                self.h_error[0] = 1  # keep the pinned flag consistent with self.dead
                 try:
                     # Best-effort: unblock whichever spin kernel is currently waiting
                     # (this epoch's, mid-flight) so a caller blocked on THIS round
                     # observes progress and moves on to raise on its next call, rather
-                    # than the compute stream spinning forever. Failure here (e.g. the
-                    # original exception was itself a CUDA error, so the context may
-                    # already be unusable) must not crash this handler -- the `dead`
-                    # flag above already guarantees no future caller re-enters the spin.
-                    with torch.cuda.stream(self.copy_stream):
-                        self.h_ack[0] = e
-                        self.d_done.copy_(self.h_ack, non_blocking=True)
+                    # than the compute stream spinning forever. A bare host store (see
+                    # above) -- not a CUDA API call -- so this cannot itself get stuck
+                    # in a queue even if the device/stream state is already unusable,
+                    # which is the point of a *best-effort* recovery. The `dead` flag
+                    # above already guarantees no future caller re-enters the spin
+                    # regardless of whether this succeeds.
+                    self.h_ack[0] = e
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "ft-dma-copy service: recovery ack after failure also failed "
@@ -1167,5 +1302,21 @@ class DmaCopyService:
                 # `while not self.stopped` and potentially masking further errors.
                 return
 
+    def service_alive(self) -> bool:
+        """True if the daemon (either backend) is still expected to be serving."""
+        self._refresh_dead()
+        if self.dead:
+            return False
+        if self._native_handle:
+            return True
+        return self._thread is not None and self._thread.is_alive()
+
     def stop(self) -> None:
         self.stopped = True
+        if self._native_handle:
+            from freetoken.moe.offload_kernels import dma_service_stop
+
+            dma_service_stop(self._native_handle)
+            self._native_handle = 0
+        if self._thread is not None:
+            self._thread.join(timeout=5)
