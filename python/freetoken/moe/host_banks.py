@@ -17,6 +17,7 @@ The mmaps are held for the process lifetime (the banks live as long as the offlo
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import math
 import mmap
@@ -28,18 +29,18 @@ from enum import Enum
 
 import torch
 
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
+
 _BLK = 4096  # O_DIRECT alignment (page size)
 
 
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
-    ``PINNED`` (cudaHostRegister'd) is required for anything the GPU dereferences:
-    the decode gather kernels and the DMA prefill copies. ``LOCKED`` (VirtualLock /
-    mlock: resident for the CPU executor, but with no device address) and
-    ``PAGEABLE`` are reserved for platforms where the pin quota cannot cover every
-    layer (Windows/WDDM); their movement paths are not implemented here -- layers
-    with either class must be served by the CPU executor.
+    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
+    The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
     """
 
     PINNED = "pinned"
@@ -52,48 +53,92 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+def _env_born_pinned() -> bool | None:
+    """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
+    v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
+    if not v:
+        return None
+    return v in ("1", "true", "yes", "on")
+
+
+def born_pinned_default() -> bool:
+    """Whether PINNED serving banks use cudaHostAlloc instead of mmap + register-after-fill.
+
+    Off by default: registered mmaps already read at the PCIe roofline and lazy mmaps commit pages only on fill. ``FREETOKEN_BANK_CUDA_ALLOC`` overrides."""
+    env = _env_born_pinned()
+    if env is not None:
+        return env
+    return False
+
 
 class HostBank:
-    """A lazily-allocated, page-aligned host buffer + its torch view, registered on demand.
+    """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
-    Allocate -> fill (write real data, or O_DIRECT read into it) -> ``pin()``. The mmap is
-    rounded up to the O_DIRECT block so chunked reads are always aligned; ``tensor`` views
-    exactly ``nbytes``."""
+    * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
+    * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_off", "_reg_len", "_pinned")
+    The buffer is rounded up to the O_DIRECT block and carved to an EXPLICITLY 4096-aligned
+    base; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_off", "_reg_len", "_pinned", "_locked")
+
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
+                 *, backing: str | None = None):
+        if backing is None:
+            plan = _requested_residency
+            # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
+            born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
+            backing = "cuda" if born else "mmap"
+        assert backing in ("mmap", "cuda"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
-        # `_reg_len` is what actually gets cudaHostRegister'd / O_DIRECT'd: the byte count
-        # rounded up to the block size.
+        # `_reg_len` is what actually gets cudaHostRegister'd / O_DIRECT'd / mlock'd: the
+        # byte count rounded up to the block size.
         self._reg_len = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        # Over-allocate by one extra block and slice to an EXPLICITLY 4096-aligned base
-        # (rather than relying on the backing allocator happening to page-align its
-        # returns). anonymous mmap(2) is page-aligned by contract on every platform this
-        # runs on today, so `off` is 0 in practice -- but computing it explicitly turns
-        # that from an incidental property of mmap into an asserted invariant of
-        # HostBank, so a future allocator swap (a custom pool, a huge-page backend, ...)
-        # cannot silently reintroduce the PCIe-transaction-straddle regression: the SM
-        # zero-copy pull kernel (fast_index_copy_multi_jit) reads host expert rows at
-        # 46-47 GB/s when row bases are 4KB-aligned but only 20.7-23.8 GB/s when they sit
-        # at a 64B phase, because every expert row inherits whatever phase the bank's
-        # base has (row byte counts are themselves exact 4KB multiples).
-        self._buf = mmap.mmap(-1, self._reg_len + _BLK)  # lazy: address space only, no resident pages yet
-        _LIVE_BUFFERS.append(self._buf)
-        raw_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
-        self._off = (-raw_addr) % _BLK
-        self.addr = raw_addr + self._off
-        assert self.addr % _BLK == 0, f"HostBank base {self.addr:#x} not {_BLK}-aligned"
+        # Over-allocate by one extra block and slice to an EXPLICITLY 4096-aligned base on
+        # BOTH backings (rather than relying on the allocator happening to page-align its
+        # returns): anonymous mmap(2) is page-aligned by contract, but cudaHostAlloc only
+        # guarantees ~512B alignment in practice. Computing the aligned base explicitly
+        # turns alignment from an incidental allocator property into an asserted invariant
+        # of HostBank, so a future allocator swap cannot silently reintroduce the
+        # PCIe-transaction-straddle regression: the SM zero-copy pull kernel
+        # (fast_index_copy_multi_jit) reads host expert rows at 46-47 GB/s when row bases
+        # are 4KB-aligned but only 20.7-23.8 GB/s when they sit at a 64B phase, because
+        # every expert row inherits whatever phase the bank's base has (row byte counts
+        # are themselves exact 4KB multiples).
+        if backing == "cuda":
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+
+            # the numpy buffer keeps the pinned storage alive via .base
+            raw = alloc_pinned_tensor(self._reg_len + _BLK, dtype=torch.uint8)  # cudaMallocHost
+            raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
+            self._buf = raw.numpy()
+            raw_addr = raw.data_ptr()
+            self._off = (-raw_addr) % _BLK
+            self.addr = raw_addr + self._off
+            assert self.addr % _BLK == 0
+            self._pinned = True  # born pinned+mapped; pin() is a no-op
+        else:
+            self._buf = mmap.mmap(-1, self._reg_len + _BLK)  # lazy: address space only, no resident pages yet
+            _LIVE_BUFFERS.append(self._buf)
+            raw_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._off = (-raw_addr) % _BLK
+            self.addr = raw_addr + self._off
+            assert self.addr % _BLK == 0, f"HostBank base {self.addr:#x} not {_BLK}-aligned"
+            self._pinned = False
         self.tensor = torch.frombuffer(
             self._buf, dtype=dtype, count=self.nbytes // elsize, offset=self._off
         ).view(*shape)
         assert self.tensor.data_ptr() == self.addr
-        self._pinned = False
+        self._locked = False
 
     @property
     def residency(self) -> HostResidency:
-        return HostResidency.PINNED if self._pinned else HostResidency.PAGEABLE
+        if self._pinned:
+            return HostResidency.PINNED
+        if self._locked:
+            return HostResidency.LOCKED
+        return HostResidency.PAGEABLE
 
     def memoryview(self) -> memoryview:
         """The bank's bytes, from its (4096-aligned) ``addr`` -- NOT the raw over-allocated
@@ -102,8 +147,12 @@ class HostBank:
         return memoryview(self._buf)[self._off:self._off + self._reg_len]
 
     def pin(self) -> None:
-        """cudaHostRegister the (now-filled, resident) buffer -- pin-after-fill."""
+        """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
+
+        ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
         if self._pinned:
+            return
+        if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
             return
         from freetoken.kernel.pinned import host_register
 
@@ -116,20 +165,59 @@ class HostBank:
         self._pinned = True
 
     def release(self) -> None:
-        """Drop the buffer's resident pages (address space stays valid; contents
-        become undefined). Only for buffers that are done being read -- the
-        converter releases each layer after writing it out."""
-        assert not self._pinned, "cannot release a pinned bank"
+        """Drop the resident pages; the address space stays valid, the contents become undefined.
+
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        if self._pinned:
+            return
         self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
-        """Make the buffer resident without a device mapping (VirtualLock/mlock).
+        """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
-        Platform-specific and not implemented here. A locked bank layer is
-        CPU-executor-readable but must never be handed to the GPU movement
-        paths.
-        """
-        raise NotImplementedError("HostBank.lock() is platform-specific and not implemented")
+        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
+        if self._locked or self._pinned:  # cudaHostRegister already page-locks
+            return
+        global _os_lock_failed
+        if _os_lock_failed:
+            return  # the quota is exhausted for good; skip the syscall spam
+        try:
+            _os_lock(self.addr, self._reg_len)
+        except (OSError, ImportError) as exc:
+            _os_lock_failed = True
+            logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
+            return
+        self._locked = True
+
+
+_os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
+_os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
+
+
+def _os_lock(addr: int, nbytes: int) -> None:
+    global _os_locked_total
+    import resource
+
+    # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
+    want = _os_locked_total + nbytes + (256 << 20)
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft != resource.RLIM_INFINITY and soft < want:
+        new_soft = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if new_soft > soft:
+            try:
+                resource.setrlimit(resource.RLIMIT_MEMLOCK, (new_soft, hard))
+            except (OSError, ValueError):
+                pass  # keep the old limit; mlock below reports the real ceiling
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+        err = ctypes.get_errno()
+        raise OSError(
+            err,
+            f"mlock({nbytes / 2**30:.1f} GiB): {os.strerror(err)} "
+            f"(RLIMIT_MEMLOCK / `ulimit -l` caps OS-locked bytes; raise it or "
+            f"shrink --moe-cpu-layers)",
+        )
+    _os_locked_total += nbytes
 
 
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
@@ -149,24 +237,79 @@ def alloc_layer_banks(
     }
 
 
+class _ResidencyPlan:
+    """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
+
+    Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
+
+    __slots__ = ("labels", "applied", "has_unpinned", "actual")
+
+    def __init__(self, labels: list[str]):
+        self.labels = list(labels)
+        self.applied = False
+        self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
+        self.actual: dict[int, str] = {}
+
+    def residency_for(self, layer_id: int) -> str:
+        self.applied = True
+        return self.labels[layer_id]
+
+    def record(self, layer_id: int, achieved: str) -> None:
+        """One pageable bank downgrades the whole layer (a failed lock settles PAGEABLE)."""
+        if self.actual.get(layer_id) != HostResidency.PAGEABLE.value:
+            self.actual[layer_id] = achieved
+
+
+_requested_residency: _ResidencyPlan | None = None
+
+
+@contextlib.contextmanager
+def requested_residency(labels: list[str] | None):
+    """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins)."""
+    global _requested_residency
+    if labels is None:
+        yield None
+        return
+    plan = _ResidencyPlan(labels)
+    prev, _requested_residency = _requested_residency, plan
+    try:
+        yield plan
+    finally:
+        _requested_residency = prev
+
+
+def _settle(bank: HostBank, residency: str) -> None:
+    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
+    if residency == HostResidency.PINNED.value:
+        bank.pin()
+    elif residency == HostResidency.LOCKED.value:
+        bank.lock()
+
+
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
-    """Pin (register) every bank after it has been filled -- pin-after-fill."""
+    """Settle every bank after it has been filled -- pin-after-fill by default.
+    List-valued entries are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
+    plan = _requested_residency
     for bank in banks.values():
         if isinstance(bank, list):
-            for layer_bank in bank:
-                layer_bank.pin()
+            for layer_id, layer_bank in enumerate(bank):
+                residency = (
+                    HostResidency.PINNED.value if plan is None
+                    else plan.residency_for(layer_id)
+                )
+                _settle(layer_bank, residency)
+                if plan is not None and residency == HostResidency.LOCKED.value:
+                    plan.record(layer_id, layer_bank.residency.value)
         else:
             bank.pin()
 
 
 class PinPipeline:
-    """Pin filled banks while other banks are still being read.
+    """Settle (pin or lock) filled banks while other banks are still being read.
 
-    cudaHostRegister is driver-serialized, so one background thread drains a
-    queue of completed banks; submitters never block. Total load time becomes
-    ~max(read, pin) instead of their sum. Use as a context manager: a clean exit
-    drains the queue and re-raises the first pin failure; an exceptional exit
-    still joins the thread but lets the original exception propagate.
+    cudaHostRegister is driver-serialized, so one background thread drains a queue and submitters never block: load time ~= max(read, settle).
+    LOCKED banks mlock on the same thread (the quota bookkeeping in ``_os_lock`` is not thread-safe).
+    A clean context-manager exit drains the queue and re-raises the first settle failure.
     """
 
     def __init__(self) -> None:
@@ -177,23 +320,31 @@ class PinPipeline:
 
     def _run(self) -> None:
         while True:
-            bank = self._q.get()
-            if bank is None:
+            item = self._q.get()
+            if item is None:
                 return
             if self._exc is not None:
-                continue  # drain without pinning after a failure
+                continue  # drain without settling after a failure
+            bank, residency, plan, layer_id = item
             try:
-                bank.pin()
+                _settle(bank, residency)
+                if plan is not None and residency == HostResidency.LOCKED.value:
+                    plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
-    def submit(self, bank: HostBank) -> None:
-        self._q.put(bank)
+    def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
+               plan=None, layer_id: int | None = None) -> None:
+        self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer."""
+        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
+        plan = _requested_residency
+        residency = (
+            HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
+        )
         for bank in banks.values():
-            self.submit(bank)
+            self.submit(bank, residency, plan, layer_id)
 
     def _join(self) -> None:
         self._q.put(None)
@@ -285,6 +436,8 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "alloc_layer_banks",
+    "born_pinned_default",
     "pin_banks",
     "read_file_into",
+    "requested_residency",
 ]
