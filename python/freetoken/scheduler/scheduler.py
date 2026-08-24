@@ -92,17 +92,28 @@ class Scheduler(SchedulerIOMixin):
             and self.cache_manager.is_swa
             and hasattr(self.engine.kv_cache, "cmp_pool")
         ):
-            from freetoken.kvcache.host_kv_tier import HostKVTier
+            from freetoken.kvcache.host_kv_tier import HostKVTier, host_kv_dir
 
+            _p = self.engine.kv_cache
+            _fp = (
+                f"{_p.num_layers}:{_p.head_dim}:{_p.index_head_dim}:{_p.P}:"
+                f"{hash(tuple(_p.compress_ratios)) & 0xFFFFFFFF:x}"
+            )
             self.cache_manager.attach_host_tier(
                 HostKVTier(
-                    self.engine.kv_cache, config.page_size,
+                    _p, config.page_size,
                     int(config.host_kv_cache_gb * (1 << 30)),
+                    disk_dir=host_kv_dir(getattr(config, "served_model_name", None)),
+                    disk_budget_bytes=int(
+                        getattr(config, "host_kv_disk_gb", 0.0) * (1 << 30)),
+                    fingerprint=_fp,
                 )
             )
             logger.info_rank0(
-                f"Host KV tier enabled: {config.host_kv_cache_gb:g} GiB of host RAM for "
-                "evicted-session KV (restore-on-admission)"
+                f"Host KV tier enabled: {config.host_kv_cache_gb:g} GiB RAM"
+                + (f" + {config.host_kv_disk_gb:g} GiB disk"
+                   if getattr(config, "host_kv_disk_gb", 0.0) > 0 else "")
+                + " for evicted-session KV (restore-on-admission)"
             )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -162,6 +173,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self.cache_manager.maybe_flush_host_tier()
 
     @torch.inference_mode()
     def rebuild_cache(

@@ -20,6 +20,9 @@ class SchedulerConfig(EngineConfig):
     # Host-RAM KV tier budget in GiB (0 = disabled). swa_radix (DSV4) only: evicted full-KV
     # spans are snapshotted to host RAM and restored at admission instead of re-prefilling.
     host_kv_cache_gb: float = 0.0
+    # Disk budget for the host KV tier in GiB (0 = RAM-only). Entries are flushed to
+    # ~/.cache/freetoken/hostkv/<model>/ and reloaded at startup: sessions survive restarts.
+    host_kv_disk_gb: float = 0.0
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40

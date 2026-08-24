@@ -239,6 +239,16 @@ def _format_cache_status(doc: dict[str, Any]) -> str:
     from freetoken.cache_report import format_cache_status
 
     lines = [format_cache_status(doc, prefix="")]
+    host = doc.get("host_tier")
+    if isinstance(host, dict):
+        lines.append(
+            f"  host tier     {host.get('entries', 0)} spans, "
+            f"ram {host.get('ram_bytes', 0) >> 20} MiB, "
+            f"disk {host.get('disk_bytes', 0) >> 20} MiB, "
+            f"saved {host.get('saved_tokens', 0)} tok, "
+            f"restored {host.get('restored_tokens', 0)} tok "
+            f"({host.get('restore_hits', 0)} hits)"
+        )
     last = doc.get("last_rebuild")
     if isinstance(last, dict):
         lines.append(f"  last rebuild  {last.get('status', 'unknown')}")

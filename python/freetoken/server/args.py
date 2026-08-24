@@ -327,6 +327,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-kv-disk-gb",
+        type=float,
+        default=ServerArgs.host_kv_disk_gb,
+        help=(
+            "Disk budget for the host KV tier in GiB (0 = RAM-only). Evicted-session KV is "
+            "persisted under ~/.cache/freetoken/hostkv/<model>/ and reloaded at startup, so "
+            "long sessions survive a server restart."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

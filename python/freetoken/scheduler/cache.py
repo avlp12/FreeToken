@@ -77,6 +77,44 @@ class CacheManager:
     def _host_save(self, ids: torch.Tensor, start: int, full_locs: torch.Tensor) -> None:
         self.host_tier.save_span(ids.cpu(), start, full_locs)
 
+    _last_host_flush = 0.0
+
+    def maybe_flush_host_tier(self, min_interval: float = 30.0) -> None:
+        """Idle-time snapshot of not-yet-saved live tree spans into the host tier, so a
+        disk-backed tier preserves sessions that were never evicted across a server restart.
+        Best-effort and rate-limited; only meaningful when the tier persists to disk."""
+        tier = self.host_tier
+        if tier is None or not self.is_swa or tier.disk_budget <= 0:
+            return
+        import time
+        now = time.monotonic()
+        if now - self._last_host_flush < min_interval:
+            return
+        self._last_host_flush = now
+        try:
+            flushed = 0
+            for node in self.prefix_cache._all_nodes():
+                keys, cur = [], node
+                while not cur.is_root():
+                    keys.append(cur._key)
+                    cur = cur.parent
+                keys.reverse()
+                ids = torch.cat(keys).cpu()
+                start = ids.numel() - node.length
+                if node.length % self.page_size != 0:
+                    continue
+                if tier.has(ids, start, ids.numel()):
+                    continue
+                tier.save_span(ids, start, node.value)
+                flushed += node.length
+            if flushed:
+                from freetoken.utils import init_logger
+                init_logger(__name__).info(
+                    f"host-kv: idle flush snapshotted {flushed} live tree tokens")
+        except Exception as exc:
+            from freetoken.utils import init_logger
+            init_logger(__name__).warning(f"host-kv idle flush failed: {exc!r}")
+
     def _host_restore(self, input_ids: torch.Tensor) -> int:
         """Restore stored spans extending the tree's raw frontier along ``input_ids``. Never
         evicts to make room (a restore must not thrash live cache); spans whose window can't

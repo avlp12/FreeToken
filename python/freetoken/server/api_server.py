@@ -805,14 +805,33 @@ def cache_geometry(state: Any) -> dict:
     return geo
 
 
+def _host_tier_stats() -> dict | None:
+    """Host-KV-tier stats, bridged from the scheduler process via its stats.json (the tier
+    writes it on every save/restore/flush). None when the tier is disabled or never wrote."""
+    import json
+    import os
+
+    from freetoken.kvcache.host_kv_tier import host_kv_dir
+
+    path = os.path.join(host_kv_dir(_served_model_name()), "stats.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 @app.get("/v1/cache/status")
 async def cache_status():
     state = get_global_state()
-    return {
+    doc = {
         "state": state.maintenance_state,
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
     }
+    if (host := _host_tier_stats()) is not None:
+        doc["host_tier"] = host
+    return doc
 
 
 @app.post("/generate")
