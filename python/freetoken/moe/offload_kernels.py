@@ -48,6 +48,32 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     )
 
 
+def prefetch_ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """``ensure_experts`` against the SECOND miss-plan descriptor set.
+
+    Same flashlib kernel, same shared LRU state (slot_for_id / id_of_slot / usage /
+    step) -- only ``src_indices``/``dst_indices``/``num_copy`` are redirected, which
+    the public ``lru_ensure`` signature already takes as caller-owned outputs. No
+    flashlib change is needed and none was made.
+
+    ``stats=None`` compiles the accumulation out: ``lru_stats`` measures the REAL
+    routing's hit/miss rate and must not be polluted by speculative admissions.
+    """
+    lru_ensure(
+        expert_ids,
+        cache.slot_for_id.view(-1),
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        expert_ids,
+        cache.prefetch_src_indices,
+        cache.prefetch_evict_slots,
+        cache.prefetch_num_indices,
+        stats=None,
+        id_base=layer_id * cache.num_experts,
+    )
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:

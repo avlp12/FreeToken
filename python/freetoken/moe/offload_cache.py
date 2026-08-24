@@ -29,6 +29,44 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+_FALSEY = {"0", "false", "no", "off", ""}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in _FALSEY
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return int(raw.strip())
+
+
+# In-graph L+1 expert prefetch (see freetoken/moe/prefetch.py). OFF by default:
+# with the flag unset every prefetch branch below is skipped, no second descriptor
+# set is allocated, no extra stream/event exists, and the captured decode graph is
+# byte-for-byte the current one.
+MOE_PREFETCH_ENV = "FREETOKEN_MOE_PREFETCH"
+# blocks_per_bank for the FORKED prefetch pull. The production serial default (8)
+# only reaches 27-37% compute/pull overlap efficiency when forked against a
+# concurrent GEMM; 1-4 reach 98-100% (and bpb=1 also raises pull-alone bandwidth,
+# 44.3 vs 38.4 GB/s) -- measured on this box, see /root/test_graph_fork_overlap_tuning.py.
+PREFETCH_BPB_ENV = "FREETOKEN_PREFETCH_BPB"
+PREFETCH_BPB_DEFAULT = 2
+# blocks_per_bank for the MAIN (serial) decode miss copy. Default unchanged from the
+# kernel's own default; exposed purely so the serial-path grid can be A/B'd at
+# production shapes without editing code.
+COPY_BPB_ENV = "FREETOKEN_COPY_BPB"
+COPY_BPB_DEFAULT = 8
+
+
+def moe_prefetch_enabled() -> bool:
+    return _env_flag(MOE_PREFETCH_ENV, False)
+
 # quant_format -> bank names, in registration order: the single place a format's bank
 # layout is declared. The cache machinery (copy_missing, the prefill double buffers,
 # bank_views) iterates banks in this order, the layers' kernel dispatch unpacks views
@@ -282,6 +320,53 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # ---- in-graph L+1 expert prefetch (FREETOKEN_MOE_PREFETCH) ----------------
+        # A SECOND, independent miss-plan descriptor set. The real decode path keeps
+        # sole ownership of evict_slots/src_indices/num_indices (single-buffered, and
+        # consumed by copy_missing in the same layer), so a speculative admission can
+        # never clobber a plan the real path has staged but not yet copied.
+        self.prefetch_enabled = moe_prefetch_enabled()
+        self.prefetch_bpb = _env_int(PREFETCH_BPB_ENV, PREFETCH_BPB_DEFAULT)
+        self.copy_bpb = _env_int(COPY_BPB_ENV, COPY_BPB_DEFAULT)
+        self.prefetch_evict_slots: torch.Tensor | None = None
+        self.prefetch_src_indices: torch.Tensor | None = None
+        self.prefetch_num_indices: torch.Tensor | None = None
+        # The forked branch the prefetch pull runs on, plus one fork/join event pair
+        # per layer. Allocated ONCE here (long before CUDA-graph capture) so the
+        # captured graph sees stable stream/event handles, and one pair per layer so
+        # no event is recorded twice inside a single capture.
+        self.prefetch_stream: torch.cuda.Stream | None = None
+        self.prefetch_fork_events: list[torch.cuda.Event] = []
+        self.prefetch_done_events: list[torch.cuda.Event] = []
+        # int32 scratch per (layer, K): lru_ensure rewrites its query in place, and the
+        # predicted ids must survive unmodified for nothing -- but the Gate's own output
+        # is a fresh tensor each step under eager and a graph-pool tensor under capture,
+        # so a persistent scratch keeps the kernel's operand address fixed.
+        self._prefetch_scratch: dict[tuple[int, int], torch.Tensor] = {}
+        self._prefetch_src_layer: int | None = None
+        if self.prefetch_enabled:
+            self._alloc_prefetch_plan()
+            if self.device.type == "cuda":
+                self.prefetch_stream = torch.cuda.Stream(device=self.device)
+                self.prefetch_fork_events = [
+                    torch.cuda.Event() for _ in range(self.num_layers)
+                ]
+                self.prefetch_done_events = [
+                    torch.cuda.Event() for _ in range(self.num_layers)
+                ]
+
+    def _alloc_prefetch_plan(self) -> None:
+        """(Re)allocate the second descriptor set; same shapes as the primary one."""
+        plan_slots = max(self.num_experts, self.cache_size)
+        self.prefetch_evict_slots = torch.empty(
+            (plan_slots,), dtype=torch.int32, device=self.device
+        )
+        self.prefetch_src_indices = torch.empty(
+            (plan_slots,), dtype=torch.int32, device=self.device
+        )
+        self.prefetch_num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self._prefetch_scratch = {}
+        self._prefetch_src_layer = None
 
     def set_bank_sources(
         self,
@@ -469,6 +554,11 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        if self.prefetch_enabled:
+            # cache_size-shaped like the primary set; the stream/events are size
+            # independent and are deliberately kept (a rebuild must not orphan a
+            # handle a captured graph might still reference).
+            self._alloc_prefetch_plan()
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -816,6 +906,77 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+
+    # ------------------------------------------------------------------ prefetch path
+    def prefetch_scratch(self, layer_id: int, numel: int) -> torch.Tensor:
+        """Persistent int32 query buffer for ``prefetch_ensure`` (one per layer/K).
+
+        Allocated on first use, which must be an EAGER forward: the engine runs a
+        warm-up decode immediately before ``torch.cuda.graph(...)``, so by capture
+        time every buffer already exists at a fixed address (same discipline as the
+        routing tracer's device record buffer)."""
+        key = (layer_id, numel)
+        buf = self._prefetch_scratch.get(key)
+        if buf is None:
+            assert not (
+                self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+            ), (
+                "MoE prefetch scratch would be allocated inside a CUDA graph's private "
+                "mempool; it must be allocated by the eager warm-up decode forward that "
+                "precedes capture"
+            )
+            buf = torch.empty((numel,), dtype=torch.int32, device=self.device)
+            self._prefetch_scratch[key] = buf
+        return buf
+
+    def prefetch_ensure(self, layer_id: int, predicted_ids: torch.Tensor) -> None:
+        """Speculatively admit ``layer_id``'s PREDICTED experts, into the second plan.
+
+        Identical LRU bookkeeping to :meth:`ensure_experts` -- same slot_for_id /
+        id_of_slot / usage / step tensors, so a correct prediction is simply a hit
+        when the real ``ensure_experts`` runs one layer later -- but the resulting
+        miss plan lands in ``prefetch_evict_slots`` / ``prefetch_src_indices`` /
+        ``prefetch_num_indices``. The real path's single-buffered plan is untouched.
+
+        ``predicted_ids`` is copied into persistent scratch first: ``lru_ensure``
+        rewrites its query in place, and the caller's tensor is the lookahead Gate's
+        own output. Stats are NOT accumulated: ``lru_stats`` must keep measuring the
+        real routing's hit/miss rate, not the speculation's.
+
+        Runs on the caller's (main) stream. All ``lru_ensure`` calls -- real and
+        prefetch -- stay serialized there; only the pull forks.
+        """
+        from freetoken.moe.offload_kernels import prefetch_ensure_experts
+
+        assert self.prefetch_enabled, "prefetch descriptors were not allocated"
+        scratch = self.prefetch_scratch(layer_id, predicted_ids.numel())
+        scratch.copy_(predicted_ids.reshape(-1))
+        self._prefetch_src_layer = layer_id
+        prefetch_ensure_experts(self, layer_id, scratch)
+
+    def prefetch_copy(self) -> None:
+        """Pull the rows the last :meth:`prefetch_ensure` admitted (second plan).
+
+        Meant to run on ``prefetch_stream``, forked behind that ensure. Uses
+        ``prefetch_bpb`` blocks per bank rather than the serial path's grid: a wide
+        grid saturates PCIe but also occupies the SMs, which is exactly what a pull
+        overlapped with a concurrent GEMM must not do.
+        """
+        assert self.banks, "set_bank_sources must register the banks first"
+        assert self._copy_fused_ok, "prefetch requires the fused multi-bank copy plan"
+        layer_id = self._prefetch_src_layer
+        assert layer_id is not None, "no staged prefetch (prefetch_ensure first)"
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_src_ptrs[layer_id],
+            self._copy_feat_bytes,
+            self.prefetch_evict_slots,
+            self.prefetch_src_indices,
+            self.prefetch_num_indices,
+            blocks_per_bank=self.prefetch_bpb,
+        )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
