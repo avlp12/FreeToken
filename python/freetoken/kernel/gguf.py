@@ -142,9 +142,12 @@ def ggml_moe_a8_vec(
     ``row_pitch_bytes`` is the byte distance between consecutive expert rows in
     ``weight``. The default 0 means "rows are tightly packed at their native
     width" -- identical addressing to the upstream kernel. Pass a nonzero pitch
-    when the rows live in a bank padded to a uniform stride (e.g. one shared by
-    several quant types); it must be a multiple of ``quant_type``'s block size
-    and no narrower than the native packed row.
+    when the rows live in a bank padded to a uniform stride shared by several
+    quant types. It is byte-granular and need NOT be a whole number of
+    ``quant_type`` blocks -- a bank pitch sized for the widest type in the bank
+    generally is not, e.g. 1568 B rows holding 74 B IQ2_XS blocks. It only has to
+    be at least the native packed row and a multiple of 16 bytes, which keeps
+    every row base 16 B-aligned.
     """
     return _module().ggml_moe_a8_vec(
         x, weight, topk_ids, top_k, quant_type, row, tokens, row_pitch_bytes

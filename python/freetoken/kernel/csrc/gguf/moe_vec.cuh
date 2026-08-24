@@ -8,11 +8,22 @@
 //
 // The vendored kernel assumes rows sit back-to-back at their native packed width
 // (`blocks_per_row * sizeof(block_q_t)`). FreeToken's mixed-quant expert bank
-// instead gives every layer the same uniform row pitch, so a layer whose native
-// row is narrower gets trailing padding bytes. `row_pitch_bytes == 0` keeps the
-// historical tightly-packed semantics bit-for-bit; a nonzero value must be a
-// multiple of the block size of the type being dispatched and at least as wide
-// as the native packed row.
+// instead gives every layer the same uniform row pitch, chosen from the WIDEST
+// type in the bank, so a layer whose native row is narrower gets trailing
+// padding. That pitch is a whole number of blocks of the widest type, which is
+// in general NOT a whole number of blocks of the narrower type sharing the bank
+// -- the production gate_up bank is 1568 B/row (16 IQ3_XXS blocks at H=4096)
+// while 42 of its layers hold IQ2_XS rows of 74 B blocks, and 1568 % 74 != 0.
+// The pitch is therefore BYTE-granular: it positions the row, and blocks tile
+// from the row base exactly as they do in a tight bank.
+//
+// `row_pitch_bytes == 0` keeps the historical tightly-packed semantics
+// bit-for-bit. A nonzero pitch must be at least the native packed row and a
+// multiple of 16 B. The 16 B rule (not the block size) is what the hardware
+// actually needs: the torch caching allocator hands out 256 B-aligned bases, so
+// a 16 B-multiple pitch keeps every row base 16 B-aligned, which covers any
+// int4/int2 vector load and is never weaker than the alignment a tight bank
+// gives the same row. Both production pitches (1568, 784) satisfy it.
 template <typename block_q_t>
 static inline int64_t moe_vec_resolve_pitch(int blocks_per_row, int64_t row_pitch_bytes) {
   const int64_t native = (int64_t)blocks_per_row * (int64_t)sizeof(block_q_t);
@@ -20,19 +31,17 @@ static inline int64_t moe_vec_resolve_pitch(int blocks_per_row, int64_t row_pitc
     return native;
   }
   TORCH_CHECK(
-      row_pitch_bytes % (int64_t)sizeof(block_q_t) == 0,
-      "moe_vec: row_pitch_bytes (",
-      row_pitch_bytes,
-      ") must be a multiple of the block size (",
-      (int64_t)sizeof(block_q_t),
-      ") of the dispatched quant type");
-  TORCH_CHECK(
       row_pitch_bytes >= native,
       "moe_vec: row_pitch_bytes (",
       row_pitch_bytes,
       ") is narrower than the native packed row (",
       native,
       " bytes)");
+  TORCH_CHECK(
+      row_pitch_bytes % 16 == 0,
+      "moe_vec: row_pitch_bytes (",
+      row_pitch_bytes,
+      ") must be a multiple of 16 bytes so every expert row starts 16 B-aligned");
   return row_pitch_bytes;
 }
 
@@ -59,27 +68,30 @@ static __global__ void moe_vec_q(
   const int blocks_per_row = ncols / qk;
   const int blocks_per_warp = vdr * WARP_SIZE / qi;
 
-  // Row-to-row stride in whole blocks. Equals blocks_per_row when the bank is
-  // tightly packed; larger when rows are padded to a uniform bank pitch. Only
-  // ADDRESSING uses this -- the dequant/dot loop still runs blocks_per_row
-  // iterations, so the padding bytes are never read.
-  const int64_t blocks_per_pitch =
-      row_pitch_bytes > 0 ? row_pitch_bytes / (int64_t)sizeof(block_q_t) : (int64_t)blocks_per_row;
+  // Row-to-row stride in BYTES. Equals the native packed row when the bank is
+  // tightly packed; wider when rows are padded to a uniform bank pitch, and not
+  // necessarily a whole number of blocks of *this* type. Only ADDRESSING uses
+  // it: the row base is computed in bytes, then blocks tile from that base as
+  // they do in a tight bank, and the dequant/dot loop still runs blocks_per_row
+  // iterations -- so the padding bytes are never read.
+  const int64_t row_bytes =
+      row_pitch_bytes > 0 ? row_pitch_bytes : (int64_t)blocks_per_row * (int64_t)sizeof(block_q_t);
 
   // partial sum for each thread
   float tmp = 0.0f;
 
-  const block_q_t* x = ((const block_q_t*)vx) + (int64_t)expert * (int64_t)nrows * blocks_per_pitch;
+  const block_q_t* x = (const block_q_t*)((const char*)vx +
+                                          ((int64_t)expert * (int64_t)nrows + (int64_t)row) * row_bytes);
   const block_q8_1* y = (const block_q8_1*)(((const int*)vy) + token * token_stride);
 
   for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
-    const int64_t ibx = (int64_t)row * blocks_per_pitch + i;  // x block index
+    // x block index, now relative to this row's base rather than the expert's
 
-    const int iby = i * (qk / QK8_1);  // y block index that aligns with ibx
+    const int iby = i * (qk / QK8_1);  // y block index that aligns with i
 
     const int iqs = vdr * (threadIdx.x % (qi / vdr));  // x block quant index when casting the quants to int
 
-    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+    tmp += vec_dot_q_cuda(&x[i], &y[iby], iqs);
   }
 
   // sum up partial sums and write back result

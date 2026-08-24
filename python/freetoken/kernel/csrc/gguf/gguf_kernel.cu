@@ -554,8 +554,11 @@ torch::Tensor ggml_moe_a8(
 // ``W``. 0 (the default, and what every pre-existing call site passes implicitly)
 // means "rows are tightly packed at their native width", i.e. exactly the
 // upstream behaviour. A nonzero pitch lets the weight live in a bank whose rows
-// are padded out to a uniform stride shared across quant types; it must be a
-// multiple of the dispatched type's block size (checked in moe_vec_resolve_pitch).
+// are padded out to a uniform stride shared across quant types. It is
+// BYTE-granular -- a bank pitch sized in blocks of the widest type in the bank is
+// generally not a whole number of blocks of a narrower type sharing that bank --
+// and only has to be >= the native row and a multiple of 16 B, which keeps every
+// row base 16 B-aligned (see moe_vec_resolve_pitch).
 torch::Tensor ggml_moe_a8_vec(
     torch::Tensor X,  // input
     torch::Tensor W,  // expert weights
