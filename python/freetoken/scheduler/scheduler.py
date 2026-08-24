@@ -179,6 +179,19 @@ class Scheduler(SchedulerIOMixin):
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
         self.cache_manager.maybe_flush_host_tier()
+        # --moe-collect-stats: dump the decode-window cache/routing stats at each idle
+        # transition (the dead-code analytics in OffloadCache finally get a consumer).
+        moc = getattr(self.engine, "moe_offload_cache", None)
+        if moc is not None and getattr(moc, "collect_stats", False):
+            try:
+                import json as _json
+                logger.info_rank0(f"moe-stats: {_json.dumps(moc.decode_miss_stats())}")
+                r = moc.decode_routing_stats()
+                if r:
+                    logger.info_rank0(f"moe-routing: {_json.dumps(r)}")
+                moc.reset_stats()
+            except Exception as exc:
+                logger.warning_rank0(f"moe-stats dump failed: {exc!r}")
 
     @torch.inference_mode()
     def rebuild_cache(

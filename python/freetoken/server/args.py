@@ -365,6 +365,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect per-layer MoE offload-cache decode stats (miss rates, routing "
+            "histogram); dumped to the log at each idle transition."
+        ),
+    )
+
+    parser.add_argument(
         "--host-kv-cache-gb",
         type=float,
         default=ServerArgs.host_kv_cache_gb,
