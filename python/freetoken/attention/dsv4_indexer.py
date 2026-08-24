@@ -68,8 +68,12 @@ class IndexerBackendMixin:
         device = scores.device
         n_blocks = scores.shape[-1]
         live = ((start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio).unsqueeze(1)
-        blk = torch.arange(n_blocks, device=device).repeat(seqlen, 1)
-        scores = scores + torch.where(blk >= live, float("-inf"), 0)
+        # Mask dead blocks in place with a bool mask. The previous form materialized a
+        # [seqlen, n_blocks] int64 ``repeat`` plus two fp32 broadcast transients (~10x the
+        # scores tensor); on long extends that peaked near 1 GiB per layer of pure scratch.
+        # Semantics are identical: dead blocks score -inf and lose the top-k.
+        dead = torch.arange(n_blocks, device=device).unsqueeze(0) >= live
+        scores.masked_fill_(dead, float("-inf"))
         picks = scores.topk(min(topk, n_blocks), dim=-1)[1]
         return torch.where(picks >= live, -1, picks + offset)
 
