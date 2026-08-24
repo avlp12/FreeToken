@@ -28,6 +28,11 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # DeepSeek-V4 only: serve the routed experts from this GGUF (a single ``.gguf`` file or
+    # a directory holding a llama.cpp split-shard set) instead of the checkpoint's own FP4
+    # safetensors. Switches expert_quant to "q2_k_ud"; everything else (attention, shared
+    # experts, router) still comes from the safetensors checkpoint at --model-path.
+    expert_gguf: str | None = None
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

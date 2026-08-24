@@ -727,6 +727,7 @@ class Engine:
                 "(locked layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
+        banks = None  # set on the load path below; read again after the layers attach
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -829,6 +830,13 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if banks is not None and banks.quant_types is not None:
+            # q2_k_ud: the banks hold rows of several ggml types at one uniform pitch, so
+            # each layer's GEMV needs ITS types. Same seam make_moe_layer's extra_attrs uses
+            # for swiglu_limit -- a plain attribute the format's branch in _expert_gemm reads.
+            for layer in layers:
+                layer.gguf_gate_up_qtype = banks.quant_types["gate_up"][layer.layer_id]
+                layer.gguf_down_qtype = banks.quant_types["down"][layer.layer_id]
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -1752,6 +1760,41 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     return requested
 
 
+def _apply_expert_gguf(config: EngineConfig, is_dsv4: bool) -> None:
+    """Resolve ``--expert-gguf``: switch the routed experts onto the GGUF q2_k_ud banks.
+
+    Runs at config-resolution time, before anything downstream reads ``expert_quant``. The
+    path is stashed on the ``dsv4_args`` instance ``ModelConfig`` carries -- the same
+    instance the ``q2_k_ud`` bank provider reads.
+    """
+    model_config = config.model_config
+    if not is_dsv4:
+        arch = getattr(model_config, "architectures", ["?"])[0]
+        raise ValueError(
+            f"--expert-gguf is DeepSeek-V4 only (this checkpoint is {arch}): the q2_k_ud "
+            "bank layout and its clamped-SwiGLU GEMV are specific to DSV4's expert geometry"
+        )
+    if getattr(config, "speculative_dspark", False):
+        raise ValueError(
+            "--expert-gguf cannot be combined with --speculative-dspark: the GGUF carries "
+            "no mtp.* drafter experts, so the drafter's MoE layers would have no banks "
+            "(MTP-expert GGUF support is unverified). Drop one of the two flags."
+        )
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    path = config.expert_gguf
+    if not is_gguf_path(path):
+        raise ValueError(
+            f"--expert-gguf {path!r} is neither a .gguf file nor a directory holding a "
+            "llama.cpp split-GGUF shard set (*-00001-of-0000N.gguf ...)"
+        )
+    object.__setattr__(model_config, "expert_quant", "q2_k_ud")
+    model_config.dsv4_args.expert_gguf_path = path
+    logger.info_rank0(
+        f"--expert-gguf: routed experts served from {path} (expert_quant=q2_k_ud)"
+    )
+
+
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
@@ -1961,6 +2004,10 @@ def _adjust_config(config: EngineConfig):
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
+    # Must precede the expert_quant read below: --expert-gguf rewrites it to "q2_k_ud",
+    # and every later decision here (backend legality, bench profile key) keys on it.
+    if getattr(config, "expert_gguf", None):
+        _apply_expert_gguf(config, is_dsv4)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
     if not is_moe:

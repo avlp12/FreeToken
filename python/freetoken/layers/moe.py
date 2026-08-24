@@ -531,6 +531,23 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "q2_k_ud":
+            # Native GGUF IQ-quant experts (DeepSeek-V4 UD-Q2_K_XL): same dequant-in-kernel
+            # grouped GEMV as q4_0, but over padded rows at a uniform bank pitch and with
+            # this LAYER's ggml types -- the banks mix IQ2_XS / IQ3_XXS / Q2_K across layers,
+            # so the types are per-layer attributes (the engine copies them off the
+            # ExpertBanks after attaching the cache), the way swiglu_limit is.
+            #
+            # Prefill runs the same vector kernel rather than the grouped MMQ the dense
+            # formats use: ggml_moe_a8 is not pitch-aware and rejects a nonzero
+            # row_pitch_bytes, so MMQ cannot read these banks at any batch size.
+            from freetoken.moe.fused_q2_k_ud import fused_experts_q2k_ud
+
+            gate_up, down = views
+            return fused_experts_q2k_ud(
+                hidden_states, gate_up, down, topk_weights, topk_ids,
+                self.gguf_gate_up_qtype, self.gguf_down_qtype, self.swiglu_limit,
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

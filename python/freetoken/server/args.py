@@ -575,6 +575,20 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--expert-gguf",
+        metavar="PATH",
+        default=ServerArgs.expert_gguf,
+        help=(
+            "DeepSeek-V4 only: serve the routed experts from this GGUF instead of the "
+            "checkpoint's FP4 safetensors. PATH is a single .gguf file or a directory "
+            "holding a llama.cpp split-shard set (e.g. an unsloth UD-Q2_K_XL build). "
+            "Attention, the shared experts and the router still come from --model-path. "
+            "Cannot be combined with --speculative-dspark (the GGUF ships no mtp.* "
+            "drafter experts)."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
