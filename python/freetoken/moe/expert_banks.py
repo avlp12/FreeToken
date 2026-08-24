@@ -28,6 +28,35 @@ from .offload_cache import _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
+_ALIGN = 4096  # PCIe/page block size fast_index_copy_multi_jit's zero-copy pull needs rows aligned to
+
+
+def _log_bank_alignment(banks: "ExpertBanks") -> None:
+    """Startup diagnostic (once, right after the banks are built): log each host bank's
+    base alignment, and warn if any layer landed off a 4096-byte boundary.
+
+    A misaligned base isn't just cosmetic -- the SM zero-copy pull kernel
+    (fast_index_copy_multi_jit) reads host expert rows at 46-47 GB/s when row bases are
+    4KB-aligned but only 20.7-23.8 GB/s at a 64B phase (PCIe transaction straddle), and
+    every expert row in a bank inherits whatever phase the bank's base has (row byte
+    counts are themselves exact 4KB multiples). ``HostBank`` now guarantees this by
+    construction (see host_banks.py), so a warning here means either a non-HostBank
+    allocation path or a future allocator regression -- defense in depth, not the
+    primary guarantee.
+    """
+    for name, per_layer in banks.sources.items():
+        bad = [(i, t.data_ptr() % _ALIGN) for i, t in enumerate(per_layer) if t.numel() and t.data_ptr() % _ALIGN != 0]
+        if not bad:
+            base = per_layer[0].data_ptr() % _ALIGN if per_layer else 0
+            logger.info_rank0(f"bank {name} base%{_ALIGN}={base} ({len(per_layer)} layers)")
+        else:
+            i0, rem0 = bad[0]
+            logger.warning(
+                f"bank {name} misaligned on {len(bad)}/{len(per_layer)} layers "
+                f"(e.g. layer {i0} base%{_ALIGN}={rem0}) -- zero-copy pull kernel bandwidth "
+                "will regress (PCIe transaction straddle); expect ~20-24 GB/s instead of ~46-47 GB/s"
+            )
+
 
 @dataclass(frozen=True)
 class ExpertBanks:
@@ -409,6 +438,7 @@ def load_expert_banks(
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            _log_bank_alignment(banks)
             return banks
 
     auto = parallel is None
@@ -433,11 +463,13 @@ def load_expert_banks(
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
     # allocation) falls back to serial.
     try:
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                   decode_target, layer_sink)
+        banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
+                                    decode_target, layer_sink)
     except NotImplementedError as exc:
         if not parallel:
             raise
         logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                   decode_target, layer_sink)
+        banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
+                                    decode_target, layer_sink)
+    _log_bank_alignment(banks)
+    return banks

@@ -60,16 +60,35 @@ class HostBank:
     rounded up to the O_DIRECT block so chunked reads are always aligned; ``tensor`` views
     exactly ``nbytes``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_off", "_reg_len", "_pinned")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
-        asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+        # `_reg_len` is what actually gets cudaHostRegister'd / O_DIRECT'd: the byte count
+        # rounded up to the block size.
+        self._reg_len = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
+        # Over-allocate by one extra block and slice to an EXPLICITLY 4096-aligned base
+        # (rather than relying on the backing allocator happening to page-align its
+        # returns). anonymous mmap(2) is page-aligned by contract on every platform this
+        # runs on today, so `off` is 0 in practice -- but computing it explicitly turns
+        # that from an incidental property of mmap into an asserted invariant of
+        # HostBank, so a future allocator swap (a custom pool, a huge-page backend, ...)
+        # cannot silently reintroduce the PCIe-transaction-straddle regression: the SM
+        # zero-copy pull kernel (fast_index_copy_multi_jit) reads host expert rows at
+        # 46-47 GB/s when row bases are 4KB-aligned but only 20.7-23.8 GB/s when they sit
+        # at a 64B phase, because every expert row inherits whatever phase the bank's
+        # base has (row byte counts are themselves exact 4KB multiples).
+        self._buf = mmap.mmap(-1, self._reg_len + _BLK)  # lazy: address space only, no resident pages yet
         _LIVE_BUFFERS.append(self._buf)
-        self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
-        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+        raw_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+        self._off = (-raw_addr) % _BLK
+        self.addr = raw_addr + self._off
+        assert self.addr % _BLK == 0, f"HostBank base {self.addr:#x} not {_BLK}-aligned"
+        self.tensor = torch.frombuffer(
+            self._buf, dtype=dtype, count=self.nbytes // elsize, offset=self._off
+        ).view(*shape)
+        assert self.tensor.data_ptr() == self.addr
         self._pinned = False
 
     @property
@@ -77,7 +96,10 @@ class HostBank:
         return HostResidency.PINNED if self._pinned else HostResidency.PAGEABLE
 
     def memoryview(self) -> memoryview:
-        return memoryview(self._buf)
+        """The bank's bytes, from its (4096-aligned) ``addr`` -- NOT the raw over-allocated
+        buffer, which may carry a leading pad. Callers (e.g. the FTW O_DIRECT reader) rely
+        on this starting exactly at ``addr`` so their reads land where ``tensor`` expects."""
+        return memoryview(self._buf)[self._off:self._off + self._reg_len]
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled, resident) buffer -- pin-after-fill."""
@@ -86,10 +108,10 @@ class HostBank:
         from freetoken.kernel.pinned import host_register
 
         try:
-            host_register(self.addr, len(self._buf))
+            host_register(self.addr, self._reg_len)
         except RuntimeError as exc:
             raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+                f"cudaHostRegister failed for {self._reg_len / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
 
