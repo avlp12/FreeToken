@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.moe.routing_trace import get_tracer as _get_routing_tracer
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -243,7 +244,21 @@ class GraphRunner:
             getattr(model, "speculative_verify_block_size", 0) or 0
         )
         self.spec_span = self.spec_block_size + 1 if self.spec_block_size else 0
+        # Research instrumentation; None unless FREETOKEN_ROUTING_TRACE was set at
+        # process start (see freetoken/moe/routing_trace.py).
+        self._routing_tracer = _get_routing_tracer()
         self._capture_graphs(max_seq_len, vocab_size, model)
+        if self._routing_tracer is not None:
+            # Arm only now: capture runs eager warm-up decode forwards on a dummy
+            # request, and those records must not reach the file.
+            self._routing_tracer.arm()
+            logger.info_rank0(
+                "MoE routing trace armed: %s (%d layers, top-%d, %d B/step D2H)",
+                self._routing_tracer.path,
+                self._routing_tracer.n_layers,
+                self._routing_tracer.top_k,
+                self._routing_tracer.record_bytes - 8,
+            )
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -472,6 +487,11 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        if self._routing_tracer is not None:
+            # Post-replay drain: the graph has written this step's routing records
+            # into the tracer's persistent device buffer, so a stream-ordered async
+            # D2H here picks up exactly this step (see routing_trace.after_step).
+            self._routing_tracer.after_step(batch.size)
         return self.buffer.logits[: batch.size]
 
     def replay_spec(self, batch: Batch) -> torch.Tensor:

@@ -27,6 +27,7 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.routing_trace import get_tracer as _get_routing_tracer
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -313,6 +314,10 @@ _SPEC_TIMING = os.environ.get("FREETOKEN_SPEC_TIMING", "0") == "1"
 # One-shot operator profile of the target verify. Explicit opt-in: Kineto adds
 # substantial CPU overhead and synchronizes CUDA when the table is emitted.
 _SPEC_PROFILE = os.environ.get("FREETOKEN_SPEC_PROFILE", "0") == "1"
+# Research MoE routing trace; None unless FREETOKEN_ROUTING_TRACE names a path
+# prefix at process start (see freetoken/moe/routing_trace.py). Only the eager
+# decode fallback drains through here -- the CUDA-graph path drains in GraphRunner.
+_ROUTING_TRACER = _get_routing_tracer()
 
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
@@ -1608,6 +1613,12 @@ class Engine:
                     logits = self.model.forward()
                     get_features = getattr(self.model, "dspark_target_features", None)
                     target_features = get_features() if get_features is not None else None
+                    # Eager decode (graphs disabled, or a batch wider than the
+                    # widest captured one) still fills the routing-trace buffer;
+                    # drain it here so the trace does not silently stop. Prefill
+                    # and speculative verify write nothing, so they drain nothing.
+                    if _ROUTING_TRACER is not None and batch.is_decode:
+                        _ROUTING_TRACER.after_step(batch.size)
         if profiling:
             torch.cuda.synchronize(self.device)
             assert prof is not None

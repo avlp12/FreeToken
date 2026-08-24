@@ -12,6 +12,7 @@ from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
+from freetoken.moe.routing_trace import get_tracer as _get_routing_tracer
 
 from .args import DeepseekV4Args
 from .layers import Linear
@@ -174,11 +175,27 @@ class MoE(nn.Module):
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
         self._comm = DistributedCommunicator() if tp_size() > 1 else None
+        # Research instrumentation, off unless FREETOKEN_ROUTING_TRACE was set at
+        # process start. Resolved once here so ``forward`` costs one ``is None``
+        # test in the default configuration -- see freetoken/moe/routing_trace.py.
+        self._routing_trace = _get_routing_tracer()
+        if self._routing_trace is not None:
+            self._routing_trace_layer_id = layer_id
+            self._routing_trace.register_gate(
+                layer_id,
+                self.gate,
+                n_layers=args.n_layers,
+                top_k=args.n_activated_experts,
+                n_experts=args.n_routed_experts,
+            )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, input_ids.flatten())
+        flat_ids = input_ids.flatten()
+        weights, indices = self.gate(x, flat_ids)
+        if self._routing_trace is not None:
+            self._maybe_trace_routing(x, flat_ids, weights, indices)
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
@@ -194,3 +211,25 @@ class MoE(nn.Module):
         if self._comm is not None:
             out = self._comm.all_reduce(out)
         return out.view(shape)
+
+    def _maybe_trace_routing(self, x, flat_ids, weights, indices) -> None:
+        """Routing-trace tap (only reached with FREETOKEN_ROUTING_TRACE set).
+
+        ``x`` is the post-``ffn_norm`` hidden this layer's router just consumed --
+        the exact tensor the lookahead routers of L+1/L+2 are replayed on, which
+        is what makes the prediction a genuine "one layer early" question rather
+        than a re-derivation of the later layer's own input.
+
+        Decode only: prefill materializes routing over the whole prompt and a
+        speculative verify block rides the prefill phase, so both are skipped
+        here. The phase is a host value read while the graph is being TRACED, not
+        a device value branched on during replay, so the captured graph contains
+        exactly the decode-path record ops.
+        """
+        tracer = self._routing_trace
+        assert tracer is not None
+        if get_global_ctx().batch.is_prefill:
+            return
+        if not tracer.traces_layer(self._routing_trace_layer_id):
+            return
+        tracer.record(self._routing_trace_layer_id, x, flat_ids, weights, indices)
