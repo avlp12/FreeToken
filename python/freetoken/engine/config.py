@@ -47,6 +47,11 @@ class EngineConfig:
     # decode miss copies via copy-engine DMA + doorbell instead of the SM zero-copy
     # pull kernel (see offload_cache.DmaCopyService).
     moe_copy_engine: bool = False
+    # In-graph L+1 expert prefetch: at every offloaded MoE layer, run the NEXT layer's
+    # own Gate on this layer's router input and pull its predicted experts on a forked
+    # stream while this layer's GEMM runs. Maps onto FREETOKEN_MOE_PREFETCH; off leaves
+    # the decode graph unchanged (see freetoken/moe/prefetch.py).
+    moe_prefetch: bool = False
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

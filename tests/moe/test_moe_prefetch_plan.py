@@ -142,6 +142,53 @@ def test_real_ensure_sees_a_correct_prediction_as_a_hit():
 
 
 @CUDA
+def test_protect_slots_survives_the_next_ensure():
+    """``protect_slots`` must take the current layer's live rows out of the NEXT
+    lru_ensure's victim pool, even when they are the only plausible victims.
+
+    Without it, the speculative admission for L+1 can evict a slot layer L's expert
+    GEMM -- still queued behind it on the main stream -- is about to read, and the
+    forked pull then overwrites that row mid-GEMM.
+    """
+    # 8 slots, 6 live rows: every admission below MUST come out of the other 2.
+    cache = _build_cache(num_layers=4, num_experts=8, cache_size=8)
+    dev = torch.device("cuda")
+
+    live = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int32, device=dev)
+    cache.ensure_experts(0, live)  # -> slot ids, in place
+    live_slots = sorted(live.tolist())
+
+    cache.protect_slots(live)
+    pred = torch.tensor([0, 1], dtype=torch.int32, device=dev)  # layer 1, both missing
+    cache.prefetch_ensure(1, pred)
+    torch.cuda.synchronize()
+
+    n = int(cache.prefetch_num_indices.item())
+    assert n == 2
+    victims = cache.prefetch_evict_slots[:n].tolist()
+    assert set(victims).isdisjoint(live_slots), (victims, live_slots)
+    # ... and layer 0's rows are still mapped where its GEMM expects them.
+    assert sorted(cache.slot_for_id[0, :6].tolist()) == live_slots
+
+
+@CUDA
+def test_unprotected_slots_are_evictable():
+    """Control for the test above: without protect_slots the same admission DOES take
+    the live rows (which is exactly the race the protection exists to remove)."""
+    cache = _build_cache(num_layers=4, num_experts=8, cache_size=8)
+    dev = torch.device("cuda")
+    live = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32, device=dev)
+    cache.ensure_experts(0, live)  # fills every slot
+    live_slots = set(live.tolist())
+
+    pred = torch.tensor([0, 1], dtype=torch.int32, device=dev)
+    cache.prefetch_ensure(1, pred)
+    torch.cuda.synchronize()
+    victims = cache.prefetch_evict_slots[:2].tolist()
+    assert set(victims) <= live_slots, "nothing else could have been evicted"
+
+
+@CUDA
 def test_rebuild_reallocates_the_prefetch_plan():
     cache = _build_cache(cache_size=64)
     stream, events = cache.prefetch_stream, cache.prefetch_done_events

@@ -74,6 +74,42 @@ def prefetch_ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> N
     )
 
 
+def protect_slots(cache, slots: torch.Tensor) -> None:
+    """Make ``slots`` non-evictable for the NEXT ``lru_ensure`` call on this cache.
+
+    ``lru_ensure`` bumps ``lru_step`` on entry and treats a slot as evictable exactly
+    when ``usage != step`` -- i.e. only the slots THAT call hit are safe. That is not
+    enough for the prefetch path: the speculative ensure for layer L+1 runs while
+    layer L's expert GEMM is still queued behind it on the main stream, and if it
+    evicted one of layer L's rows the forked pull would overwrite that row mid-GEMM.
+
+    Writing ``step + 1`` -- the value the next call will compute -- into those slots'
+    usage puts them in precisely the bucket that call refuses to evict, and leaves
+    them ordinary (merely recent) for every call after it.
+
+    One launch, fixed shape, no host sync -- CUDA-graph safe. The slot ids are what
+    the real ``ensure_experts`` already rewrote ``topk_ids`` into, so the caller has
+    them for free.
+    """
+    n = slots.numel()
+    _protect_slots_kernel[(1,)](
+        cache.usage,
+        slots.reshape(-1),
+        cache.step,
+        n,
+        BLOCK=triton.next_power_of_2(max(n, 1)),
+    )
+
+
+@triton.jit
+def _protect_slots_kernel(usage_ptr, slots_ptr, step_ptr, n, BLOCK: tl.constexpr):
+    off = tl.arange(0, BLOCK)
+    lane = off < n
+    s = tl.load(slots_ptr + off, mask=lane, other=-1)
+    step = tl.load(step_ptr) + 1
+    tl.store(usage_ptr + s, step, mask=lane & (s >= 0))
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:

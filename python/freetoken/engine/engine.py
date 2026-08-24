@@ -676,6 +676,11 @@ class Engine:
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
         cache_factory = getattr(self.model, "make_offload_moe_cache", None)
+        # --moe-prefetch maps onto the env flag the cache and the prefetcher read, so
+        # the switch and a bare FREETOKEN_MOE_PREFETCH=1 are the same setting. Must run
+        # before any OffloadMoeCache is constructed (including a model-owned one).
+        if getattr(config, "moe_prefetch", False):
+            os.environ["FREETOKEN_MOE_PREFETCH"] = "1"
         if cache_factory is not None and config.moe_cache_auto:
             raise ValueError(
                 "--moe-cache-auto is not supported for models with a custom "

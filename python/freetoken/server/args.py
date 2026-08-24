@@ -376,6 +376,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefetch",
+        action="store_true",
+        default=ServerArgs.moe_prefetch,
+        help=(
+            "Experimental: in-graph L+1 expert prefetch. At each offloaded MoE layer, "
+            "run the NEXT layer's own router on this layer's router input and pull the "
+            "predicted experts on a forked stream while this layer's GEMM runs "
+            "(FREETOKEN_PREFETCH_BPB tunes that pull's grid). Equivalent to "
+            "FREETOKEN_MOE_PREFETCH=1."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-collect-stats",
         action="store_true",
         default=ServerArgs.moe_collect_stats,

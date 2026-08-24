@@ -929,6 +929,18 @@ class OffloadMoeCache:
             self._prefetch_scratch[key] = buf
         return buf
 
+    def protect_slots(self, slots: torch.Tensor) -> None:
+        """Shield ``slots`` from the NEXT ``lru_ensure``'s victim search.
+
+        Called with the current layer's routed slot ids right before the speculative
+        ensure for L+1, so that speculation can never evict a row the current layer's
+        expert GEMM -- still queued behind it on the main stream -- is about to read.
+        See ``offload_kernels.protect_slots``.
+        """
+        from freetoken.moe.offload_kernels import protect_slots
+
+        protect_slots(self, slots)
+
     def prefetch_ensure(self, layer_id: int, predicted_ids: torch.Tensor) -> None:
         """Speculatively admit ``layer_id``'s PREDICTED experts, into the second plan.
 
@@ -1276,8 +1288,17 @@ def moe_copy_engine_safe_with_graphs(
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
+    # Resolve the prefetcher ONCE, here: with the feature off every layer keeps
+    # prefetcher = None and the decode path costs a single `is None` test.
+    prefetcher = None
+    if cache.prefetch_enabled:
+        from freetoken.moe.prefetch import get_prefetcher
+
+        prefetcher = get_prefetcher()
     for layer in layers:
         layer.offload_cache = cache
+        if hasattr(layer, "prefetcher"):
+            layer.prefetcher = prefetcher
     return layers
 
 

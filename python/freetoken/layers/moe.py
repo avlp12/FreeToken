@@ -218,6 +218,14 @@ class OffloadMoELayer(MoELayer):
         )
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
+        # In-graph L+1 expert prefetch: a MoePrefetcher, or None when the feature is
+        # off (the default). Set by attach_offload_moe_cache, exactly when the cache
+        # has prefetch state allocated -- so the decode path costs one `is None` test
+        # in the default configuration. ``prefetch_ctx`` is the (router input, flat
+        # token ids) pair the owning model publishes each forward; models that do not
+        # publish one simply never prefetch. See freetoken/moe/prefetch.py.
+        self.prefetcher = None
+        self.prefetch_ctx: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def forward(
         self,
@@ -309,8 +317,23 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        prefetcher = self.prefetcher
+        if prefetcher is not None:
+            # This layer's rows, pulled on the forked stream one layer ago, must have
+            # landed before any of this layer's own cache bookkeeping runs -- the
+            # prefetch plan is single-buffered, exactly like the real one
+            # (freetoken/moe/prefetch.py explains why the join cannot come later).
+            prefetcher.join(cache, self.layer_id)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        if prefetcher is not None:
+            # Predict and start pulling layer L+1's experts while this layer's GEMM
+            # (queued right below) runs -- the whole point of the feature. topk_ids
+            # are slot ids by now: the rows this GEMM will read, which the speculative
+            # admission must not evict.
+            ctx = self.prefetch_ctx
+            if ctx is not None:
+                prefetcher.schedule(cache, self.layer_id, ctx[0], ctx[1], topk_ids)
         return self._expert_gemm(
             cache,
             hidden_states,

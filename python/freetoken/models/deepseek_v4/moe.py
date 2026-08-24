@@ -12,6 +12,7 @@ from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
+from freetoken.moe.prefetch import get_prefetcher as _get_moe_prefetcher
 from freetoken.moe.routing_trace import get_tracer as _get_routing_tracer
 
 from .args import DeepseekV4Args
@@ -175,6 +176,18 @@ class MoE(nn.Module):
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
         self._comm = DistributedCommunicator() if tp_size() > 1 else None
+        # Publish this layer's router so layer L-1 can run it one layer ahead (in-graph
+        # L+1 expert prefetch). Registration is unconditional and free -- one dict
+        # entry, no tensors -- which keeps it independent of when FREETOKEN_MOE_PREFETCH
+        # is read; whether anything actually prefetches is decided by
+        # ``experts.prefetcher``, set only when the cache allocated prefetch state.
+        _get_moe_prefetcher().register_gate(
+            layer_id,
+            self.gate,
+            n_layers=args.n_layers,
+            top_k=args.n_activated_experts,
+            n_experts=args.n_routed_experts,
+        )
         # Research instrumentation, off unless FREETOKEN_ROUTING_TRACE was set at
         # process start. Resolved once here so ``forward`` costs one ``is None``
         # test in the default configuration -- see freetoken/moe/routing_trace.py.
@@ -196,6 +209,12 @@ class MoE(nn.Module):
         weights, indices = self.gate(x, flat_ids)
         if self._routing_trace is not None:
             self._maybe_trace_routing(x, flat_ids, weights, indices)
+        if self.experts.prefetcher is not None:
+            # ``x`` is the post-ffn_norm hidden this layer's router just consumed --
+            # the exact tensor layer L+1's Gate is replayed on, which is what makes
+            # the prediction a genuine one-layer-early question. ``flat_ids`` matters
+            # for the leading hash routers, which key on the token id.
+            self.experts.prefetch_ctx = (x, flat_ids)
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
