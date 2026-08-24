@@ -24,7 +24,10 @@ GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
 GGML_Q6_K = 14
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
 GGML_BF16 = 30
+GGML_MXFP4 = 39
 
 # (block numel, bytes per block) per ggml type.
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
@@ -34,6 +37,9 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_MXFP4: (32, 17),
 }
 
 GGML_NAME = {
@@ -43,6 +49,9 @@ GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_MXFP4: "MXFP4",
 }
 
 
@@ -144,6 +153,9 @@ __all__ = [
     "GGML_Q4_0",
     "GGML_Q8_0",
     "GGML_Q6_K",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
+    "GGML_MXFP4",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
