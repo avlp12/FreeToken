@@ -288,6 +288,22 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
     # no alphas. DeepSeek-V4's own grouped GEMV kernels read them via bank_views().
     # Written as-loaded -> streamable (dummy fabricates in one shot; never streamed).
+    from freetoken.moe.fakequant import fakequant_bits_from_env
+
+    fq_bits = fakequant_bits_from_env()
+    if fq_bits > 0 and layer_sink is not None and not dummy:
+        # fakequant re-encodes each bank from its OWN fully materialized values (it needs
+        # the whole [E, N, K] tensor to dequant/simulate/re-encode per 32-group), but the
+        # layer_sink path (checkpoint conversion) streams each layer straight out as soon
+        # as it completes -- nothing stays resident here for fakequant to rewrite. Rather
+        # than silently skip it, force the non-streamed path for this load.
+        logger.warning_rank0(
+            f"FREETOKEN_FAKEQUANT_BITS={fq_bits} set but this load streams layers to "
+            "layer_sink (checkpoint conversion path); fakequant needs the full banks "
+            "materialized here to re-encode them, so forcing the non-streamed ds_fp4 "
+            "build for this load (layer_sink disabled)."
+        )
+        layer_sink = None
     sink = None if dummy else layer_sink
     if dummy:
         from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
@@ -303,6 +319,14 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
 
         banks = load_dsfp4_expert_sources(model_path, args, layer_sink=sink)
+    if fq_bits > 0 and not dummy:
+        # Hook point: banks are fully loaded (and, on the non-streamed path taken above,
+        # already pinned -- the loaders pin-after-fill internally via PinPipeline) here,
+        # identically regardless of which of the two loaders built them. Rewrites the
+        # SAME pinned host buffers in place; see freetoken.moe.fakequant for the scheme.
+        from freetoken.moe.fakequant import apply_fakequant_to_banks
+
+        apply_fakequant_to_banks(banks, device=device if isinstance(device, torch.device) else None)
     return ExpertBanks(
         "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]}, streamed=sink is not None
     )
