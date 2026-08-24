@@ -17,6 +17,9 @@ class SchedulerConfig(EngineConfig):
     # True when --max-prefill-length was given on the CLI. Models that widen the chunk for
     # single-pass prefill (DSV4) must not clobber an explicit user value.
     max_extend_tokens_explicit: bool = False
+    # Host-RAM KV tier budget in GiB (0 = disabled). swa_radix (DSV4) only: evicted full-KV
+    # spans are snapshotted to host RAM and restored at admission instead of re-prefilling.
+    host_kv_cache_gb: float = 0.0
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40

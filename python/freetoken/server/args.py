@@ -315,6 +315,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-kv-cache-gb",
+        type=float,
+        default=ServerArgs.host_kv_cache_gb,
+        help=(
+            "Host-RAM KV tier budget in GiB (0 = disabled). DSV4 only: evicted full-KV "
+            "spans are snapshotted to host RAM and restored at admission time, so a "
+            "session pushed out by cache pressure resumes from its cached prefix instead "
+            "of a cold re-prefill."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

@@ -84,6 +84,26 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
+        # Host-RAM KV tier (DSV4 swa_radix only): snapshot evicted full-KV spans to host
+        # RAM and restore them at admission instead of re-prefilling. Opt-in via
+        # --host-kv-cache-gb; requires the pool tiers the DSV4 paged pool exposes.
+        if (
+            config.host_kv_cache_gb > 0
+            and self.cache_manager.is_swa
+            and hasattr(self.engine.kv_cache, "cmp_pool")
+        ):
+            from freetoken.kvcache.host_kv_tier import HostKVTier
+
+            self.cache_manager.attach_host_tier(
+                HostKVTier(
+                    self.engine.kv_cache, config.page_size,
+                    int(config.host_kv_cache_gb * (1 << 30)),
+                )
+            )
+            logger.info_rank0(
+                f"Host KV tier enabled: {config.host_kv_cache_gb:g} GiB of host RAM for "
+                "evicted-session KV (restore-on-admission)"
+            )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager

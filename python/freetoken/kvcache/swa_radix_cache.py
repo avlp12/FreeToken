@@ -83,6 +83,10 @@ class SWARadixCache:
         self._clk = 0            # logical access clock (tie-free, for near-root-first order)
         self._uuid = 0           # monotonic swa window-boundary handle counter
         self._revives = 0        # observability: # of insert-side tombstone revives (Branches 1/2)
+        # Optional host-KV-tier save hook: callable(prefix_ids, span_start, full_locs), fired
+        # just before a node's full KV leaves the tree (its content is still valid then --
+        # slots are merely queued for reuse). None = tier disabled; the caller guards errors.
+        self.host_hook = None
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
@@ -297,6 +301,7 @@ class SWARadixCache:
             node = heapq.heappop(leaves)
             if node.ref_count != 0 or not node.is_leaf() or node.is_root():
                 continue
+            self._fire_host_hook(node)
             freed += node.length
             kv.append(node.value)
             self.full_evictable -= node.length
@@ -325,6 +330,7 @@ class SWARadixCache:
             if node.swa_tombstone or node.swa_ref_count != 0 or node.is_root():
                 continue
             if node.is_leaf() and node.ref_count == 0:
+                self._fire_host_hook(node)
                 kv.append(node.value)
                 swa.append(node.value)
                 self.full_evictable -= node.length
@@ -400,11 +406,57 @@ class SWARadixCache:
         freed = 0
         while (parent.swa_tombstone and parent.is_leaf()
                and parent.ref_count == 0 and not parent.is_root()):
+            self._fire_host_hook(parent)
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length
             parent = self._unlink(parent)
         return parent, freed
+
+    # ---------------------------------------------------------------- host KV tier
+    def _fire_host_hook(self, node: RadixTreeNode) -> None:
+        """Snapshot ``node``'s span to the host tier just before its full KV leaves the tree.
+        Fired while the node is still linked (ancestors reconstruct the prefix) and before the
+        pool frees its slots (content still valid). Best-effort: errors degrade to plain
+        eviction."""
+        if self.host_hook is None:
+            return
+        try:
+            keys: List[torch.Tensor] = []
+            cur = node
+            while not cur.is_root():
+                keys.append(cur._key)
+                cur = cur.parent
+            keys.reverse()
+            ids = torch.cat(keys)
+            self.host_hook(ids, ids.numel() - node.length, node.value)
+        except Exception as exc:  # never let the tier break eviction
+            self.host_hook = None
+            from freetoken.utils import init_logger
+            init_logger(__name__).warning(f"host-kv save failed, tier disabled: {exc!r}")
+
+    def raw_frontier(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+        """Walk the tree along ``input_ids`` without splitting or stamping. Returns the deepest
+        fully-matched node and the frontier position; a partial in-node match returns frontier
+        ``-1`` (no clean attach boundary -> the host tier skips restore)."""
+        node, pos = self.root, 0
+        while pos < len(input_ids):
+            child = node.children.get(self.key_fn(input_ids[pos:]))
+            if child is None:
+                break
+            match_len = align_down(child.get_match_len(input_ids[pos:]), self.page_size)
+            if match_len < child.length:
+                return (node, pos) if match_len == 0 else (child, -1)
+            node = child
+            pos += match_len
+        return node, pos
+
+    def attach_restored(self, node: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor,
+                        *, live: bool) -> RadixTreeNode:
+        """Attach a host-tier-restored span as a fresh child of ``node`` (the raw frontier).
+        ``live=False`` re-enters it in the tombstoned state it was evicted in."""
+        assert self.key_fn(ids) not in node.children, "restore would shadow an existing child"
+        return self._add_child(node, ids, kv, tombstone=not live)
 
     def _stamp_path(self, node: RadixTreeNode) -> None:
         """Stamp the matched path with strictly DECREASING timestamps toward root (deepest newest)

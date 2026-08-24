@@ -65,6 +65,61 @@ class CacheManager:
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
     prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
+    host_tier = None             # optional HostKVTier (swa_radix only; see attach_host_tier)
+
+    def attach_host_tier(self, tier) -> None:
+        """Enable the host-RAM KV tier (DSV4 swa_radix only): evicted full-KV spans are
+        snapshotted to host RAM and transparently restored at admission time."""
+        assert self.is_swa, "host KV tier requires the swa_radix cache"
+        self.host_tier = tier
+        self.prefix_cache.host_hook = self._host_save
+
+    def _host_save(self, ids: torch.Tensor, start: int, full_locs: torch.Tensor) -> None:
+        self.host_tier.save_span(ids.cpu(), start, full_locs)
+
+    def _host_restore(self, input_ids: torch.Tensor) -> int:
+        """Restore stored spans extending the tree's raw frontier along ``input_ids``. Never
+        evicts to make room (a restore must not thrash live cache); spans whose window can't
+        be seated come back tombstoned, exactly as they left. Returns restored token count."""
+        tier = self.host_tier
+        if tier is None or not tier.entries:
+            return 0
+        node, frontier = self.prefix_cache.raw_frontier(input_ids)
+        if frontier < 0:
+            return 0
+        restored = 0
+        # Restoring MAY evict other unlocked prefixes -- that is the session swap (their spans
+        # get saved to the tier by the same eviction hook). Pin the frontier node so the swap's
+        # own eviction can never unlink the chain we are attaching to.
+        uuid = self.prefix_cache.inc_lock(node) if not node.is_root() else None
+        try:
+            while (entry := tier.find(input_ids, frontier)) is not None:
+                pages = entry.span() // self.page_size
+                if pages == 0 or entry.span() > self.available_size:
+                    break
+                full = self._page_to_token(self._allocate(pages))
+                window_ok = entry.live and self.swa_available_size >= entry.span()
+                if window_ok:
+                    self.ensure_swa_slots(entry.span())
+                    self.swa_pool.alloc_swa(full)
+                live = tier.restore_span(entry, full, window_ok)
+                child = self.prefix_cache.attach_restored(
+                    node, entry.ids[entry.start : entry.end], full, live=live)
+                new_uuid = self.prefix_cache.inc_lock(child)
+                if not node.is_root():
+                    self.prefix_cache.dec_lock(node, uuid)
+                node, uuid = child, new_uuid
+                frontier = entry.end
+                restored += entry.span()
+        finally:
+            if not node.is_root():
+                self.prefix_cache.dec_lock(node, uuid)
+        if restored:
+            from freetoken.utils import init_logger
+            init_logger(__name__).info(
+                f"host-kv: restored {restored} tokens to the prefix cache "
+                f"(frontier -> {frontier})")
+        return restored
 
     def page_usage(self) -> tuple[int, int]:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
@@ -93,6 +148,16 @@ class CacheManager:
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            if self.host_tier is not None and m.cached_len < align_down(len(ids), self.page_size):
+                try:
+                    if self._host_restore(ids):
+                        m = self.prefix_cache.match_prefix(ids)
+                except Exception as exc:  # best-effort: fall back to the plain match
+                    from freetoken.utils import init_logger
+                    init_logger(__name__).warning(
+                        f"host-kv restore failed, tier disabled: {exc!r}")
+                    self.host_tier = None
+                    self.prefix_cache.host_hook = None
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
@@ -587,6 +652,10 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+        # Re-arm the host tier's save hook on the fresh tree (stored spans stay valid -- they
+        # hold relocatable content, no absolute slot ids).
+        if self.host_tier is not None and self.is_swa:
+            self.prefix_cache.host_hook = self._host_save
 
     @contextmanager
     def lazy_free_region(self):
