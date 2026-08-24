@@ -11,7 +11,9 @@ dim; row_bytes spans whole quant blocks of the fastest dim).
 from __future__ import annotations
 
 import functools
+import glob
 import os
+import re
 import struct
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -19,11 +21,22 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 
+# llama.cpp split-GGUF shard filename convention: "<stem>-NNNNN-of-MMMMM.gguf".
+_SPLIT_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
+
 
 def is_gguf_path(model_path: str) -> bool:
-    """A single ``.gguf`` file (the only GGUF layout FreeToken loads directly)."""
-    return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
+    """A single ``.gguf`` file, or a directory holding a llama.cpp split-GGUF shard
+    set (``*-00001-of-0000N.gguf`` ...). The path to a set's first shard is itself a
+    plain ``.gguf`` file and already matches the first branch.
+    """
+    if isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
         ".gguf"
+    ):
+        return True
+    return isinstance(model_path, str) and os.path.isdir(model_path) and any(
+        _SPLIT_SHARD_RE.match(os.path.basename(p))
+        for p in glob.glob(os.path.join(model_path, "*.gguf"))
     )
 
 
@@ -140,11 +153,50 @@ def gguf_architecture(model_path: str) -> str:
     return str(arch)
 
 
-def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
+def _split_shard_paths(model_path: str) -> list[str] | None:
+    """Ordered shard paths for a llama.cpp split-GGUF set, or ``None`` if
+    ``model_path`` is a plain single-file GGUF (not a split set).
+
+    Accepts either a directory containing the shard set, or the path to the set's
+    first shard (``*-00001-of-0000N.gguf``); siblings are located by globbing the
+    same directory for files matching the same ``stem``/``total``.
+    """
+    if isinstance(model_path, str) and os.path.isdir(model_path):
+        dirpath = model_path
+    elif (
+        isinstance(model_path, str)
+        and os.path.isfile(model_path)
+        and "-00001-of-" in os.path.basename(model_path)
+    ):
+        dirpath = os.path.dirname(model_path) or "."
+    else:
+        return None
+
+    groups: dict[tuple[str, str], dict[int, str]] = {}
+    for path in sorted(glob.glob(os.path.join(dirpath, "*.gguf"))):
+        m = _SPLIT_SHARD_RE.match(os.path.basename(path))
+        if m is None:
+            continue
+        key = (m.group("stem"), m.group("total"))
+        groups.setdefault(key, {})[int(m.group("idx"))] = path
+
+    if not groups:
+        return None
+    if len(groups) > 1:
+        raise ValueError(f"{model_path}: multiple split-GGUF shard sets found: {sorted(groups)}")
+    (stem, total), shards = next(iter(groups.items()))
+    total_n = int(total)
+    missing = [i for i in range(1, total_n + 1) if i not in shards]
+    if missing:
+        raise ValueError(
+            f"{model_path}: split-GGUF set {stem!r} missing shard(s) {missing} of {total_n}"
+        )
+    return [shards[i] for i in range(1, total_n + 1)]
+
+
+def _iter_tensors_from_reader(reader) -> Iterator[GgufTensor]:
     import gguf
 
-    reader = _reader(model_path)
     for t in reader.tensors:
         ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
         torch_shape = tuple(reversed(ne))
@@ -169,6 +221,24 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
             row_bytes=row_bytes,
             _raw=raw,
         )
+
+
+def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
+    """Yield every tensor with its torch shape, ggml type, and packed block bytes.
+
+    ``model_path`` may be a single ``.gguf`` file, a directory containing a
+    llama.cpp split-GGUF shard set, or the path to that set's first shard
+    (``*-00001-of-0000N.gguf``, siblings globbed automatically). Split sets are
+    read shard-by-shard and the tensors of all shards are yielded as one stream,
+    since each shard's tensor-info table lists only the tensors physically stored
+    in that shard.
+    """
+    shard_paths = _split_shard_paths(model_path)
+    if shard_paths is None:
+        yield from _iter_tensors_from_reader(_reader(model_path))
+        return
+    for shard_path in shard_paths:
+        yield from _iter_tensors_from_reader(_reader(shard_path))
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
