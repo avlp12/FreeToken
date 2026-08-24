@@ -104,12 +104,13 @@ def _build(prefetch: bool, topk_limit: int = 0):
 
     gates = [_FakeGate(i, dev) for i in range(NUM_LAYERS)]
     pf = MoePrefetcher()
-    # Pinned, not inherited from the ambient FREETOKEN_PREFETCH_TOPK: these tests
-    # assert on how many rows the speculation pulls, so the rank limit has to be a
-    # parameter of the test rather than of whatever environment it runs in.
-    pf.topk_limit = topk_limit
     for i, g in enumerate(gates):
         pf.register_gate(i, g, n_layers=NUM_LAYERS, top_k=TOP_K, n_experts=NUM_EXPERTS)
+    # Pinned AFTER registration (which is where the auto limit resolves) and not
+    # inherited from the ambient FREETOKEN_PREFETCH_TOPK: these tests assert on how
+    # many rows the speculation pulls, so the rank limit has to be a parameter of the
+    # test rather than of whatever environment it happens to run in. 0 = no limit.
+    pf.topk_limit = topk_limit
     return cache, gates, (pf if prefetch else None)
 
 

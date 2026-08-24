@@ -42,32 +42,36 @@ Ordering rules the implementation preserves:
 
 Why a rank limit (FREETOKEN_PREFETCH_TOPK) exists
 -------------------------------------------------
-Measured on this box, DSV4-Flash q2_k_ud, 740 slots, 399-token decode
-(``moe-stats``, expert rows are 9.19 MiB each, 43 layers)::
+Decode here is **bandwidth** bound, not latency bound, and that changes what the
+feature is for. Measured on this box -- DSV4-Flash q2_k_ud, 740 slots, 399-token
+decode, expert rows 9.19 MiB, 43 layers, from ``moe-stats``::
 
-                       real misses   speculative   total rows   sustained
-                       /layer/step   pulled        /layer/step  PCIe        tok/s
-    prefetch off       2.742         --            2.742        24.2 GB/s   21.3
-    prefetch on (all 6) 1.080        2.691         3.771        31.9 GB/s   20.4
+                     real miss   spec     total rows   sustained
+                     /layer      pulled   /layer       PCIe        tok/s
+    off              2.742       --       2.742        24.2 GB/s   21.3
+    top-2, bpb 4     1.955       0.862    2.818        26.9 GB/s   23.4
+    top-3, bpb 4     1.689       1.226    2.915        28.5 GB/s   24.2   <- default
+    top-4, bpb 4     1.434       1.647    3.081        29.6 GB/s   24.2
+    all 6,  bpb 2    1.080       2.691    3.771        31.9 GB/s   20.4
 
-The prediction works: real misses fall 61%, and the fork does overlap -- it pushes
-the link from 24.2 GB/s to 31.9 GB/s, which is this platform's measured zero-copy
-ceiling. Both halves of the design do exactly what they were built to do.
+Read down the columns and the whole mechanism is visible. The lookahead genuinely
+predicts: every extra rank cuts real misses further, and at all six it removes 61% of
+them. The fork genuinely overlaps: every extra rank also lifts sustained PCIe, from
+24.2 GB/s (the serial path leaves a quarter of the link idle behind compute) toward
+31.9 GB/s, this platform's zero-copy ceiling.
 
-It still nets zero, because decode here is **bandwidth** bound, not latency bound.
-Speculating on all six predictions moves 37.5% more bytes; the fork wins back 32%
-more bandwidth; the two cancel. Of the 2.691 rows pulled speculatively only ~1.66
-were rows the real path would otherwise have fetched -- the other ~1.03 are
-mispredictions, paid for in full at the one resource that is already exhausted.
+But every rank costs bytes on a link that is the bottleneck, and the low-ranked
+predictions are the ones most likely to be wrong. At all six, 37.5% more bytes move
+and the fork wins back 32% more bandwidth -- they cancel exactly, which is why the
+first server measurement of this feature showed no effect at all despite both halves
+working. Only ~1.66 of those 2.691 speculative rows were rows the real path would
+have fetched anyway; the rest is waste billed to the exhausted resource.
 
-So the useful knob is not the fork, it is how much speculation to buy. Truncating to
-the highest-scoring predictions keeps the ones most likely to be right and drops the
-tail that costs bytes without removing misses. ``FREETOKEN_PREFETCH_TOPK=N`` pulls
-only the top N of each layer's prediction (0 = all). The break-even is where total
-rows/layer stays at or below the prefetch-off figure while the fork keeps the higher
-bandwidth: at 24.2 -> 31.9 GB/s, moving the OFF byte count at the ON bandwidth would
-be ~28 tok/s, so anything that buys back the overlap without the waste is worth real
-throughput.
+Half the router's top_k is the measured optimum and the default (an explicit
+``FREETOKEN_PREFETCH_TOPK`` overrides; 0 pulls every prediction). Hash-router layers
+are never truncated: their Gate is a token-id lookup, exact by construction, so every
+row it names would have been fetched anyway -- and its ids carry no score order to
+truncate by.
 
 Keep-wrong semantics
 --------------------
@@ -135,7 +139,8 @@ logger = init_logger(__name__)
 __all__ = ["MoePrefetcher", "get_prefetcher"]
 
 # How many of the lookahead router's top-k predictions to actually pull, per layer.
-# 0 = all of them. See the "Why a rank limit" section of the module docstring: on a
+# Unset = auto (half the router's top_k, the measured optimum -- see the "Why a rank
+# limit" section of the module docstring); 0 = all of them; N = that many. On a
 # bandwidth-saturated link the low-ranked predictions cost more in wasted bytes than
 # the misses they remove, so this is the knob that decides whether the feature is a
 # win or a wash.
@@ -168,7 +173,10 @@ class MoePrefetcher:
         # log otherwise cannot tell you.
         self.scheduled: set[int] = set()
         raw = os.getenv(TOPK_ENV, "").strip()
-        self.topk_limit = int(raw) if raw else 0
+        self._topk_env = int(raw) if raw else None  # None -> auto, from top_k
+        # 0 = pull every prediction. Replaced with the resolved limit by the first
+        # register_gate, which is where the router's top_k becomes known.
+        self.topk_limit = 0
 
     # ------------------------------------------------------------------ registry
     def register_gate(
@@ -190,6 +198,12 @@ class MoePrefetcher:
             return
         if self.n_layers == 0:
             self.n_layers, self.top_k, self.n_experts = n_layers, top_k, n_experts
+            # Auto rank limit: half the router's top_k. Measured optimum at top_k=6
+            # (see the module docstring's table); expressed as a fraction so a model
+            # with a different top_k lands somewhere sane rather than on a literal 3.
+            self.topk_limit = (
+                self._topk_env if self._topk_env is not None else max(1, top_k // 2)
+            )
         elif (self.n_layers, self.top_k, self.n_experts) != (n_layers, top_k, n_experts):
             # Mixed geometries in one process: keep the first and prefetch nothing
             # for the rest rather than mispredicting into a foreign id space.

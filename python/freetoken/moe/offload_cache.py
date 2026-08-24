@@ -56,7 +56,12 @@ MOE_PREFETCH_ENV = "FREETOKEN_MOE_PREFETCH"
 # concurrent GEMM; 1-4 reach 98-100% (and bpb=1 also raises pull-alone bandwidth,
 # 44.3 vs 38.4 GB/s) -- measured on this box, see /root/test_graph_fork_overlap_tuning.py.
 PREFETCH_BPB_ENV = "FREETOKEN_PREFETCH_BPB"
-PREFETCH_BPB_DEFAULT = 2
+# 4 blocks per bank, measured at production shapes (DSV4-Flash q2_k_ud, TWO banks:
+# 24.1 tok/s at bpb=4 vs 23.3 at bpb=2 and 23.6 at bpb=8). The unit is per BANK, so
+# a 2-bank format at bpb=2 issues only 4 blocks in total -- well under the PCIe knee
+# -- while the 8-bank synthetic that first showed 98-100% overlap efficiency at
+# "bpb 1-4" was issuing 8-32. Total blocks is what matters; re-sweep per format.
+PREFETCH_BPB_DEFAULT = 4
 # blocks_per_bank for the MAIN (serial) decode miss copy. Default unchanged from the
 # kernel's own default; exposed purely so the serial-path grid can be A/B'd at
 # production shapes without editing code.
