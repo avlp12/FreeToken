@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -30,6 +31,13 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _FALSEY = {"0", "false", "no", "off", ""}
+
+# Per-layer prefill instrumentation (FREETOKEN_PREFILL_TRACE=1). Diagnostic only: it
+# adds a CUDA event pair per layer copy plus one log line per chunk, so it stays off in
+# production. It measures the three things a streaming prefill can lose time to: host
+# time inside prefetch (a host-blocking sync there stalls the whole pipeline), the copy
+# stream's own DMA duration, and host time blocked on the ready event before the GEMM.
+_PREFILL_TRACE = os.getenv("FREETOKEN_PREFILL_TRACE", "0").strip().lower() not in _FALSEY
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -783,6 +791,14 @@ class OffloadMoeCache:
             # fence the first prefetch would stomp bytes a running GEMM is reading.
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
+        if _PREFILL_TRACE:
+            self._tr = {
+                "pf_host": 0.0,  # host seconds spent inside prefetch_prefill_layer
+                "wait_host": 0.0,  # host seconds blocked in wait_prefill_layer
+                "t0": time.perf_counter(),
+                "ev": [],  # (start_event, end_event) per layer copy, on the copy stream
+                "layers": 0,
+            }
         self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot
@@ -793,6 +809,16 @@ class OffloadMoeCache:
             self.prefill_copy_stream.synchronize()
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
+        if _PREFILL_TRACE and getattr(self, "_tr", None) is not None:
+            _t0 = time.perf_counter()
+            try:
+                self._prefetch_prefill_layer(layer_id)
+            finally:
+                self._tr["pf_host"] += time.perf_counter() - _t0
+            return
+        self._prefetch_prefill_layer(layer_id)
+
+    def _prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
             return
         if layer_id < 0:
@@ -819,9 +845,22 @@ class OffloadMoeCache:
             copy()
         else:
             with torch.cuda.stream(self.prefill_copy_stream):
+                _tr = getattr(self, "_tr", None) if _PREFILL_TRACE else None
+                if _tr is not None:
+                    # pre: copy stream reaches this layer's turn; start: the release
+                    # wait is satisfied; end: the layer's bytes have landed. pre->start
+                    # is release-wait stall, start->end is the actual DMA.
+                    e_pre, e_start, e_end = (torch.cuda.Event(enable_timing=True) for _ in range(3))
+                    e_pre.record(self.prefill_copy_stream)
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                if _tr is not None:
+                    e_start.record(self.prefill_copy_stream)
                 copy()
+                if _tr is not None:
+                    e_end.record(self.prefill_copy_stream)
+                    _tr["ev"].append((layer_id, e_pre, e_start, e_end))
+                    _tr["layers"] += 1
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
@@ -953,8 +992,45 @@ class OffloadMoeCache:
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
+            _t0 = time.perf_counter() if _PREFILL_TRACE else 0.0
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+            if _PREFILL_TRACE and getattr(self, "_tr", None) is not None:
+                self._tr["wait_host"] += time.perf_counter() - _t0
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
+    def _dump_prefill_trace(self) -> None:
+        """One log line per prefill chunk: where the streaming time actually went."""
+        tr = getattr(self, "_tr", None)
+        if not tr or not tr["ev"]:
+            return
+        self._tr = None  # dump once per chunk
+        torch.cuda.synchronize(self.device)
+        wall = time.perf_counter() - tr["t0"]
+        dma = [s.elapsed_time(e) for _, _, s, e in tr["ev"]]
+        stall = [p.elapsed_time(s) for _, p, s, _ in tr["ev"]]
+        # Bytes moved per layer = every bank's whole-layer extent.
+        per_layer = sum(int(f) * self.num_experts for f in self._copy_feat_bytes_host)
+        total_gib = per_layer * len(dma) / 2**30
+        busy = sum(dma) / 1e3
+        dma_sorted = sorted(dma)
+        gemm = [a.elapsed_time(b) for a, b in tr.get("gemm_ev", [])]
+        gemm_s = sum(gemm) / 1e3
+        logger.info(
+            f"prefill-trace-gemm: tokens={tr.get('tokens')} layers={len(gemm)} "
+            f"moe_gemm={gemm_s:.3f}s ({gemm_s / wall * 100 if wall else 0:.0f}% of chunk wall) "
+            f"rest={(wall - gemm_s):.3f}s"
+        )
+        logger.info(
+            f"prefill-trace: layers={len(dma)} wall={wall:.3f}s "
+            f"bytes={total_gib:.1f}GiB dma_busy={busy:.3f}s "
+            f"({total_gib / busy if busy else 0:.1f}GB/s in-copy, "
+            f"{total_gib / wall if wall else 0:.1f}GB/s effective) "
+            f"idle={(wall - busy):.3f}s "
+            f"host_in_prefetch={tr['pf_host']:.3f}s host_in_wait={tr['wait_host']:.3f}s "
+            f"release_stall={sum(stall) / 1e3:.3f}s "
+            f"dma_ms[min/med/max]={dma_sorted[0]:.1f}/{dma_sorted[len(dma_sorted) // 2]:.1f}/"
+            f"{dma_sorted[-1]:.1f}"
+        )
 
     def release_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap:
@@ -966,6 +1042,8 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+        if _PREFILL_TRACE and layer_id == self.num_layers - 1:
+            self._dump_prefill_trace()
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

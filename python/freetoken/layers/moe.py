@@ -412,6 +412,11 @@ class OffloadMoELayer(MoELayer):
         assert cache is not None
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
+            _tr = getattr(cache, "_tr", None)
+            if _tr is not None:
+                _g0 = torch.cuda.Event(enable_timing=True)
+                _g1 = torch.cuda.Event(enable_timing=True)
+                _g0.record()
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -422,6 +427,10 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            if _tr is not None:
+                _g1.record()
+                _tr.setdefault("gemm_ev", []).append((_g0, _g1))
+                _tr["tokens"] = hidden_states.shape[0]
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
