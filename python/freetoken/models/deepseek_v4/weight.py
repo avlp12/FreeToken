@@ -22,6 +22,7 @@ from tqdm import tqdm
 from freetoken.models.loader import drop_page_cache
 
 from .args import DeepseekV4Args, load_args
+from .layers import wo_a_fp8
 from .parallel import div_tp, shard, tp_info
 
 
@@ -71,6 +72,40 @@ def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 1
     s = torch.exp2(codes - 127.0)
     s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:n, :k]
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
+
+
+def quantize_fp8_block(weight: torch.Tensor, block: int = 128):
+    """Inverse of :func:`_dequant_fp8_block`: FP32/BF16 -> 128x128 block-scaled FP8.
+
+    The checkpoint's ue8m0 rule, matching ``act_quant``: per block
+    ``s = 2**ceil(log2(max(|w|, 1e-4) / 448))``, ``w_fp8 = round_e4m3(clamp(w/s, +-448))``,
+    scale stored as the e8m0 code ``e + 127``. Used for fabricated / re-quantized weights
+    (the real ``wo_a`` FP8 path passes the checkpoint tensors through untouched).
+    """
+    n, k = weight.shape
+    assert n % block == 0 and k % block == 0, (n, k, block)
+    w = weight.to(torch.float32).view(n // block, block, k // block, block)
+    amax = w.abs().amax(dim=(1, 3)).clamp_min(1e-4)                # [n/b, k/b]
+    e = torch.ceil(torch.log2(amax / 448.0))
+    s = torch.exp2(e)
+    q = (w / s[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    code = (e + 127.0).to(torch.uint8).view(torch.float8_e8m0fnu)
+    return q.view(n, k), code
+
+
+def _wo_a(name: str, weight: torch.Tensor, scale: torch.Tensor) -> Iterator:
+    """Yield the attention output projection's ``wo_a`` in whichever form this process
+    runs: bf16 (dequantized, the reference einsum) or the checkpoint's FP8 + e8m0 scale.
+
+    The FP8 form passes the checkpoint tensors through UNCHANGED -- no re-quantization,
+    so the only numeric change versus the reference is where the dequant happens (in the
+    GEMV's per-128-block accumulator instead of at load) plus the activation quant.
+    """
+    if not wo_a_fp8():
+        yield name, shard(_dequant_fp8_block(weight, scale), 0)
+        return
+    yield name, shard(weight, 0)
+    yield f"{name}_scale", shard(scale, 0)
 
 
 def iter_weights(
@@ -130,12 +165,11 @@ def iter_weights(
             yield from linear(f"{a}.wq_b", split=0)  # column-parallel over heads
             yield from linear(f"{a}.wkv")
             yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            # Rows are o_groups blocks of o_lora_rank, so a dim-0 split hands each rank
-            # whole groups -- matching the heads its wq_b shard produced.
-            yield f"{a}.wo_a", shard(_dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
-            ), 0)
+            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum)
+            # unless FREETOKEN_WO_A_FP8 keeps it FP8. Rows are o_groups blocks of
+            # o_lora_rank, so a dim-0 split hands each rank whole groups -- matching the
+            # heads its wq_b shard produced; the 128-row scale grid splits the same way.
+            yield from _wo_a(f"{a}.wo_a", get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale"))
             yield from linear(f"{a}.wo_b", split=1)  # row-parallel; all-reduced in _wo
             yield f"{a}.attn_sink", shard(get(f"{a}.attn_sink"), 0)
 
@@ -205,8 +239,8 @@ def _iter_dspark_weights(args: DeepseekV4Args, reader: "_ShardReader", linear):
         for name, tensor in linear(f"{a_src}.wkv"):
             yield name.replace(a_src, a_dst), tensor
         yield f"{a_dst}.kv_norm.weight", get(f"{a_src}.kv_norm.weight")
-        yield f"{a_dst}.wo_a", shard(
-            _dequant_fp8_block(get(f"{a_src}.wo_a.weight"), get(f"{a_src}.wo_a.scale")), 0
+        yield from _wo_a(
+            f"{a_dst}.wo_a", get(f"{a_src}.wo_a.weight"), get(f"{a_src}.wo_a.scale")
         )
         for name, tensor in linear(f"{a_src}.wo_b", split=1):
             yield name.replace(a_src, a_dst), tensor

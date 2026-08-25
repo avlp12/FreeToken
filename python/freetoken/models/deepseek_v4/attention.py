@@ -9,12 +9,22 @@ from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
-from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
+from freetoken.kernel.triton.dsv4.fp8_linear import (
+    act_quant_fp8_inplace,
+    grouped_block_fp8_linear,
+)
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
-from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
+from .layers import (
+    FP8,
+    Linear,
+    RMSNorm,
+    get_compress_topk_idxs,
+    get_window_topk_idxs,
+    wo_a_fp8,
+)
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 from .parallel import div_tp, tp_size
 
@@ -66,10 +76,22 @@ class Attention(nn.Module):
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
         self.wkv = Linear(self.dim, self.head_dim, kind="fp8")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
+        # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum), or --
+        # under FREETOKEN_WO_A_FP8 -- kept in the checkpoint's block-scaled FP8 and run
+        # through the grouped FP8 GEMV, halving its bytes at the cost of numerics.
         wo_a_rows = self.n_groups * args.o_lora_rank
         wo_a_k = args.n_heads * self.head_dim // args.o_groups
-        self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
+        self.wo_a_fp8 = wo_a_fp8()
+        if self.wo_a_fp8:
+            self.wo_a = nn.Parameter(
+                torch.empty(wo_a_rows, wo_a_k, dtype=FP8), requires_grad=False)
+            self.wo_a_scale = nn.Parameter(
+                torch.empty(wo_a_rows // 128, wo_a_k // 128, dtype=torch.float8_e8m0fnu),
+                requires_grad=False,
+            )
+        else:
+            self.wo_a = nn.Parameter(
+                torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
         # Row-parallel: each rank consumes its own groups and contributes a partial sum.
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
         self.softmax_scale = self.head_dim ** -0.5
@@ -124,8 +146,13 @@ class Attention(nn.Module):
         # produce a PARTIAL sum over the full output dim. One all-reduce completes it --
         # the single attention-side collective per block.
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
+        if self.wo_a_fp8:
+            # Block-diagonal FP8 GEMV: group g's head slice against rows
+            # [g*o_lora_rank, (g+1)*o_lora_rank) of wo_a. One launch at decode.
+            o = grouped_block_fp8_linear(o, self.wo_a, self.wo_a_scale, self.o_lora_rank)
+        else:
+            wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         o = self.wo_b(o)
         if self._comm is not None:
             o = self._comm.all_reduce(o)

@@ -3,6 +3,8 @@ compressed top-k index builders."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -11,6 +13,34 @@ from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 
 FP8 = torch.float8_e4m3fn
+
+
+def _env_wo_a_fp8() -> bool:
+    return os.environ.get("FREETOKEN_WO_A_FP8", "").lower() in ("1", "true", "yes", "on")
+
+
+#: ``FREETOKEN_WO_A_FP8=1`` keeps the attention output projection's ``wo_a`` in the
+#: checkpoint's block-scaled FP8 instead of dequantizing it to bf16 at load. ``wo_a`` is
+#: the single largest bf16 read left in the decode step (67 MB/layer x 43 = 2.9 GB/token,
+#: already at 94% of achievable bandwidth), so halving its bytes is the only way to make
+#: it cheaper. It CHANGES NUMERICS -- the reference runs a bf16 einsum here, and the FP8
+#: path additionally quantizes the activation -- so it is OFF by default and must be
+#: quality-gated before it is turned on.
+#:
+#: Read ONCE at import: the flag decides both the parameter dtypes the model allocates and
+#: which tensors the weight loader yields, and those two run at different times. A flip in
+#: between would silently mis-shape the load, so :func:`wo_a_fp8` refuses it.
+WO_A_FP8 = _env_wo_a_fp8()
+
+
+def wo_a_fp8() -> bool:
+    """Is the FP8 ``wo_a`` path enabled for this process? (see :data:`WO_A_FP8`)"""
+    if _env_wo_a_fp8() != WO_A_FP8:
+        raise RuntimeError(
+            "FREETOKEN_WO_A_FP8 changed after import: it selects both the wo_a parameter "
+            "dtype and the tensors the loader yields -- set it before the process starts"
+        )
+    return WO_A_FP8
 
 
 class Linear(nn.Module):
