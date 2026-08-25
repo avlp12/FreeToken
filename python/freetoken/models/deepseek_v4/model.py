@@ -30,7 +30,8 @@ from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
-from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
+from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+from freetoken.kernel.triton.dsv4.hc_fused import can_fuse, hc_head_stage, hc_stage
 from freetoken.kernel.triton.dsv4.norm import inv_rms
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
@@ -38,6 +39,7 @@ from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .attention import Attention
+from .hyperconnect import UNFUSED_HC, HCState, hc_materialize
 from .moe import MoE
 
 # Re-exports: keep every class/helper previously defined here importable from .model
@@ -57,6 +59,10 @@ logger = init_logger(__name__)
 
 # FREETOKEN_SPEC_DEBUG=1 also reports where the draft context KV lands.
 _DRAFT_CTX_DEBUG = os.environ.get("FREETOKEN_SPEC_DEBUG", "0") == "1"
+
+# Kept importable from .model for the numerics tests and for anything already reaching
+# for the escape hatch here.
+_UNFUSED_HC = UNFUSED_HC
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,8 @@ class Block(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base):
+        """Reference composition (``FREETOKEN_UNFUSED_HC=1``): collapse ``hc_mult``
+        streams to one and produce the next site's re-expand operands."""
         shape, dtype = x.size(), x.dtype
         x2d = x.flatten(2)
         xf = x2d.float()
@@ -111,70 +119,78 @@ class Block(nn.Module):
         y = hc_pre_combine(x.view(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
         return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
 
-    def hc_post(self, x, residual, post, comb):
-        shape = residual.size()
-        M = shape[0] * shape[1]
-        y = hc_post_combine(
-            x.reshape(M, self.dim), residual.reshape(M, self.hc_mult, self.dim), post, comb
-        )
-        return y.view(shape)
 
-    def prefill_batched(self, x, input_ids, segments, flat_positions):
+    def _hc_site(self, state: HCState, hc_fn, hc_scale, hc_base, norm):
+        """One hyper-connection site, start to finish.
+
+        Applies the pending re-expand from the previous sublayer, mixes, collapses the
+        streams and runs the sublayer's input RMSNorm -- one kernel launch when the
+        fused stage is available, nine when it is not.
+
+        Returns ``(stream, y, post, comb)``: the flat ``[M, hc_mult*dim]`` residual this
+        site branched from, the ``[B, T, dim]`` normalised sublayer input, and the
+        operands the *next* site will re-expand with.
+        """
+        shape = state.shape
+        B, T, hc, dim = shape
+        M = B * T
+        if _UNFUSED_HC or not can_fuse(M, dim, hc):
+            x = hc_materialize(state)
+            y, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
+            return x.view(M, hc * dim), norm(y), post, comb
+        stream, y, post, comb = hc_stage(
+            state.stream, state.pending, hc_fn, hc_scale, hc_base,
+            hc_mult=hc, sinkhorn_iters=self.hc_sinkhorn_iters, hc_eps=self.hc_eps,
+            norm_eps=self.norm_eps, norm_weight=norm.weight, tokens=M, dim=dim,
+        )
+        return stream, y.view(B, T, dim), post, comb
+
+    def _run(self, state: HCState, attn_call, input_ids) -> HCState:
+        """attn site -> attention -> ffn site -> MoE, leaving the final re-expand
+        pending for the next block (or for whoever flushes the pipeline)."""
+        shape = state.shape
+        M, dim = shape[0] * shape[1], shape[3]
+        residual, y, post, comb = self._hc_site(
+            state, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm
+        )
+        state = HCState(shape, pending=(attn_call(y).reshape(M, dim), residual, post, comb))
+
+        residual, y, post, comb = self._hc_site(
+            state, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm
+        )
+        out = self.ffn(y, input_ids).reshape(M, dim)
+        return HCState(shape, pending=(out, residual, post, comb))
+
+    def prefill_batched(self, state, input_ids, segments, flat_positions):
         # Ragged batched prefill (cu_seqlens, no padding; bs >= 1, cold and radix-hit segments
-        # mixed freely). ``x`` is [1, T, hc_mult, dim] -- the requests' token streams
-        # concatenated. Per-token ops (HC / norm / MoE) run batched over ALL T tokens (the
+        # mixed freely). The state carries a [1, T, hc_mult, dim] stream -- the requests' token
+        # streams concatenated. Per-token ops (HC / norm / MoE) run batched over ALL T tokens (the
         # MoE-offload amortization win); attention runs as ONE flat cu_seqlens launch over all
         # T queries (Attention.forward_ragged), with the stateful compressor/indexer looped per
         # request. ``segments`` = [(offset, extend_len, table_idx, start_pos)] off the attention
         # metadata; ``flat_positions`` [T] = per-token ABSOLUTE position (batch.positions).
-        residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.attn_norm(x)
-        x = self.attn.forward_ragged(x, segments, flat_positions)
-        x = self.hc_post(x, residual, post, comb)
+        return self._run(
+            state,
+            lambda y: self.attn.forward_ragged(y, segments, flat_positions),
+            input_ids,
+        )
 
-        residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
-
-    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None, ictx=None):
-        residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.attn_norm(x)
-        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx, ictx)
-        x = self.hc_post(x, residual, post, comb)
-
-        residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
+    def decode_step(self, state, pos, rows, cmp_stage_cap, input_ids, wctx=None, ictx=None):
+        return self._run(
+            state,
+            lambda y: self.attn.decode_step(y, pos, rows, cmp_stage_cap, wctx, ictx),
+            input_ids,
+        )
 
     def verify_block(
-        self, x, pos, rows, cmp_stage_cap, input_ids, num_reqs, span, wctx
+        self, state, pos, rows, cmp_stage_cap, input_ids, num_reqs, span, wctx
     ):
         """Fixed-width DSpark target block; algebra matches ``decode_step``."""
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        return self._run(
+            state,
+            lambda y: self.attn.verify_block(y, pos, rows, cmp_stage_cap, num_reqs, span, wctx),
+            input_ids,
         )
-        x = self.attn_norm(x)
-        x = self.attn.verify_block(
-            x, pos, rows, cmp_stage_cap, num_reqs, span, wctx
-        )
-        x = self.hc_post(x, residual, post, comb)
-
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        return self.hc_post(x, residual, post, comb)
 
 
 class Transformer(nn.Module):
@@ -274,6 +290,7 @@ class Transformer(nn.Module):
         return gathered[:, : self.vocab_size]
 
     def hc_head(self, x):
+        """Reference composition (``FREETOKEN_UNFUSED_HC=1``)."""
         shape, dtype = x.size(), x.dtype
         dim = self.args.dim
         x2d = x.flatten(2)
@@ -285,6 +302,45 @@ class Transformer(nn.Module):
         return hc_pre_combine(
             x.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype
         ).view(*shape[:2], dim)
+
+    def _head_site(self, state: HCState, final_norm: bool) -> torch.Tensor:
+        """Collapse the last block's streams for the output head.
+
+        The head mixes with ``hc_mult`` gates only -- no Sinkhorn, no re-expand -- so
+        this is the same fused stage minus that half, and it absorbs both the last
+        block's pending re-expand and (when the caller normalises straight after) the
+        final RMSNorm. Returns ``[B, T, dim]``.
+        """
+        B, T, hc, dim = state.shape
+        M = B * T
+        if _UNFUSED_HC or not can_fuse(M, dim, hc):
+            h = self.hc_head(hc_materialize(state))
+            return self.norm(h) if final_norm else h
+        y = hc_head_stage(
+            state.stream, state.pending, self.hc_head_fn, self.hc_head_scale,
+            self.hc_head_base, hc_mult=hc, hc_eps=self.hc_eps, norm_eps=self.norm_eps,
+            norm_weight=self.norm.weight if final_norm else None, tokens=M, dim=dim,
+        )
+        return y.view(B, T, dim)
+
+    def _layer_stack(self, h, run_layer, aux: list):
+        """Drive the 43 blocks over one deferred-re-expand pipeline.
+
+        Only the DSpark auxiliary taps force the stream to be materialised (they read
+        the block's own output); every other boundary hands the pending re-expand to
+        the next block's first hyper-connection kernel.
+        """
+        state = HCState.of(h)
+        for i, layer in enumerate(self.layers):
+            state = run_layer(i, layer, state)
+            if i in self._aux_layer_ids:
+                # The drafter's whole view of the context: this block's output with the
+                # hyper-connection copies averaged away, [B, T, dim]. This is the one
+                # place the pipeline has to stop and materialise the stream.
+                out = hc_materialize(state)
+                aux.append(out.mean(dim=2))
+                state = HCState.of(out)
+        return state
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
@@ -303,12 +359,11 @@ class Transformer(nn.Module):
         h = self.embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         aux: list[torch.Tensor] = []
-        for i, layer in enumerate(self.layers):
-            h = layer.prefill_batched(h, input_ids, segments, flat_positions)
-            if i in self._aux_layer_ids:
-                # The drafter's whole view of the context: this block's output with the
-                # hyper-connection copies averaged away, [1, T, dim].
-                aux.append(h.mean(dim=2))
+        state = self._layer_stack(
+            h,
+            lambda i, layer, st: layer.prefill_batched(st, input_ids, segments, flat_positions),
+            aux,
+        )
         aux_hidden = (
             torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
             if aux else None
@@ -324,8 +379,7 @@ class Transformer(nn.Module):
             )
         else:
             self._target_features = None
-        h = self.hc_head(h)
-        h = self.norm(h)
+        h = self._head_site(state, final_norm=True)
         # Normally only each request's final token needs logits. A speculative VERIFY
         # pass is the same ragged prefill -- each request resuming from its own
         # start_pos -- but it needs the logits at EVERY drafted position, to compare
@@ -361,10 +415,13 @@ class Transformer(nn.Module):
         # (two, for DSV4-Flash's 41 compressed layers) serves every layer of it.
         ictx = get_global_ctx().attn_backend.index_ctx(pos, rows, wctx, cmp_stage_cap)
         aux: list[torch.Tensor] = []
-        for i, layer in enumerate(self.layers):
-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, ictx)
-            if i in self._aux_layer_ids:
-                aux.append(h.mean(dim=2))  # [B, 1, dim]
+        state = self._layer_stack(
+            h,
+            lambda i, layer, st: layer.decode_step(
+                st, pos, rows, cmp_stage_cap, input_ids, wctx, ictx
+            ),
+            aux,
+        )
         aux_hidden = (
             torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
             if aux else None
@@ -382,8 +439,7 @@ class Transformer(nn.Module):
             )
         else:
             self._target_features = None
-        h = self.hc_head(h)
-        h = self.norm(h)
+        h = self._head_site(state, final_norm=True)
         return self.logits(h[:, -1])
 
     def verify_block(
@@ -407,13 +463,13 @@ class Transformer(nn.Module):
         h = self.embed_tokens(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         aux: list[torch.Tensor] = []
-        for i, layer in enumerate(self.layers):
-            h = layer.verify_block(
-                h, pos, rows, cmp_stage_cap, input_ids,
-                num_reqs, span, wctx,
-            )
-            if i in self._aux_layer_ids:
-                aux.append(h.mean(dim=2))
+        state = self._layer_stack(
+            h,
+            lambda i, layer, st: layer.verify_block(
+                st, pos, rows, cmp_stage_cap, input_ids, num_reqs, span, wctx
+            ),
+            aux,
+        )
 
         aux_hidden = (
             torch.cat(aux, dim=-1).view(-1, self.args.dim * len(aux))
@@ -430,7 +486,7 @@ class Transformer(nn.Module):
             )
         else:
             self._target_features = None
-        h = self.norm(self.hc_head(h))
+        h = self._head_site(state, final_norm=True)
         return self.logits(h.view(-1, self.args.dim))
 
 

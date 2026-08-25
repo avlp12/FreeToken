@@ -77,15 +77,31 @@ import triton.language as tl
 
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
-# One token per program in the split-K body, so every program re-reads all of ``hc_fn``
-# out of L2. That is a win while the token count is small (decode) and a loss once the
-# reference gemm can amortise the weight read across a tile of tokens (prefill), so the
-# fused path hands large batches back to the reference composition.
-FUSE_MAX_TOKENS = 64
+# One token per program in the split-K body, so the whole 1.5 MB of ``hc_fn`` is read
+# once PER TOKEN, where the reference's gemm reads it once per site and amortises it
+# across the batch. Fusing buys ~8 launches x 1.024 us per site and costs
+# (tokens-1) x ~1.05 us of extra weight traffic, so it stops paying somewhere in the
+# teens -- measured crossover on a 5090 is between 16 tokens (1.9x faster) and 32
+# (0.7x). Above the threshold the model hands the site back to the reference
+# composition, which is both correct and the faster of the two there.
+#
+# Lifting this would mean tiling the split-K body over tokens as well (SGLang's
+# token_block=32), which is the right move for large-batch decode and prefill but is
+# not what the batch-1 decode tail needs.
+FUSE_MAX_TOKENS = 16
 
+# Tuned on an RTX 5090 (sm_120, 170 SMs) against the 43-layer chain in
+# benchmarks/dsv4_hc_stage.py. The split-K body is a pure weight read -- 1.5 MB of
+# hc_fn per site, no reuse, nothing to hide the latency behind -- so it wants programs,
+# not work per program: one K-block each and enough of them to cover the machine is
+# ~1.6x faster than the four-blocks-per-program rule the reference implementations use
+# for their (larger, batched) tiles. Past 128 programs the epilogue, which is serial per
+# token however finely K is split, is all that is left.
 BLOCK_K = 128
 NUM_WARPS = 4
-NUM_STAGES = 3
+NUM_STAGES = 2
+_SK_CAP = 128
+_SK_MIN_BLOCKS = 1
 
 
 @triton.jit
@@ -222,7 +238,8 @@ def split_k_for(tokens: int, hc_dim: int, device_index: int) -> int:
     only on ``(tokens, hc_dim, device)``, so a given shape always reduces in the same
     order -- reproducibility does not depend on occupancy or arrival order.
     """
-    cap = min(_sm_count(device_index) // max(tokens, 1), hc_dim // (4 * BLOCK_K))
+    cap = min(_sm_count(device_index) // max(tokens, 1),
+              hc_dim // (_SK_MIN_BLOCKS * BLOCK_K), _SK_CAP)
     s = 1
     while s * 2 <= cap and hc_dim % (s * 2) == 0 and (hc_dim // (s * 2)) % BLOCK_K == 0:
         s *= 2

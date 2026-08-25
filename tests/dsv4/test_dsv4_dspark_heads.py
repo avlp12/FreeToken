@@ -136,8 +136,11 @@ class TestDraftHeadNormalization:
         from freetoken.models.deepseek_v4.dspark import DSparkDrafter
 
         body = inspect.getsource(DSparkDrafter.head_hidden)
-        assert "return self.hc_head(h)" in body
-        assert "return self.norm(self.hc_head(h))" not in body
+        # The confidence head reads the PRE-norm collapse; only ``propose`` normalises,
+        # and only for the base logits. Both the reference composition and the fused
+        # stage must leave the final RMSNorm off.
+        assert "self.norm(" not in body
+        assert "norm_weight=None" in body  # fused stage: no folded RMSNorm
 
     def test_only_base_logits_apply_the_final_norm(self):
         import inspect

@@ -37,10 +37,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+from freetoken.kernel.triton.dsv4.hc_fused import can_fuse, hc_head_stage
 from freetoken.kernel.triton.dsv4.norm import inv_rms
 from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
+from .hyperconnect import UNFUSED_HC, HCState, hc_materialize
 from .layers import Linear, RMSNorm
 from .parallel import div_tp
 
@@ -616,7 +618,10 @@ class DSparkDrafter(nn.Module):
         return ids
 
     def hc_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Reduce the hyper-connection copies to one hidden state (mirrors Transformer)."""
+        """Reduce the hyper-connection copies to one hidden state (mirrors Transformer).
+
+        Reference composition; the fused single-launch form is in ``head_hidden``.
+        """
         shape, dtype = x.size(), x.dtype
         x2d = x.flatten(2)
         xf = x2d.float()
@@ -634,11 +639,24 @@ class DSparkDrafter(nn.Module):
 
         ``embeds`` is ``[1, T, dim]`` -- the block's token embeddings, already summed with
         the projected target hidden by the caller. Returns ``[1, T, dim]``.
+
+        The blocks run the same deferred-re-expand pipeline as the target stack: each
+        ``Block`` hands its pending ``hc_post`` to the next site's kernel, and the head
+        collapse absorbs the last one. No auxiliary taps here, so nothing forces the
+        stream to be materialised in between.
         """
         h = embeds.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        B, T = h.shape[0], h.shape[1]
+        state = HCState.of(h)
         for layer in self.layers:
-            h = layer.prefill_batched(h, input_ids, segments, positions)
-        return self.hc_head(h)
+            state = layer.prefill_batched(state, input_ids, segments, positions)
+        if UNFUSED_HC or not can_fuse(B * T, self.dim, self.hc_mult):
+            return self.hc_head(hc_materialize(state))
+        return hc_head_stage(
+            state.stream, state.pending, self.hc_head_fn, self.hc_head_scale,
+            self.hc_head_base, hc_mult=self.hc_mult, hc_eps=self.hc_eps,
+            norm_eps=self.norm_eps, norm_weight=None, tokens=B * T, dim=self.dim,
+        ).view(B, T, self.dim)
 
     def sample_block(
         self,

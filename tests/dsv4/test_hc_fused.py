@@ -22,10 +22,13 @@ contract is:
   actually run.
 """
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.autograd.profiler_util import DeviceType
 
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.hc_fused import (
@@ -33,6 +36,7 @@ from freetoken.kernel.triton.dsv4.hc_fused import (
 )
 from freetoken.kernel.triton.dsv4.norm import inv_rms, rms_norm
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
+from freetoken.models.deepseek_v4.hyperconnect import HCState, hc_materialize
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernel")
 
@@ -134,7 +138,10 @@ def test_mix_accuracy_not_worse_than_reference(tokens):
         return ((p.double() - truth).abs() / truth.abs()).mean().item()
 
     err_fused, err_ref = err(post), err(rpost.view(tokens, HC))
-    assert err_fused < err_ref * 1.5, (tokens, err_fused, err_ref)
+    # Either no worse than the reference, or already down at the fp32 floor where the
+    # ratio stops meaning anything (fp32 eps is 1.19e-7; at one token both paths land
+    # within a couple of ulps of the truth and which one wins is coin-flip).
+    assert err_fused < max(err_ref * 1.5, 4 * 1.1921e-7), (tokens, err_fused, err_ref)
 
 
 def test_reexpand_matches_standalone_kernel():
@@ -358,6 +365,126 @@ def test_can_fuse_gate():
 def test_env_flag_is_read_by_the_model():
     """The escape hatch has to be a real switch, not documentation."""
     from freetoken.models.deepseek_v4 import model as m
+    from freetoken.models.deepseek_v4 import hyperconnect as hcmod
 
     assert hasattr(m, "_UNFUSED_HC")
-    assert m._UNFUSED_HC == (os.environ.get("FREETOKEN_UNFUSED_HC", "0") not in ("0", ""))
+    want = os.environ.get("FREETOKEN_UNFUSED_HC", "0") not in ("0", "")
+    assert hcmod.UNFUSED_HC == want
+    assert m._UNFUSED_HC == want
+
+
+def test_unfused_env_takes_effect_in_a_fresh_interpreter():
+    """The flag is read at import, so prove it in a process that has it set."""
+    src = (
+        "from freetoken.models.deepseek_v4 import model as m;"
+        "from freetoken.models.deepseek_v4 import hyperconnect as h;"
+        "assert h.UNFUSED_HC is True and m._UNFUSED_HC is True;"
+        "print('ok')"
+    )
+    env = dict(os.environ, FREETOKEN_UNFUSED_HC="1")
+    out = subprocess.run([sys.executable, "-c", src], env=env, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "ok" in out.stdout
+
+
+# --------------------------------------------------------------------- the pipeline
+
+
+def _chain_params(sites, seed=41):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    return [
+        (
+            torch.randn(MIX, HCD, generator=g, device=DEV, dtype=torch.float32) * 0.02,
+            (torch.rand(3, generator=g, device=DEV) + 0.5).contiguous(),
+            torch.randn(MIX, generator=g, device=DEV) * 0.1,
+            torch.randn(DIM, generator=g, device=DEV, dtype=torch.bfloat16),
+        )
+        for _ in range(sites)
+    ]
+
+
+def _ref_chain(x, params, tokens):
+    """The composition FREETOKEN_UNFUSED_HC=1 runs, with the sublayers stubbed to a
+    pass-through so only the hyper-connection arithmetic is under test."""
+    stream = x
+    for fn, scale, base, w in params:
+        residual = stream
+        y, post, comb = _ref_pre(stream, fn, scale, base, w)
+        stream = _ref_post(y, residual, post, comb)
+    return stream
+
+
+def _fused_chain(x, params, tokens):
+    stream, pending = x, None
+    for fn, scale, base, w in params:
+        stream, y, post, comb = hc_stage(
+            stream, pending, fn, scale, base, hc_mult=HC, sinkhorn_iters=ITERS,
+            hc_eps=EPS, norm_eps=EPS, norm_weight=w, tokens=tokens, dim=DIM,
+        )
+        pending, stream = (y, stream, post, comb), None
+    return hc_materialize(HCState((tokens, 1, HC, DIM), pending=pending)).view(tokens, HCD)
+
+
+def test_pipeline_is_one_launch_per_site():
+    """The launch budget, guarded. Nine kernels per site become one; only the final
+    flush costs an extra."""
+    tokens, sites = 1, 6
+    params = _chain_params(sites)
+    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+
+    def count(call):
+        call()
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            call()
+            torch.cuda.synchronize()
+        return sum(
+            e.count for e in prof.key_averages()
+            if e.device_type == DeviceType.CUDA and e.self_device_time_total > 0
+        )
+
+    n_ref = count(lambda: _ref_chain(x, params, tokens))
+    n_fus = count(lambda: _fused_chain(x, params, tokens))
+    assert n_fus == sites + 1, (n_fus, n_ref)  # one per site, plus the closing flush
+    assert n_ref >= 8 * sites, n_ref
+
+
+def test_pipeline_drift_stays_inside_the_chain_conditioning():
+    """Over a stack of sites the fused and reference chains separate -- a stack of
+    hyper-connections is a chaotic map. The bar is that the separation is no larger
+    than the reference chain's own response to a single bf16 step on a single input
+    element, i.e. the fused path stays inside the arithmetic's noise floor."""
+    tokens, sites = 1, 12
+    params = _chain_params(sites, seed=59)
+    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+
+    ref = _ref_chain(x, params, tokens)
+    fus = _fused_chain(x, params, tokens)
+
+    xp = x.clone()
+    xp.view(-1)[0] = (xp.view(-1)[0].view(torch.int16) + 1).view(torch.bfloat16)
+    ctl = _ref_chain(xp, params, tokens)
+
+    def rel(a):
+        return ((a.float() - ref.float()).pow(2).sum().sqrt()
+                / ref.float().pow(2).sum().sqrt()).item()
+
+    assert rel(fus) <= max(rel(ctl) * 2.0, 1e-6), (rel(fus), rel(ctl))
+
+
+def test_flush_matches_the_standalone_post_combine():
+    """``hc_materialize`` is the reference kernel, unchanged -- it is what the DSpark
+    auxiliary taps and the unfused path fall back to."""
+    tokens = 4
+    a = torch.randn(tokens, DIM, device=DEV, dtype=torch.bfloat16)
+    res = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    post = torch.rand(tokens, HC, device=DEV) + 0.5
+    comb = torch.rand(tokens, HC, HC, device=DEV)
+    st = HCState((tokens, 1, HC, DIM), pending=(a, res, post, comb))
+    assert torch.equal(
+        hc_materialize(st).view(tokens, HCD), _ref_post(a, res, post, comb)
+    )
+    assert torch.equal(hc_materialize(HCState.of(res.view(tokens, 1, HC, DIM))),
+                       res.view(tokens, 1, HC, DIM))
