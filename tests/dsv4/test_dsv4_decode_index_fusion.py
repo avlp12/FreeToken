@@ -379,6 +379,34 @@ def test_decode_step_end_to_end_matches_the_unfused_path(ratio, p):
             assert torch.equal(a, b), f"pool buffer {i} (ratio={ratio}, pos={p})"
 
 
+@pytest.mark.parametrize("ratio,k", [(4, 512), (128, 1024)])
+def test_cmp_topk_to_global_at_capture_widths(ratio, k):
+    """A capture bakes the staging width off the engine's live ceiling: the ratio-4
+    layers then run ``k = index_topk = 512`` and the indexer-less class a positional
+    list ~1024 wide. Those tile sizes must compile and stay bit-identical -- the
+    small-``k`` cases above would not catch a block-size regression."""
+    from freetoken.kernel.triton.dsv4.decode_index import cmp_topk_to_global
+
+    n_stage = k * 4
+    width = n_stage * ratio
+    snap = torch.arange(width, dtype=torch.int64, device=DEV).unsqueeze(0).repeat(2, 1)
+    snap[1, ::7] = -1
+    rows = torch.arange(2, device=DEV)
+    valid = torch.tensor([n_stage // 2, n_stage], dtype=torch.int64, device=DEV)
+    wtopk = torch.arange(2 * P, dtype=torch.int64, device=DEV).view(2, 1, P)
+
+    got = cmp_topk_to_global(None, valid, rows, snap, wtopk, ratio=ratio, identity_k=n_stage)
+    want = _ref_topk_idxs(None, valid, rows, snap, wtopk, ratio, 0, n_stage)
+    assert torch.equal(got, want)
+
+    picks = torch.randint(
+        0, n_stage, (2, 1, k), generator=torch.Generator().manual_seed(3)
+    ).to(DEV)
+    got = cmp_topk_to_global(picks, valid, rows, snap, wtopk, ratio=ratio)
+    want = _ref_topk_idxs(picks, valid, rows, snap, wtopk, ratio, 0, None)
+    assert torch.equal(got, want)
+
+
 @pytest.mark.parametrize("ratio", [4, 128])
 def test_fused_decode_step_captures_and_replays_in_a_cuda_graph(ratio):
     """The fusion must stay INSIDE the captured graph.
