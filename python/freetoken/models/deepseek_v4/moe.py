@@ -10,6 +10,7 @@ from torch import nn
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
+from freetoken.kernel.triton.dsv4.router import fused_router, unfused_router
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
 from freetoken.moe.prefetch import get_prefetcher as _get_moe_prefetcher
@@ -19,6 +20,20 @@ from .args import DeepseekV4Args
 from .layers import Linear
 
 from .parallel import div_tp, tp_size
+
+
+def _fuse_router(score_func: str) -> bool:
+    """Whether ``Gate.forward``'s tail runs as the single fused kernel.
+
+    The kernel implements the sqrtsoftplus scoring function only -- the one every
+    DSV4 checkpoint uses. ``softmax`` (which also skips the renorm) and
+    ``sigmoid`` stay on the torch chain: no checkpoint exercises them, so a
+    second and third kernel specialization would be untested code on a path that
+    is not hot. Read per call, not at import: the escape hatch has to be usable
+    from a test that flips the env var after the module is loaded, and the read
+    is a dict lookup on a path that is already doing a GEMV.
+    """
+    return score_func not in ("softmax", "sigmoid") and not unfused_router()
 
 
 class Gate(nn.Module):
@@ -39,8 +54,62 @@ class Gate(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, *, return_scores: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        *,
+        return_scores: bool = False,
+        want_int32: bool = False,
+    ):
+        """Route ``x``: ``(weights, indices)``, plus ``sel_scores`` / int32 ids on request.
+
+        ``want_int32`` additionally returns the expert ids as a fresh contiguous
+        int32 tensor -- the form ``MoE.forward`` has to hand ``routed_forward``
+        anyway. The fused kernel stores it in the same launch it stores the int64
+        ids, so asking for it costs nothing and saves the caller a cast; the
+        buffer is exclusively owned, so the offload cache's in-place expert-id ->
+        slot-id rewrite is safe on it.
+        """
         scores = bf16_linear_fp32(x, self.weight)
+        if _fuse_router(self.score_func):
+            weights, indices, idx32, sel_scores = fused_router(
+                scores,
+                self.bias,
+                self.tid2eid if self.hash else None,
+                input_ids if self.hash else None,
+                top_k=self.topk,
+                route_scale=self.route_scale,
+                renormalize=True,
+                want_int32=want_int32,
+                want_sel=return_scores,
+            )
+            out = (weights, indices)
+            if return_scores:
+                out = out + (sel_scores,)
+            if want_int32:
+                out = out + (idx32,)
+            return out
+        return self._reference_route(
+            scores, input_ids, return_scores=return_scores, want_int32=want_int32
+        )
+
+    def _reference_route(
+        self,
+        scores: torch.Tensor,
+        input_ids: torch.Tensor,
+        *,
+        return_scores: bool = False,
+        want_int32: bool = False,
+    ):
+        """Pre-fusion torch composition of the router tail (nine launches).
+
+        Reached under ``FREETOKEN_UNFUSED_ROUTER=1``, and unconditionally for the
+        ``softmax``/``sigmoid`` scoring functions, which no DSV4 checkpoint uses
+        and which the fused kernel therefore does not implement. It is also the
+        reference the bit-identity test compares against, so it must stay a
+        faithful transcription of the original chain -- do not "simplify" it.
+        """
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
@@ -74,9 +143,12 @@ class Gate(nn.Module):
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
+        out = (weights, indices)
         if return_scores:
-            return weights, indices, sel_scores
-        return weights, indices
+            out = out + (sel_scores,)
+        if want_int32:
+            out = out + (indices.to(torch.int32).contiguous(),)
+        return out
 
 
 class Expert(nn.Module):
@@ -224,7 +296,12 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         flat_ids = input_ids.flatten()
-        weights, indices = self.gate(x, flat_ids)
+        # ``want_int32``: the routed GEMM needs the ids as contiguous int32 and the
+        # offload decode rewrites them in place, so the cast is not optional -- it is
+        # just cheaper inside the router kernel (one extra store) than as its own
+        # launch. The int64 ids still come back unchanged for the prefetcher and the
+        # routing tracer, which slice and read them.
+        weights, indices, ids32 = self.gate(x, flat_ids, want_int32=True)
         if self._routing_trace is not None:
             self._maybe_trace_routing(x, flat_ids, weights, indices)
         if self.experts.prefetcher is not None:
@@ -238,10 +315,11 @@ class MoE(nn.Module):
         # to overlap the CPU overflow compute.
         shared = self.shared_experts(x)
         # routed_forward may mutate the ids in place (offload decode slot remap);
-        # indices.to(int32) always copies (int64 source), so no clone needed here.
-        routed = self.experts.routed_forward(
-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
-        )
+        # ``ids32`` is a fresh buffer the gate wrote this call and nothing else
+        # reads, so no clone is needed here -- same guarantee the old
+        # ``indices.to(int32)`` copy gave. ``weights`` is already fp32 contiguous
+        # (kernel output), so ``.float().contiguous()`` would be two no-ops.
+        routed = self.experts.routed_forward(x, weights, ids32)
         out = routed + shared
         # Both halves are partial sums over the split intermediate dim; one collective
         # completes the layer (see DSV4OffloadMoELayer._maybe_all_reduce).
