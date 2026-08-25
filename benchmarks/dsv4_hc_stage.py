@@ -170,13 +170,15 @@ def main() -> int:
 
     ref = ref_chain(x, sites, head, n)
     fus = fused_chain(x, sites, head, n)
-    # Control: nudge ONE input element by one bf16 step and re-run the *reference*.
-    # A stack of hyper-connections is a chaotic map, so this is the yardstick the
-    # fused-vs-reference drift has to be read against -- anything at or below it is the
-    # chain's own conditioning, not a defect in the kernel.
+    # Control: nudge one input element PER TOKEN by one bf16 step and re-run the
+    # *reference*. A stack of hyper-connections is a chaotic map, so this is the
+    # yardstick the fused-vs-reference drift has to be read against -- anything at or
+    # below it is the chain's own conditioning, not a defect in the kernel. It has to be
+    # per token because tokens do not mix: perturbing only row 0 would leave every other
+    # row identical and understate the floor.
     xp = x.clone()
-    flat = xp.view(-1)
-    flat[0] = (flat[0].view(torch.int16) + 1).view(torch.bfloat16)
+    col = xp[:, 0]
+    col.copy_((col.view(torch.int16) + 1).view(torch.bfloat16))
     ctl = ref_chain(xp, sites, head, n)
     torch.cuda.synchronize()
 
