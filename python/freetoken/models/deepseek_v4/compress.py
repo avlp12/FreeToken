@@ -330,51 +330,80 @@ class Compressor(nn.Module):
             idx_mod, should, freq_idx = ictx.idx_mod, ictx.should3, ictx.freq_idx
         score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
 
-        # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
-        block = (
-            self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
-                self.layer_id, self.tier, prev_window_slots, self.ring_size
-            )
-            if ictx is None
-            else self.attn.read_carry_rows(self.layer_id, self.tier, ictx.carry_prev)
-        )
-        ks = block[..., :item].clone()  # [B, ring_size, item]
-        ss = block[..., item:].clone()
-
-        if overlap:
-            # per-row B-half slot
-            wslot = ((ratio + idx_mod) if ictx is None else ictx.ovl_slot).view(B, 1)
-            ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
-            ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
-            kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
-            score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
-            compressed = gated_pool(kv_eff, score_eff, dtype)
-            ks[:, :ratio] = torch.where(should, ks[:, ratio:], ks[:, :ratio])
-            ss[:, :ratio] = torch.where(should, ss[:, ratio:], ss[:, :ratio])
-        else:
-            ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
-            ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
-            compressed = gated_pool(ks, ss, dtype)
-        # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
-        # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.
-        carry_state = torch.cat([ks, ss], dim=-1)
-        if ictx is None:
-            self.attn.write_carry_blocks(
-                self.layer_id, self.tier, window_slots, self.ring_size, carry_state
-            )
-        else:
-            self.attn.write_carry_rows(self.layer_id, self.tier, ictx.carry_cur, carry_state)
+        # A speculative verify journals the written carry block by value, so it needs the
+        # concatenated tensor the fused store never materializes; keep it on the torch path.
         batch = get_global_ctx().batch
-        if getattr(batch, "speculative", False):
-            journal = batch.spec_carry_states
-            if journal is None:
-                raise RuntimeError("a speculative verify did not initialize its carry journal")
-            key = (self.layer_id, self.tier, self.ring_size)
-            record = getattr(journal, "record", None)
-            if record is None:
-                journal.setdefault(key, []).append(carry_state)
+        spec = bool(getattr(batch, "speculative", False))
+
+        if ictx is not None and not spec:
+            # Ring block -> registers -> gated-pool operands -> ring block, in two
+            # launches. Pure movement: the previous page's block with this token's
+            # kv/score substituted into its slot, then the advanced (and, where the
+            # block completed, rolled) block written back at this token's page.
+            from freetoken.kernel.triton.dsv4.carry_ring import carry_load, carry_store
+
+            ring = self.state_ring
+            ks, ss, kv_eff, score_eff = carry_load(
+                ring.buffer, ictx.carry_prev, kv, score,
+                ictx.ovl_slot if overlap else ictx.idx_mod,
+                item=item, ratio=ratio, d=d, overlap=overlap,
+            )
+            compressed = gated_pool(
+                kv_eff if overlap else ks, score_eff if overlap else ss, dtype
+            )
+            carry_store(
+                ring.buffer, ictx.carry_cur, ks, ss, ictx.should,
+                item=item, ratio=ratio, overlap=overlap,
+            )
+        else:
+            # Read each row's rolling carry block from the PREVIOUS token's page
+            # (ks|ss split at item).
+            block = (
+                self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
+                    self.layer_id, self.tier, prev_window_slots, self.ring_size
+                )
+                if ictx is None
+                else self.attn.read_carry_rows(self.layer_id, self.tier, ictx.carry_prev)
+            )
+            ks = block[..., :item].clone()  # [B, ring_size, item]
+            ss = block[..., item:].clone()
+
+            if overlap:
+                # per-row B-half slot
+                wslot = ((ratio + idx_mod) if ictx is None else ictx.ovl_slot).view(B, 1)
+                ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
+                ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
+                kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
+                score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
+                compressed = gated_pool(kv_eff, score_eff, dtype)
+                ks[:, :ratio] = torch.where(should, ks[:, ratio:], ks[:, :ratio])
+                ss[:, :ratio] = torch.where(should, ss[:, ratio:], ss[:, :ratio])
             else:
-                record(key, carry_state)
+                ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
+                ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
+                compressed = gated_pool(ks, ss, dtype)
+            # Persist the advanced carry block to THIS token's page (per row, disjoint
+            # blocks); the next step reads it from here. Within a page prev==cur, so this
+            # is a self-consistent roll.
+            carry_state = torch.cat([ks, ss], dim=-1)
+            if ictx is None:
+                self.attn.write_carry_blocks(
+                    self.layer_id, self.tier, window_slots, self.ring_size, carry_state
+                )
+            else:
+                self.attn.write_carry_rows(self.layer_id, self.tier, ictx.carry_cur, carry_state)
+            if spec:
+                journal = batch.spec_carry_states
+                if journal is None:
+                    raise RuntimeError(
+                        "a speculative verify did not initialize its carry journal"
+                    )
+                key = (self.layer_id, self.tier, self.ring_size)
+                record = getattr(journal, "record", None)
+                if record is None:
+                    journal.setdefault(key, []).append(carry_state)
+                else:
+                    record(key, carry_state)
 
         compressed = self.norm(compressed)
         freqs_t = self.freqs_cis.index_select(0, freq_idx)  # [B, rd//2]
