@@ -227,11 +227,22 @@ class OffloadMoeCache:
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
         self.cache_policy_id = policy_ids[self.cache_policy]
-        self.slot_for_id = torch.full(
-            (self.num_layers, self.num_experts),
+        # One extra trailing element is allocated as a WRITE-ONLY SINK. Invalidating a
+        # prefill buffer has to clear slot_for_id for the ids it evicts, and the ids
+        # that need clearing are only the non-negative ones -- but a boolean mask index
+        # (`old_ids[old_ids >= 0]`) runs `nonzero`, which needs its result size on the
+        # host and therefore SYNCS, draining the copy stream once per layer. Routing the
+        # negative entries to this sink instead makes the clear a fixed-shape scatter
+        # with no host round trip. Nothing ever reads the sink.
+        self._slot_for_id_flat = torch.full(
+            (self.num_layers * self.num_experts + 1,),
             -1,
             dtype=torch.int32,
             device=self.device,
+        )
+        self._slot_for_id_sink = self.num_layers * self.num_experts
+        self.slot_for_id = self._slot_for_id_flat[: self._slot_for_id_sink].view(
+            self.num_layers, self.num_experts
         )
         # Reverse map, in the flat id space flashlib's slot_cache works in:
         # id == layer_id * num_experts + expert, so one array replaces the (layer,
@@ -771,7 +782,12 @@ class OffloadMoeCache:
         slot_start = buffer_id * self.num_experts
         slot_end = slot_start + self.num_experts
         old_ids = self.id_of_slot[slot_start:slot_end]
-        self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+        # Fixed-shape scatter, no host sync: ids that are already -1 (nothing to clear)
+        # are aimed at the write-only sink element instead of being filtered out.
+        old64 = old_ids.to(torch.int64)
+        self._slot_for_id_flat.scatter_(
+            0, torch.where(old64 >= 0, old64, old64.new_full((), self._slot_for_id_sink)), -1
+        )
         old_ids.fill_(-1)
         # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
         # ensure_experts evicts them first.
