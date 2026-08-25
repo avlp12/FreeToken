@@ -314,6 +314,12 @@ _SPEC_TIMING = os.environ.get("FREETOKEN_SPEC_TIMING", "0") == "1"
 # One-shot operator profile of the target verify. Explicit opt-in: Kineto adds
 # substantial CPU overhead and synchronizes CUDA when the table is emitted.
 _SPEC_PROFILE = os.environ.get("FREETOKEN_SPEC_PROFILE", "0") == "1"
+# profile: temporary env-gated decode instrumentation (see docs in forward_batch).
+_DECODE_PROFILE = int(os.environ.get("FREETOKEN_DECODE_PROFILE", "0") or 0)
+_DECODE_TIMING = int(os.environ.get("FREETOKEN_DECODE_TIMING", "0") or 0)
+_DECODE_PROFILE_SKIP = int(os.environ.get("FREETOKEN_DECODE_PROFILE_SKIP", "8") or 0)
+_DECODE_PROFILE_ROWS = int(os.environ.get("FREETOKEN_DECODE_PROFILE_ROWS", "80") or 80)
+_DECODE_PROFILE_OUT = os.environ.get("FREETOKEN_DECODE_PROFILE_OUT", "")
 # Research MoE routing trace; None unless FREETOKEN_ROUTING_TRACE names a path
 # prefix at process start (see freetoken/moe/routing_trace.py). Only the eager
 # decode fallback drains through here -- the CUDA-graph path drains in GraphRunner.
@@ -490,6 +496,13 @@ class Engine:
         self._spec_drafted = 0
         self._spec_timing_left = 12
         self._spec_profile_left = 1
+        # profile: decode-step instrumentation state
+        self._decode_prof_skip = _DECODE_PROFILE_SKIP
+        self._decode_prof_left = _DECODE_PROFILE
+        self._decode_prof = None
+        self._decode_time_skip = _DECODE_PROFILE_SKIP
+        self._decode_time_left = _DECODE_TIMING
+        self._decode_time_ms = []
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1606,6 +1619,34 @@ class Engine:
             )
             if profiling else nullcontext()
         )
+        # profile: env-gated decode kernel profiler / step timer (temporary).
+        # FREETOKEN_DECODE_PROFILE=N  -> after FREETOKEN_DECODE_PROFILE_SKIP warmup
+        #   decode steps, run torch.profiler across the next N decode forwards and log
+        #   the aggregated kernel table (CUPTI reports kernels replayed inside a CUDA
+        #   graph, so this works on the graphed decode path).
+        # FREETOKEN_DECODE_TIMING=N   -> CUDA-event time the forward region of N decode
+        #   steps and log mean/median/min ms (no profiler overhead).
+        _dec = batch.is_decode and not batch.speculative
+        if _dec and self._decode_prof_left > 0:
+            if self._decode_prof_skip > 0:
+                self._decode_prof_skip -= 1
+            elif self._decode_prof is None:
+                self._decode_prof = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                )
+                self._decode_prof.start()
+        _dec_timing = (
+            _dec and self._decode_time_left > 0 and self._decode_time_skip == 0
+        )
+        if _dec and self._decode_time_left > 0 and self._decode_time_skip > 0:
+            self._decode_time_skip -= 1
+        if _dec_timing:
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record(self.stream)
         with profile_ctx as prof:
             with self.ctx.forward_batch(batch):
                 if self.graph_runner.can_use_spec_cuda_graph(batch):
@@ -1624,6 +1665,52 @@ class Engine:
                     # and speculative verify write nothing, so they drain nothing.
                     if _ROUTING_TRACER is not None and batch.is_decode:
                         _ROUTING_TRACER.after_step(batch.size)
+        if _dec_timing:
+            _t1.record(self.stream)
+            _t1.synchronize()
+            self._decode_time_ms.append(_t0.elapsed_time(_t1))
+            self._decode_time_left -= 1
+            if self._decode_time_left == 0:
+                _v = sorted(self._decode_time_ms)
+                _n = len(_v)
+                logger.info_rank0(
+                    "decode step timing over %d steps: mean=%.3fms median=%.3fms "
+                    "min=%.3fms max=%.3fms",
+                    _n,
+                    sum(_v) / _n,
+                    _v[_n // 2],
+                    _v[0],
+                    _v[-1],
+                )
+        if _dec and self._decode_prof is not None:
+            self._decode_prof_left -= 1
+            if self._decode_prof_left == 0:
+                torch.cuda.synchronize(self.device)
+                self._decode_prof.stop()
+                _steps = max(1, _DECODE_PROFILE)
+                try:
+                    _tbl = self._decode_prof.key_averages().table(
+                        sort_by="self_device_time_total", row_limit=_DECODE_PROFILE_ROWS
+                    )
+                except (KeyError, ValueError):
+                    _tbl = self._decode_prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=_DECODE_PROFILE_ROWS
+                    )
+                logger.info_rank0(
+                    "decode profile over %d steps (by self CUDA time):\n%s", _steps, _tbl
+                )
+                if _DECODE_PROFILE_OUT:
+                    try:
+                        with open(_DECODE_PROFILE_OUT, "w") as _f:
+                            _f.write(f"# decode profile over {_steps} steps\n")
+                            _f.write(_tbl)
+                            _f.write("\n")
+                        self._decode_prof.export_chrome_trace(
+                            _DECODE_PROFILE_OUT + ".trace.json"
+                        )
+                    except Exception as _e:  # pragma: no cover - instrumentation only
+                        logger.warning(f"decode profile dump failed: {_e}")
+                self._decode_prof = None
         if profiling:
             torch.cuda.synchronize(self.device)
             assert prof is not None
