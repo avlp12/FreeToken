@@ -1010,6 +1010,98 @@ int64_t ggml_moe_get_block_size(int64_t type) {
   return 0;
 }
 
+// ``sizeof(block_q_t)`` for a ggml type -- the byte width of ONE quantized
+// super-block, so ``blocks_per_row * ggml_type_block_bytes(t)`` is the natively
+// packed row width.
+//
+// Deliberately NOT ``ggml_moe_get_block_size``: that one returns the MMQ tile
+// height MOE_X_* (a row count), returns 0 for every IQ type, and 4 for Q2_K.
+// Confusing the two silently truncates a bank slice, so they are separate
+// functions with separate names.
+//
+// Used by the prefill dequant-GEMM path: the q2_k_ud banks pad every row out to
+// one shared pitch, and slicing the native prefix off each row turns a padded
+// bank back into the tightly-packed bank ``ggml_dequantize`` assumes.
+int64_t ggml_type_block_bytes(int64_t type) {
+  switch (type) {
+    case 2:
+      return (int64_t)sizeof(block_q4_0);
+    case 3:
+      return (int64_t)sizeof(block_q4_1);
+    case 6:
+      return (int64_t)sizeof(block_q5_0);
+    case 7:
+      return (int64_t)sizeof(block_q5_1);
+    case 8:
+      return (int64_t)sizeof(block_q8_0);
+    case 10:
+      return (int64_t)sizeof(block_q2_K);
+    case 11:
+      return (int64_t)sizeof(block_q3_K);
+    case 12:
+      return (int64_t)sizeof(block_q4_K);
+    case 13:
+      return (int64_t)sizeof(block_q5_K);
+    case 14:
+      return (int64_t)sizeof(block_q6_K);
+    case 16:
+      return (int64_t)sizeof(block_iq2_xxs);
+    case 17:
+      return (int64_t)sizeof(block_iq2_xs);
+    case 18:
+      return (int64_t)sizeof(block_iq3_xxs);
+    case 19:
+      return (int64_t)sizeof(block_iq1_s);
+    case 20:
+      return (int64_t)sizeof(block_iq4_nl);
+    case 21:
+      return (int64_t)sizeof(block_iq3_s);
+    case 22:
+      return (int64_t)sizeof(block_iq2_s);
+    case 23:
+      return (int64_t)sizeof(block_iq4_xs);
+    case 29:
+      return (int64_t)sizeof(block_iq1_m);
+  }
+  return 0;
+}
+
+// Elements per super-block (ggml's ``blck_size``) for a type. Pairs with
+// ``ggml_type_block_bytes``: ``row_bytes = ncols / block_elems * block_bytes``.
+// Kept here rather than in a Python table so the two halves of that product can
+// never drift apart from the structs the dequant kernels actually read.
+int64_t ggml_type_block_elems(int64_t type) {
+  switch (type) {
+    case 2:
+      return QK4_0;
+    case 3:
+      return QK4_1;
+    case 6:
+      return QK5_0;
+    case 7:
+      return QK5_1;
+    case 8:
+      return QK8_0;
+    case 20:
+      return QK4_NL;
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 21:
+    case 22:
+    case 23:
+    case 29:
+      return QK_K;
+  }
+  return 0;
+}
+
 // ---- FreeToken pybind bindings (donor registers these via TORCH_LIBRARY; we
 // expose them through torch.utils.cpp_extension.load's pybind module instead) ----
 #include <torch/extension.h>
@@ -1060,4 +1152,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("out") = py::none());
   m.def("ggml_moe_vec_batched_supported", &ggml_moe_vec_batched_supported, "");
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
+  m.def("ggml_type_block_bytes", &ggml_type_block_bytes, "");
+  m.def("ggml_type_block_elems", &ggml_type_block_elems, "");
 }

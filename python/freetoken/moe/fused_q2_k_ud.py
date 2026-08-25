@@ -45,6 +45,21 @@ extra sort would be pure overhead on the latency-critical path.
 
 ``FREETOKEN_MOE_PREFILL_BATCH`` sets N (default 8). ``0`` or ``1`` restores the
 unbatched prefill kernel for A/B comparison.
+
+Prefill dequant-GEMM
+--------------------
+Batching fixed the HBM traffic but not the ALU work: one block still re-runs the
+IQ2_XS codebook lookups once per routed row it serves, so each expert is still
+DECODED ~24 times per layer. At a big enough chunk the answer is to stop decoding
+per row entirely -- decode a tile of experts once into a bf16 scratch matrix and
+run a grouped bf16 GEMM (:mod:`freetoken.moe.prefill_dequant_gemm`). That is the
+default for chunks of at least ``FREETOKEN_PREFILL_DEQUANT_MIN_TOKENS`` tokens;
+``FREETOKEN_PREFILL_DEQUANT_GEMM=0`` restores the batched GEMV above exactly.
+
+It is the one path here that is NOT bit-identical to the unbatched kernel: the
+activation stays bf16 instead of being quantized to q8_1, which removes error
+rather than adding it. Decode is untouched -- ``is_prefill=False`` never reaches
+either prefill branch.
 """
 
 from __future__ import annotations
@@ -53,6 +68,8 @@ import os
 import warnings
 
 import torch
+
+from freetoken.moe import prefill_dequant_gemm as _dq
 
 # Batch widths the CUDA side instantiates (MOE_VEC_BATCH_WIDTHS in
 # moe_vec_batched.cuh). 0/1 mean "no batching".
@@ -141,6 +158,56 @@ def _expert_group_perm(topk_ids: torch.Tensor, num_experts: int, n: int) -> torc
     return perm
 
 
+def _dequant_gemm_experts(
+    hidden_states: torch.Tensor,  # [T, H]
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_qtype: int,
+    down_qtype: int,
+    swiglu_limit: float,
+    fused_swiglu,
+) -> torch.Tensor:
+    """Prefill path: decode each expert once per chunk, then a grouped bf16 GEMM.
+
+    The whole layer stays in EXPERT-SORTED routed-row order between the two GEMMs.
+    The gate_up call needs the activations gathered (routed row r reads token
+    ``r // top_k``); the down call does not, because ``inter`` is already indexed
+    by sorted position and the down projection's activation for routed row r IS
+    row r. So the permutation is paid once on the way in and once on the way out,
+    and the two GEMMs chain directly.
+
+    See :mod:`freetoken.moe.prefill_dequant_gemm` for the pitch slicing, the
+    ``_grouped_mm`` layout, and the single host wait.
+    """
+    num_tokens = hidden_states.shape[0]
+    h = down_q.shape[1]  # hidden
+    top_k = topk_ids.shape[1]
+
+    plan = _dq.RoutePlan(topk_ids, gate_up_q.shape[0], _dq.TILE)
+    # Enqueue the gather BEFORE waiting on the plan's boundary transfer (inside
+    # grouped_expert_gemm -> plan.tiles()), so the GPU is busy across the wait.
+    a = hidden_states.index_select(0, plan.order // top_k if top_k > 1 else plan.order)
+
+    gate_up = _dq.grouped_expert_gemm(a, gate_up_q, gate_up_qtype, plan)
+    del a
+    inter = fused_swiglu(gate_up, swiglu_limit)
+    del gate_up
+    out_sorted = _dq.grouped_expert_gemm(inter, down_q, down_qtype, plan)
+    del inter
+
+    # Unpermute. ``out_sorted[i]`` holds routed row ``plan.order[i]``, so this is
+    # a SCATTER (``out[order[i]] = out_sorted[i]``), not a gather -- inverting it
+    # silently returns a permuted-but-plausible answer.
+    out = torch.empty_like(out_sorted)
+    out.index_copy_(0, plan.order, out_sorted)
+    del out_sorted
+    out = out.reshape(num_tokens, top_k, h)
+    out.mul_(topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype))
+    return out.sum(dim=1)
+
+
 def fused_experts_q2k_ud(
     hidden_states: torch.Tensor,  # [T, H]
     gate_up_q: torch.Tensor,  # [num_slots, 2I, gate_up_pitch] uint8
@@ -158,8 +225,12 @@ def fused_experts_q2k_ud(
     ``topk_ids`` already index the bank rows: cache slots on the decode path,
     materialized layer positions (position == expert id) on the streaming prefill path.
 
-    ``is_prefill`` selects the weight-reuse batched GEMV. It changes throughput
-    only -- the returned values are bit-identical either way.
+    ``is_prefill`` selects the prefill kernel -- the dequant-GEMM path when the
+    chunk is big enough for it (see :mod:`freetoken.moe.prefill_dequant_gemm`),
+    otherwise the weight-reuse batched GEMV, which is bit-identical to the
+    unbatched one. The dequant-GEMM path is NOT bit-identical: it keeps the
+    activation in bf16 instead of quantizing it to q8_1, which is a small
+    accuracy gain, not a loss.
     """
     from freetoken.kernel.gguf import (
         ggml_moe_a8_vec,
@@ -172,6 +243,18 @@ def fused_experts_q2k_ud(
     n2 = gate_up_q.shape[1]  # 2 * intermediate
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
+
+    if is_prefill and _dq.ENABLED and num_tokens >= _dq.MIN_TOKENS:
+        # Decode never reaches here, and neither does a short chunk: decoding all
+        # 256 experts to serve a few hundred routed rows loses to the GEMV.
+        i = n2 // 2
+        if _dq.supported(int(gate_up_qtype), h, gate_up_q.shape[2]) and _dq.supported(
+            int(down_qtype), i, down_q.shape[2]
+        ):
+            return _dequant_gemm_experts(
+                hidden_states, gate_up_q, down_q, topk_weights, topk_ids,
+                int(gate_up_qtype), int(down_qtype), swiglu_limit, fused_swiglu,
+            )
 
     batch_n = _PREFILL_BATCH if is_prefill else 0
     if (

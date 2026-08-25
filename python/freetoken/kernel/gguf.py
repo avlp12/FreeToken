@@ -242,6 +242,50 @@ def ggml_moe_get_block_size(quant_type: int) -> int:
     return _module().ggml_moe_get_block_size(quant_type)
 
 
+def ggml_type_block_bytes(quant_type: int) -> int:
+    """``sizeof(block_q_t)`` for a ggml type -- the byte width of ONE super-block.
+
+    ``blocks_per_row * ggml_type_block_bytes(t)`` is the row width a natively
+    packed bank of ``t`` occupies, which is exactly what :func:`ggml_dequantize`
+    assumes (it walks ``m * n`` elements with no pitch parameter). The prefill
+    dequant-GEMM path uses it to slice the native prefix out of a padded-pitch
+    expert bank.
+
+    NOT interchangeable with :func:`ggml_moe_get_block_size`, which returns the
+    MMQ tile height ``MOE_X_*`` -- a row COUNT, 0 for every IQ type and 4 for
+    Q2_K. Returns 0 for a type with no dequant kernel.
+    """
+    return _module().ggml_type_block_bytes(quant_type)
+
+
+def ggml_type_block_elems(quant_type: int) -> int:
+    """Elements per super-block (ggml's ``blck_size``) for a type; 0 if unknown.
+
+    Companion to :func:`ggml_type_block_bytes` -- together they give
+    ``native_row_bytes = ncols // block_elems * block_bytes``.
+    """
+    return _module().ggml_type_block_elems(quant_type)
+
+
+def ggml_type_row_bytes(quant_type: int, ncols: int) -> int:
+    """Natively packed byte width of one ``ncols``-element row of ``quant_type``.
+
+    0 when the type is unknown to the dequant kernels. Raises when ``ncols`` is
+    not a whole number of super-blocks -- a row that does not tile is not a row
+    this path can slice.
+    """
+    elems = ggml_type_block_elems(quant_type)
+    nbytes = ggml_type_block_bytes(quant_type)
+    if elems == 0 or nbytes == 0:
+        return 0
+    if ncols % elems:
+        raise ValueError(
+            f"ncols {ncols} is not a multiple of the {elems}-element super-block "
+            f"of ggml type {quant_type}"
+        )
+    return ncols // elems * nbytes
+
+
 __all__ = [
     "ggml_dequantize",
     "ggml_mul_mat_vec_a8",
@@ -251,4 +295,7 @@ __all__ = [
     "ggml_moe_a8_vec_batched",
     "ggml_moe_vec_batched_supported",
     "ggml_moe_get_block_size",
+    "ggml_type_block_bytes",
+    "ggml_type_block_elems",
+    "ggml_type_row_bytes",
 ]
