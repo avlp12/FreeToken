@@ -54,9 +54,34 @@ L+1 prediction was wrong still have been covered two layers earlier.
 
 But those bytes cross the SAME saturated link, and the rank-limit table below is the
 lesson about what that costs. So the L+2 stage speculates NARROW: ``top-1`` by
-predicted score by default (``FREETOKEN_PREFETCH_L2_TOPK``, 0 disables the stage
-entirely), against ``top-3`` for L+1. Hash-router targets are exact and never
-truncated, at either distance.
+predicted score (``FREETOKEN_PREFETCH_L2_TOPK``, 0 disables the stage entirely),
+against ``top-3`` for L+1. Hash-router targets are exact and never truncated, at
+either distance.
+
+**And measured at the server, even top-1 does not pay: the stage is OFF by default.**
+The narrow L+2 pull turns out to predict rows that are already resident. From
+``--moe-collect-stats`` over a 399-token decode at 740 slots, L2 on vs off::
+
+                   missing/layer   pf_pulled/layer   total rows/layer
+    L2 top-1           1.691           1.251              2.943
+    L2 off             1.709           1.218              2.927
+
+It removes 0.018 real misses per layer and pulls 0.033 extra rows to do it -- it moves
+MORE bytes than it saves, on the resource that is the bottleneck. What it also costs
+is on the critical path: 40 extra speculative ensures, 40 extra ``protect_slots``
+kernels and 40 extra pull launches per step (~55% of which retire empty, num_indices
+0), and -- because a source layer records ONE done event after BOTH its stages --
+``join(L+1)`` waits on the L+2 pull as well as the L+1 pull it actually needs.
+
+A/B at the server, 300-step CUDA-event decode timing, five interleaved pairs across
+both serving configs (740-slot/320K and 1421-slot/128K). Every pair favours OFF, on
+mean, on median and on end-to-end tok/s; median deltas -1.3% to -4.4%::
+
+    320K  median ms   35.85 -> 34.27 | 36.82 -> 35.32 | 36.33 -> 35.32
+    128K  median ms   29.95 -> 28.99 | 29.65 -> 29.27
+
+Interleaved because the box drifts: two runs of the SAME config an hour apart differed
+by 4.6%, which is the size of the effect, so a single A/B could not have carried this.
 
 Double pulling is not a hazard the code has to defend against: the two stages predict
 DIFFERENT layers (L+1 and L+2), whose rows live in disjoint id spaces, so one layer's
@@ -86,7 +111,15 @@ Read down the columns and the whole mechanism is visible. The lookahead genuinel
 predicts: every extra rank cuts real misses further, and at all six it removes 61% of
 them. The fork genuinely overlaps: every extra rank also lifts sustained PCIe, from
 24.2 GB/s (the serial path leaves a quarter of the link idle behind compute) toward
-31.9 GB/s, this platform's zero-copy ceiling.
+31.9 GB/s.
+
+(The "31.9 GB/s is this platform's zero-copy ceiling" this section used to claim is
+wrong, and was wrong in a direction that made the feature look boxed in. Per-kernel
+timings from a CUPTI trace of the replayed decode graph put an UNCONTENDED
+``fast_index_copy_multi`` at 50.4 GB/s on the serial path (bpb 8) and 44.5 GB/s on the
+forked pull (bpb 4) -- ~80% of PCIe Gen5 x16. Sustained over the whole step decode
+reaches only 35.2 GB/s, and over just the copy-active part of the step 46.3 GB/s. So
+the link is NOT saturated: it is idle for 24% of the step. See the accounting below.)
 
 But every rank costs bytes on a link that is the bottleneck, and the low-ranked
 predictions are the ones most likely to be wrong. At all six, 37.5% more bytes move
@@ -100,6 +133,62 @@ Half the router's top_k is the measured optimum and the default (an explicit
 are never truncated: their Gate is a token-id lookup, exact by construction, so every
 row it names would have been fetched anyway -- and its ids carry no score order to
 truncate by.
+
+What decode's copy time actually decomposes into
+------------------------------------------------
+A CUPTI trace of 20 replayed decode steps (``FREETOKEN_DECODE_PROFILE``, 740 slots)
+splits cleanly, because the two copy paths compile to distinguishable kernels: the
+serial ``copy_missing`` is ``fast_index_copy_multi<int,1024,8>`` (``copy_bpb``) and the
+forked pull is ``...<int,1024,4>`` (``prefetch_bpb``). Wall time by which classes are
+live, per step (GPU busy 34.64 ms; CUDA-event step time on the same config 34.88 ms,
+so this closes to 0.7%)::
+
+    compute alone (link idle)                              8.33 ms   24.0%
+    compute || forked pull                                 7.40 ms   21.4%
+    serial copy_missing alone                             11.34 ms   32.7%
+    serial copy_missing || forked pull                     4.28 ms   12.4%
+    forked pull alone (main stream stalled at the join)    3.29 ms    9.5%
+    serial copy_missing || compute                         0.00 ms    0.0%
+
+That last row is the one that reframes the feature. ``copy_missing(L)`` is the
+dependency ``GEMM(L)`` waits on, on the same stream, so it can never overlap compute --
+measured 0.000 ms, not "poorly overlapped". Of 30.60 ms of copy kernel time per step,
+15.63 ms is structurally unhideable and 14.97 ms (the pull) is the only part that CAN
+hide. So "the copy stream overlaps compute 24% of the time" is not a quarter of the
+achievable: the ceiling is 49%, the prefetch share, and 49.4% of the pull is in fact
+already hidden. The feature is at half its ceiling, not a quarter.
+
+Visible copy = GPU busy - compute = 18.91 ms/step, and it decomposes as::
+
+    serial real misses (34.4 real copies/step x 403.7us uncontended)   13.89 ms
+    unhidden prefetch (pull work at solo rate, minus what hid)          4.24 ms
+    copy-vs-copy contention, net                                        0.78 ms
+
+The contention term is small and that is a result, not an omission: running the two
+copy classes concurrently inflates their kernel time by 5.06 ms (a contended serial
+copy is 632.9us against 403.7us solo, x1.57; a contended pull 708.5us against 310.0us,
+x2.29) but buys back 4.28 ms of wall. The link arbitrates close to work-conservingly,
+so pulling harder on it is not where the win is -- confirmed by sweeping the pull's
+grid, where ``prefetch_bpb`` 4 beats both 2 (+6.1%) and 8 (+1.8%).
+
+The 4.24 ms of unhidden prefetch is a LEAD-TIME shortfall, not a scheduling bug:
+
+* it is concentrated -- the top 8 of 43 layers hold 77.6% of the join stall, and per
+  layer the stall tracks the size of the pull forked one layer earlier;
+* it alternates with the model's own structure, ``compress_ratios`` running 4/128/4/128
+  from layer 2, so consecutive layers offer very different amounts of compute for the
+  same pull to hide behind;
+* the hash layers are the extreme case. ``n_hash_layers=3``, and their Gate is exact,
+  so layers 1 and 2 have NO real misses at all (their ``copy_missing`` retires in ~1us)
+  and every row they need arrives speculatively -- a 1193us pull against a one-layer
+  window, which stalls 1948us. Perfect prediction does not help when there is only one
+  layer of lead time to spend it in.
+
+And the 8.33 ms of link idle is spread evenly, ~190us per layer, rather than pooled
+anywhere: it is the interval in each layer during which no copy is KNOWABLE -- the
+one-layer-lead pull has drained and the next layer's real routing has not run yet.
+Closing it needs more lead, not a different fork/join schedule; see the note on
+depth-D speculation in the design docs before reaching for one.
 
 Keep-wrong semantics
 --------------------
@@ -117,6 +206,10 @@ exactly like the real one, so deferring the join past the next layer's staging l
 ``prefetch_ensure`` overwrite ``evict_slots``/``num_indices`` while the branch's pull
 was still reading them -- the pull then lands wrong rows in wrong slots. That
 reproduced hard: a naive late join failed value identity in 4 of 4 runs under load.
+
+The server confirms the placement is worth the machinery it needs: at 740 slots the
+early join costs 5.5% (36.48 -> 38.49 ms mean per decode step), and at 1421 slots the
+two are within noise of each other (30.46 vs 30.14). So late stays the default.
 
 Two structural changes move the join to just before the expert GEMM.
 
@@ -191,13 +284,17 @@ __all__ = ["MoePrefetcher", "get_prefetcher"]
 # the misses they remove, so this is the knob that decides whether the feature is a
 # win or a wash.
 TOPK_ENV = "FREETOKEN_PREFETCH_TOPK"
-# How many of the L+2 lookahead's predictions to pull, per layer. Default 1: the L+2
-# stage exists to cover what the L+1 stage misses and to smooth bursts, not to move
-# more bytes, and its recall (65.3%) is lower than L+1's. 0 disables the stage
-# entirely -- no second Gate call, no second ensure, no second pull, and the captured
-# graph is the L+1-only one kernel for kernel.
+# How many of the L+2 lookahead's predictions to pull, per layer. Default 0: OFF --
+# no second Gate call, no second ensure, no second pull, and the captured graph is the
+# L+1-only one kernel for kernel. The stage was designed to cover what the L+1 stage
+# misses and to smooth bursts, but at the server the rows it names are already
+# resident: it removes 0.018 real misses per layer while pulling 0.033 extra rows, and
+# its pull sits on the critical path because the source layer's single done event
+# makes join(L+1) wait for it. Five interleaved A/B pairs across both serving configs
+# all favour off. See "The second lookahead stage (L+2)" in the module docstring.
+# Set to 1 (or more) to restore it.
 L2_TOPK_ENV = "FREETOKEN_PREFETCH_L2_TOPK"
-L2_TOPK_DEFAULT = 1
+L2_TOPK_DEFAULT = 0
 # Where the branch join goes. 1 (default) = just before the expert GEMM, the wide
 # window the parity-indexed descriptors make sound. 0 = the old placement, before the
 # layer's real ensure_experts. Kept as a knob purely so the placement can be A/B'd at
