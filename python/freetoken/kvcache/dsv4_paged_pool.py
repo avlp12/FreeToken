@@ -136,6 +136,20 @@ class CompressStateRing:
         self.buffer[state_loc] = kv_score
         self._clear_scratch()
 
+    def get_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """:meth:`get_blocks` with the ring rows already resolved.
+
+        The fused decode index kernel derives ``page_base + arange(ring_size)`` for
+        every row in the same launch that produces the rest of the step's addresses,
+        so the gather is handed the rows directly instead of rebuilding them here
+        (an ``arange`` + a broadcast ``add`` per compressor per layer per step)."""
+        return self.buffer[rows]
+
+    def set_rows(self, rows: torch.Tensor, blocks: torch.Tensor) -> None:
+        """:meth:`set_blocks` with the ring rows already resolved."""
+        self.buffer[rows] = blocks
+        self._clear_scratch()
+
     def get_blocks(self, page_base: torch.Tensor) -> torch.Tensor:
         """Batched per-row carry-block read. ``page_base`` is ``[B]`` (the ring block base
         row per row, == ``(window_slot // P) * ring_size``). Returns ``[B, ring_size, 2*item]``

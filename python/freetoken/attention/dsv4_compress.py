@@ -127,6 +127,16 @@ class CompressorBackendMixin:
         ring = self.compress_state_ring(layer_id, tier)
         ring.set_blocks(self.ring_page_base(window_slots, ring_size), blocks)
 
+    def read_carry_rows(self, layer_id: int, tier: str, rows: torch.Tensor) -> torch.Tensor:
+        """Per-row carry blocks at PRE-RESOLVED ring rows (fused decode path)."""
+        return self.compress_state_ring(layer_id, tier).get_rows(rows)
+
+    def write_carry_rows(
+        self, layer_id: int, tier: str, rows: torch.Tensor, blocks: torch.Tensor
+    ) -> None:
+        """Per-row carry-block write at PRE-RESOLVED ring rows (fused decode path)."""
+        self.compress_state_ring(layer_id, tier).set_rows(rows, blocks)
+
     def write_boundary_carries(
         self, *, layer_id: int, tier: str, ratio: int, overlap: bool, ring_size: int,
         ape: torch.Tensor, kv: torch.Tensor, score: torch.Tensor, lo: int, hi: int,

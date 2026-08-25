@@ -140,11 +140,11 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, post, comb)
         return x
 
-    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None):
+    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None, ictx=None):
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm(x)
-        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx)
+        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx, ictx)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -354,10 +354,15 @@ class Transformer(nn.Module):
         # the gathers -- never cache it on the metadata) and threaded
         # into every layer. They read only the shared snapshot / positions, so they are identical
         # across layers.
-        wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
+        md = get_global_ctx().batch.attn_metadata
+        wctx = md.window_ctx(pos, rows)
+        # Same hoist for the rest of the step's derived addresses: they depend on the
+        # layer only through its compress RATIO, so one fused launch per ratio class
+        # (two, for DSV4-Flash's 41 compressed layers) serves every layer of it.
+        ictx = get_global_ctx().attn_backend.index_ctx(pos, rows, wctx, cmp_stage_cap)
         aux: list[torch.Tensor] = []
         for i, layer in enumerate(self.layers):
-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, ictx)
             if i in self._aux_layer_ids:
                 aux.append(h.mean(dim=2))  # [B, 1, dim]
         aux_hidden = (

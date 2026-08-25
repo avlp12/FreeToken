@@ -294,6 +294,7 @@ class Compressor(nn.Module):
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
         window_slots: torch.Tensor, rows: torch.Tensor, ti: int | None = None,
+        ictx=None,
     ) -> None:
         """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
         ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
@@ -303,7 +304,16 @@ class Compressor(nn.Module):
         carry block is READ from ``prev_window_slots``' page (where the prior step / prefill wrote
         it), advanced, and WRITTEN BACK to ``window_slots``' page -- so the carry follows the request
         across 128-page boundaries (within a page prev/cur are the same block). Distinct window pages
-        -> disjoint ring blocks, so co-tenant rows never contaminate each other."""
+        -> disjoint ring blocks, so co-tenant rows never contaminate each other.
+
+        ``ictx`` is this step's fused index context for THIS compressor's ratio class
+        (see ``DSV4SparseAttnBackend.index_ctx``). Every address below -- the APE row,
+        the block-completion flag, both ring blocks, the completed block's rope
+        position and the masked store destination -- is then read from it instead of
+        being recomposed here, which is the whole per-layer scalar cluster. Passing
+        ``None`` (a prefill walk, a DSpark verify, or ``FREETOKEN_UNFUSED_INDEX=1``)
+        takes the original torch composition, kept below as the bisection reference.
+        """
         assert self.cmp_pool is not None
         B = x.size(0)
         ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
@@ -312,19 +322,28 @@ class Compressor(nn.Module):
         x = x.view(B, -1)
         kv = bf16_linear_fp32(x, self.wkv.weight).view(B, 1, item)
         score = bf16_linear_fp32(x, self.wgate.weight).view(B, 1, item)
-        idx_mod = pos % ratio  # [B]
+        if ictx is None:
+            idx_mod = pos % ratio  # [B]
+            should = ((pos + 1) % ratio == 0).view(B, 1, 1)
+            freq_idx = (pos + 1 - ratio).clamp_min(0)
+        else:
+            idx_mod, should, freq_idx = ictx.idx_mod, ictx.should3, ictx.freq_idx
         score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
-        should = ((pos + 1) % ratio == 0).view(B, 1, 1)
 
         # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
-        block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
-            self.layer_id, self.tier, prev_window_slots, self.ring_size
+        block = (
+            self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
+                self.layer_id, self.tier, prev_window_slots, self.ring_size
+            )
+            if ictx is None
+            else self.attn.read_carry_rows(self.layer_id, self.tier, ictx.carry_prev)
         )
         ks = block[..., :item].clone()  # [B, ring_size, item]
         ss = block[..., item:].clone()
 
         if overlap:
-            wslot = (ratio + idx_mod).view(B, 1)  # per-row B-half slot
+            # per-row B-half slot
+            wslot = ((ratio + idx_mod) if ictx is None else ictx.ovl_slot).view(B, 1)
             ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
             ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
             kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
@@ -339,9 +358,12 @@ class Compressor(nn.Module):
         # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
         # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.
         carry_state = torch.cat([ks, ss], dim=-1)
-        self.attn.write_carry_blocks(
-            self.layer_id, self.tier, window_slots, self.ring_size, carry_state
-        )
+        if ictx is None:
+            self.attn.write_carry_blocks(
+                self.layer_id, self.tier, window_slots, self.ring_size, carry_state
+            )
+        else:
+            self.attn.write_carry_rows(self.layer_id, self.tier, ictx.carry_cur, carry_state)
         batch = get_global_ctx().batch
         if getattr(batch, "speculative", False):
             journal = batch.spec_carry_states
@@ -355,7 +377,7 @@ class Compressor(nn.Module):
                 record(key, carry_state)
 
         compressed = self.norm(compressed)
-        freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
+        freqs_t = self.freqs_cis.index_select(0, freq_idx)  # [B, rd//2]
         apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
         if self.rotate:
             compressed = hadamard_transform(compressed)
@@ -369,8 +391,12 @@ class Compressor(nn.Module):
         # completed-block row is arithmetic: full_loc(pos) // ratio (every pos in the block shares
         # it). Read off the full-loc SNAPSHOT so a concurrent next-batch allocate cannot redirect
         # this write (overlap safety); real rows resolve to a live row, dummy rows to reserved 0.
-        cmp_dst = self.attn.decode_compress_rows(
-            rows, pos, ratio, self.layer_id, self.tier, should.view(B), ti=ti
+        cmp_dst = (
+            self.attn.decode_compress_rows(
+                rows, pos, ratio, self.layer_id, self.tier, should.view(B), ti=ti
+            )
+            if ictx is None
+            else ictx.cmp_dst(self.tier)
         )
         self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(B, -1))
 
@@ -512,7 +538,7 @@ class Indexer(nn.Module):
     def decode_step(
         self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
         prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
-        n_stage: int,
+        n_stage: int, ictx=None, raw_picks: bool = False,
     ) -> torch.Tensor:
         """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
         indexer blocks per row (gathered PER ROW from the paged idx_pool), masks blocks beyond
@@ -520,7 +546,14 @@ class Indexer(nn.Module):
         indices offset by ``offset`` (``-1`` for picks past the valid count). ``pos``/
         ``window_slots`` are ``[B]`` GPU int tensors; ``rows`` is the LOCAL row index [B] into the
         decode full-loc SNAPSHOT (read instead of the live map -> overlap safe); ``n_stage`` is the
-        fixed staging width (== max valid count in eager, a static capture width under graph)."""
+        fixed staging width (== max valid count in eager, a static capture width under graph).
+
+        ``ictx`` is this step's fused index context for the layer's ratio class; when
+        given, ``valid`` and the inner compressor's addressing come from it. With
+        ``raw_picks`` the RAW top-k block indices are returned instead of the masked,
+        offset ones -- the caller then resolves selection, pool row and the window
+        concatenation in ONE fused launch, so the intermediate block-index tensor that
+        nothing else reads is never materialized."""
         B = x.size(0)
         ratio, rd = self.compress_ratio, self.rope_head_dim
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
@@ -528,9 +561,12 @@ class Indexer(nn.Module):
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
         # Advance the indexer's own compressor (writes this token's idx key to idx_pool per row).
-        self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
+        self.compressor.decode_step(
+            x, pos, prev_window_slots, window_slots, rows, ictx=ictx
+        )
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        valid = (pos + 1) // ratio  # [B] per-row valid block count
+        # [B] per-row valid block count
+        valid = (pos + 1) // ratio if ictx is None else ictx.valid
         # Head-reduced scores in one pass: the kernel gathers each block's key off the full-loc
         # SNAPSHOT (not the live map -> overlap-safe replay) and reads its column bound from
         # ``valid`` in DEVICE memory, so a captured graph scores only the live blocks instead of
@@ -540,6 +576,8 @@ class Indexer(nn.Module):
             weights.reshape(B, self.n_heads),
             valid, n_stage, ratio, self.layer_id, rows,
         ).view(B, 1, n_stage)
+        if raw_picks:
+            return index_score.topk(min(self.index_topk, n_stage), dim=-1)[1]
         return self.attn.indexer_select_decode(
             index_score, valid=valid, topk=self.index_topk, offset=offset
         )

@@ -29,8 +29,9 @@ the <= 31 alignment ones -- permanently -1, hence masked in the kernel.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
 from freetoken.core import Batch, get_global_ctx
@@ -40,7 +41,19 @@ from .dsv4_compress import CompressorBackendMixin
 from .dsv4_indexer import IndexerBackendMixin
 
 if TYPE_CHECKING:
+    from freetoken.kernel.triton.dsv4.decode_index import RatioIndexCtx
     from freetoken.models import ModelConfig
+
+
+def unfused_index() -> bool:
+    """``FREETOKEN_UNFUSED_INDEX=1`` -> take the pre-fusion torch composition.
+
+    The fused index kernels are bit-identical by construction and tested as such
+    (``tests/dsv4/test_dsv4_decode_index_fusion.py``), so they are the default. The
+    old path stays reachable so a future addressing regression can be bisected
+    against it without a revert.
+    """
+    return os.environ.get("FREETOKEN_UNFUSED_INDEX", "0") == "1"
 
 
 @dataclass
@@ -105,12 +118,33 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         concurrent allocate_paged cannot redirect an in-flight replay; runs inside the captured
         graph (its inputs -- the snapshot and ``positions`` -- are graph buffers), which is why
         it takes ``pos`` instead of reading it off the batch.
+
+        Fused into ONE Triton launch (``window_ring_ctx``). The torch composition it
+        replaces -- sub / remainder / clamp / two compares / two wheres / three
+        gathers -- is kept verbatim as ``_reference_window_ctx`` and selected by
+        ``FREETOKEN_UNFUSED_INDEX=1``, so an addressing regression can be bisected
+        against it without a revert.
         """
+        j = self.window_ar
+        assert j is not None, "window_ctx is decode-only"
+        # Triton is CUDA-only; the CPU shape/staging tests keep the torch composition.
+        if unfused_index() or not pos.is_cuda:
+            return self._reference_window_ctx(pos, rows)
+        from freetoken.kernel.triton.dsv4.decode_index import window_ring_ctx
+
+        return window_ring_ctx(
+            pos, rows, self.full_snapshot(),
+            get_global_ctx().kv_cache.full_to_window, j.shape[0],
+        )
+
+    def _reference_window_ctx(
+        self, pos: torch.Tensor, rows: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-fusion torch composition of :meth:`window_ctx` (bit-identity reference)."""
         snap = self.full_snapshot()
         translate = get_global_ctx().kv_cache.translate_full_to_window
         bs = pos.shape[0]
         j = self.window_ar
-        assert j is not None, "window_ctx is decode-only"
         win = j.shape[0]
         window_slots = translate(snap[rows, pos])
         prev_window_slots = translate(snap[rows, (pos - 1).clamp_min(0)])
@@ -227,6 +261,80 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         md = get_global_ctx().batch.attn_metadata
         assert isinstance(md, DSV4AttnMetadata)
         return md.full_snapshot()
+
+    def index_ctx(
+        self, pos: torch.Tensor, rows: torch.Tensor, wctx, cmp_stage_cap: int
+    ) -> Dict[int, "RatioIndexCtx"]:
+        """This decode step's derived indices, ONE entry per compress-ratio class.
+
+        Every address a compressed layer derives per step -- ``pos % ratio``, the
+        block-completion flag, the compress-state ring blocks at the previous and
+        current window pages, the completed block's rope position, the live block
+        count, the sparse kernel's per-row compressed bound, and the masked store
+        destination -- is a function of ``(pos, snapshot, window slots, ratio)``
+        only. All three of those inputs are layer-invariant and the pools' scratch
+        bases are ``full_token // ratio``, so LAYERS OF ONE RATIO DERIVE IDENTICAL
+        VALUES. DSV4-Flash has two nonzero ratios over 41 compressed layers, so this
+        turns ~40 launches x 41 layers into two.
+
+        Indexer-less ratio classes (everything but ratio 4) also select their
+        compressed blocks positionally, which makes their whole ``[window |
+        compressed]`` top-k layer-invariant too -- resolved here in one more launch
+        and shared by every such layer.
+
+        Returns ``{}`` under ``FREETOKEN_UNFUSED_INDEX=1``; the model then falls back
+        to the per-layer torch composition (as does a CPU forward -- Triton is
+        CUDA-only, and the pool/backend unit tests run on CPU).
+        """
+        if unfused_index() or not pos.is_cuda:
+            return {}
+        from freetoken.kernel.triton.dsv4.decode_index import (
+            cmp_topk_to_global,
+            decode_index_ctx,
+        )
+        from freetoken.kvcache.dsv4_cost_model import ring_size_for_ratio
+
+        pool = self.pool
+        window_slots, prev_window_slots, window_slots_topk = wctx
+        snap = self.snapshot()
+        topk = self.config.dsv4_args.index_topk
+        out: Dict[int, "RatioIndexCtx"] = {}
+        for ratio in sorted({r for r in pool.compress_ratios if r}):
+            L = pool.compress_ratios.index(ratio)
+            has_indexer = ratio == 4
+            n_stage = (cmp_stage_cap + 1) // ratio
+            width = min(topk, n_stage) if has_indexer else n_stage
+            ctx = decode_index_ctx(
+                pos, rows, window_slots, prev_window_slots, snap,
+                ratio=ratio, ring_size=ring_size_for_ratio(ratio), P=pool.P,
+                cap=width, cmp_base=pool.cmp_scratch_base[L],
+                idx_base=pool.idx_scratch_base[L] if has_indexer else None,
+                overlap=ratio == 4,
+            )
+            if not has_indexer:
+                ctx.topk_idxs = cmp_topk_to_global(
+                    None, ctx.valid, rows, snap, window_slots_topk,
+                    ratio=ratio, identity_k=n_stage,
+                )
+            out[ratio] = ctx
+        return out
+
+    def decode_topk_idxs(
+        self, picks: torch.Tensor, valid: torch.Tensor, rows: torch.Tensor,
+        window_slots_topk: torch.Tensor, ratio: int, offset: int = 0,
+    ) -> torch.Tensor:
+        """A ratio-4 layer's ``[window | compressed]`` global slots in ONE launch.
+
+        Collapses ``indexer_select_decode`` (compare / add / where), ``blocks_to_global``
+        (clamp / mul / gather / floor-div / where), the window-half ``cat`` and the
+        ``int()`` cast, whose intermediate block indices nothing else reads.
+        """
+        from freetoken.kernel.triton.dsv4.decode_index import cmp_topk_to_global
+
+        return cmp_topk_to_global(
+            picks, valid, rows, self.snapshot(), window_slots_topk,
+            ratio=ratio, offset=offset,
+        )
 
     def window_slots_of(self, ti: int, lo: int, hi: int) -> torch.Tensor:
         """Window slots for a prefill/extend range, off the request's LIVE full locs (positions

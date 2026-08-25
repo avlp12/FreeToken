@@ -352,7 +352,7 @@ class Attention(nn.Module):
 
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
-        wctx=None,
+        wctx=None, ictx=None,
     ) -> torch.Tensor:
         """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
         GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
@@ -366,7 +366,13 @@ class Attention(nn.Module):
         the layer's fixed compressed top-k width is ``(cmp_stage_cap+1)//ratio`` (= max valid count
         over rows in eager; a static capture width = ``(max_seq-1+1)//ratio`` under graph). Picks
         past each row's valid count are masked to -1 (the kernel ignores -1), so co-tenant rows
-        stay isolated."""
+        stay isolated.
+
+        ``ictx`` is this step's fused index context, keyed by compress ratio and also
+        resolved once per forward in the model's decode loop -- every address this
+        layer would otherwise recompose from ``pos`` is already in it. ``None`` (a
+        standalone call, or ``FREETOKEN_UNFUSED_INDEX=1``) takes the per-layer torch
+        composition kept below as the bit-identity reference."""
         B = x.size(0)
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         device = x.device
@@ -376,6 +382,8 @@ class Attention(nn.Module):
         # stays per-layer (freqs_cis differs between compressed and non-compressed layers).
         if wctx is None:
             wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
+        if ictx is not None:
+            ictx = ictx.get(ratio) if ratio else None
         window_slots, prev_window_slots, window_slots_topk = wctx
         freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
@@ -396,29 +404,52 @@ class Attention(nn.Module):
         n_window = win
         cmp_counts = None
         if self.compress_ratio:
-            self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
-            valid = (pos + 1) // ratio  # [B] per-row compressed block count
-            if self.indexer is not None:
-                # Indexer returns the selected BLOCK indices (offset 0) into [0, n_cmp_stage) or -1.
-                blocks = self.indexer.decode_step(
-                    x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage
-                )  # [B, 1, k] block index or -1
+            self.compressor.decode_step(
+                x, pos, prev_window_slots, window_slots, rows, ictx=ictx
+            )
+            if ictx is not None:
+                # Fused: the live block count and the sparse kernel's per-row compressed
+                # bound came out of this step's ratio-class index kernel.
+                cmp_counts = ictx.cmp_counts
+                if self.indexer is None:
+                    # Positional selection is layer-invariant, so the whole
+                    # [window | compressed] list was resolved once for the ratio class.
+                    topk_idxs = ictx.topk_idxs
+                else:
+                    picks = self.indexer.decode_step(
+                        x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage,
+                        ictx=ictx, raw_picks=True,
+                    )  # [B, 1, k] RAW top-k block indices
+                    # Selection mask, block -> global cmp row, and the window-half
+                    # concatenation collapse into one launch.
+                    topk_idxs = self.attn.decode_topk_idxs(
+                        picks, ictx.valid, rows, window_slots_topk, ratio
+                    )
             else:
-                # Each valid block b is its own pick (column order = block order); invalid -> -1.
-                blk = torch.arange(n_cmp_stage, device=device)
-                col_valid = blk[None, :] < valid[:, None]  # [B, n_cmp_stage]
-                blocks = torch.where(col_valid, blk[None, :], -1).view(B, 1, n_cmp_stage)
-            # Block index -> GLOBAL cmp row, off the decode SNAPSHOT (rows are local).
-            compress_idxs = self.attn.blocks_to_global(blocks, ratio, rows=rows)
-            topk_idxs = torch.cat([window_slots_topk, compress_idxs], dim=-1)
-            # Valid compressed picks are a PREFIX of the list: the ratio-128 layer emits blocks in
-            # order, and the indexer's top-k sorts its -1 picks (score -inf) last. So one count per
-            # row bounds the kernel's loop -- read from DEVICE memory, so the captured graph's work
-            # tracks the live position instead of the staged width.
-            cmp_counts = valid.clamp(max=compress_idxs.shape[-1]).to(torch.int32).view(B, 1)
+                valid = (pos + 1) // ratio  # [B] per-row compressed block count
+                if self.indexer is not None:
+                    # Indexer returns the selected BLOCK indices (offset 0) into
+                    # [0, n_cmp_stage) or -1.
+                    blocks = self.indexer.decode_step(
+                        x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage
+                    )  # [B, 1, k] block index or -1
+                else:
+                    # Each valid block b is its own pick (column order = block order);
+                    # invalid -> -1.
+                    blk = torch.arange(n_cmp_stage, device=device)
+                    col_valid = blk[None, :] < valid[:, None]  # [B, n_cmp_stage]
+                    blocks = torch.where(col_valid, blk[None, :], -1).view(B, 1, n_cmp_stage)
+                # Block index -> GLOBAL cmp row, off the decode SNAPSHOT (rows are local).
+                compress_idxs = self.attn.blocks_to_global(blocks, ratio, rows=rows)
+                topk_idxs = torch.cat([window_slots_topk, compress_idxs], dim=-1).int()
+                # Valid compressed picks are a PREFIX of the list: the ratio-128 layer emits
+                # blocks in order, and the indexer's top-k sorts its -1 picks (score -inf)
+                # last. So one count per row bounds the kernel's loop -- read from DEVICE
+                # memory, so the captured graph's work tracks the live position instead of
+                # the staged width.
+                cmp_counts = valid.clamp(max=compress_idxs.shape[-1]).to(torch.int32).view(B, 1)
         else:
-            topk_idxs = window_slots_topk
-        topk_idxs = topk_idxs.int()
+            topk_idxs = window_slots_topk.int()
 
         o = self.attn.attend(
             q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
