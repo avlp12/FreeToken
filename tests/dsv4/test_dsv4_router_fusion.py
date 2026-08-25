@@ -39,27 +39,44 @@ def _args(hash_layers=0):
     )
 
 
+def _gen(seed: int):
+    """A private generator, never the global one.
+
+    tests/dsv4/test_hc_fused.py draws some of its inputs from the *ambient* CUDA
+    RNG, so any file collected before it that reseeds or consumes the global
+    stream silently changes that test's inputs -- and its tolerances are tight
+    enough to notice. Nothing here touches the global generator.
+    """
+    return torch.Generator(device=DEV).manual_seed(seed)
+
+
 def _gate(hash_layer: bool, seed: int = 0):
     from freetoken.models.deepseek_v4.moe import Gate
 
-    torch.manual_seed(seed)
+    g_rng = _gen(seed)
     args = _args(hash_layers=1 if hash_layer else 0)
     g = Gate(0, args).to(DEV)
     with torch.no_grad():
-        g.weight.copy_(torch.randn(N_EXPERTS, DIM, device=DEV, dtype=torch.bfloat16) * 0.02)
+        g.weight.copy_(
+            torch.randn(N_EXPERTS, DIM, device=DEV, dtype=torch.bfloat16, generator=g_rng)
+            * 0.02
+        )
         if g.bias is not None:
-            g.bias.copy_(torch.randn(N_EXPERTS, device=DEV) * 0.1)
+            g.bias.copy_(torch.randn(N_EXPERTS, device=DEV, generator=g_rng) * 0.1)
         if hash_layer:
             g.tid2eid.copy_(
-                torch.randint(0, N_EXPERTS, (VOCAB, TOPK), device=DEV, dtype=torch.int64)
+                torch.randint(
+                    0, N_EXPERTS, (VOCAB, TOPK), device=DEV, dtype=torch.int64,
+                    generator=g_rng,
+                )
             )
     return g
 
 
 def _inputs(m, seed=0, scale=1.0):
-    torch.manual_seed(1000 + seed)
-    x = torch.randn(m, DIM, device=DEV, dtype=torch.bfloat16) * scale
-    ids = torch.randint(0, VOCAB, (m,), device=DEV, dtype=torch.int64)
+    g_rng = _gen(1000 + seed)
+    x = torch.randn(m, DIM, device=DEV, dtype=torch.bfloat16, generator=g_rng) * scale
+    ids = torch.randint(0, VOCAB, (m,), device=DEV, dtype=torch.int64, generator=g_rng)
     return x, ids
 
 

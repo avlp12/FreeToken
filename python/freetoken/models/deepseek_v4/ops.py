@@ -78,7 +78,10 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 
 def apply_rotary_emb_decode(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+    positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """In-place interleaved rotary for batched DECODE: PER-ROW freqs.
 
@@ -86,13 +89,58 @@ def apply_rotary_emb_decode(
     complex (each row's own position). Broadcasts the row's freqs over the inner (head) dim.
     At B=1 this is identical to ``apply_rotary_emb`` (the shared bs-broadcast view coincides).
 
+    With ``positions`` (int64 ``[B]``), ``freqs_cis`` is instead the FULL table and the
+    kernel gathers each row's frequencies itself, deleting the caller's
+    ``index_select`` launch. Same entries, same arithmetic -- see
+    ``kernel/triton/dsv4/rope.py``.
+
     Fused into one Triton kernel (borrowed from sglang's deepseek_v4_rope): the prior torch path
     (``view_as_complex`` -> complex mul -> ``view_as_real`` -> ``copy_``) was ~3-5 small at::native
     kernels per call, called for q/kv/o in every layer. Same interleaved fp32 complex math, stored
     back to ``x``'s dtype -> bit-identical (parity-gated)."""
+    from freetoken.kernel.triton.dsv4.norm_rope import unfused_norm_rope
     from freetoken.kernel.triton.dsv4.rope import rope_decode_inplace
 
-    return rope_decode_inplace(x, freqs_cis, inverse)
+    if positions is not None and unfused_norm_rope():
+        freqs_cis = freqs_cis.index_select(0, positions)
+        positions = None
+    return rope_decode_inplace(x, freqs_cis, inverse, positions)
+
+
+def rms_norm_rope_decode(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    *,
+    heads: int = 1,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """``rms_norm`` then decode RoPE over the last ``rope_dim``, in one launch.
+
+    ``freqs_cis`` is the full table; the kernel gathers it by ``positions``.
+    ``heads`` is the number of rows per batch element (``x`` is ``[B, 1, heads, D]``
+    or ``[B, 1, D]``) -- how a flattened row finds the token position to rotate by.
+
+    ``FREETOKEN_UNFUSED_NORM_ROPE=1`` takes the three-launch composition below,
+    which is also the reference the bit-identity test compares against."""
+    from freetoken.kernel.triton.dsv4.norm import rms_norm
+    from freetoken.kernel.triton.dsv4.norm_rope import (
+        rms_norm_rope_decode as _fused,
+        unfused_norm_rope,
+    )
+
+    if unfused_norm_rope():
+        y = rms_norm(x, weight, eps)
+        apply_rotary_emb_decode(
+            y[..., -rope_dim:], freqs_cis.index_select(0, positions), inverse
+        )
+        return y
+    return _fused(
+        x, weight, eps, freqs_cis, positions, rope_dim, heads=heads, inverse=inverse
+    )
 
 
 def hc_split_sinkhorn(

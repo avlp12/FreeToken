@@ -25,7 +25,12 @@ from .layers import (
     get_window_topk_idxs,
     wo_a_fp8,
 )
-from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+from .ops import (
+    apply_rotary_emb,
+    apply_rotary_emb_decode,
+    get_freqs_cis,
+    rms_norm_rope_decode,
+)
 from .parallel import div_tp, tp_size
 
 
@@ -412,16 +417,21 @@ class Attention(nn.Module):
         if ictx is not None:
             ictx = ictx.get(ratio) if ratio else None
         window_slots, prev_window_slots, window_slots_topk = wctx
-        freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
+        # No per-layer ``freqs_cis.index_select(0, pos)`` any more: the three rope
+        # sites below index the table themselves (``positions=pos``). That gather
+        # moved rd floats and cost a launch to do it. The two norm+rope pairs are
+        # one kernel each -- see kernel/triton/dsv4/norm_rope.py.
 
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
-        q = rms_norm(q, None, self.eps)
-        apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
+        q = rms_norm_rope_decode(
+            q, None, self.eps, self.freqs_cis, pos, rd, heads=self.n_heads
+        )
 
         kv = self.wkv(x)
-        kv = self.kv_norm(kv)
-        apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+        kv = rms_norm_rope_decode(
+            kv, self.kv_norm.weight, self.eps, self.freqs_cis, pos, rd
+        )
         act_quant_fp8_inplace(kv[..., :-rd], 64)
         # Persistent window write: each row's new token to its own window slot (swa_ratio=1).
         self.attn.store_window(kv.view(B, -1), self.layer_id, window_slots)
@@ -482,7 +492,7 @@ class Attention(nn.Module):
             q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
             cmp_counts=cmp_counts, has_compression=bool(ratio),
         )
-        apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)  # per-row position freqs (inverse)
+        apply_rotary_emb_decode(o[..., -rd:], self.freqs_cis, True, positions=pos)
         return self._wo(o, B, 1)
 
     def verify_block(
@@ -508,15 +518,16 @@ class Attention(nn.Module):
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         flat = x.reshape(n, self.dim)
         xq = flat.unsqueeze(1)
-        freqs_t = self.freqs_cis.index_select(0, pos)
 
         qr = q = self.q_norm(self.wq_a(xq))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
-        q = rms_norm(q, None, self.eps)
-        apply_rotary_emb_decode(q[..., -rd:], freqs_t)
+        q = rms_norm_rope_decode(
+            q, None, self.eps, self.freqs_cis, pos, rd, heads=self.n_heads
+        )
 
-        kv = self.kv_norm(self.wkv(xq))
-        apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+        kv = rms_norm_rope_decode(
+            self.wkv(xq), self.kv_norm.weight, self.eps, self.freqs_cis, pos, rd
+        )
         act_quant_fp8_inplace(kv[..., :-rd], 64)
 
         window_slots, prev_window_slots, window_slots_topk = wctx
@@ -556,5 +567,5 @@ class Attention(nn.Module):
             q, self.layer_id, topk_idxs.int(), win, self.attn_sink,
             self.softmax_scale, cmp_counts=cmp_counts, has_compression=bool(ratio),
         )
-        apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)
+        apply_rotary_emb_decode(o[..., -rd:], self.freqs_cis, True, positions=pos)
         return self._wo(o, n, 1).view(1, n, self.dim)

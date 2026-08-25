@@ -13,7 +13,7 @@ from freetoken.kernel.triton.dsv4.hadamard import hadamard_transform
 
 from .args import DeepseekV4Args
 from .layers import Linear, RMSNorm
-from .ops import apply_rotary_emb, apply_rotary_emb_decode
+from .ops import apply_rotary_emb, apply_rotary_emb_decode, rms_norm_rope_decode
 
 
 class Compressor(nn.Module):
@@ -405,9 +405,13 @@ class Compressor(nn.Module):
                 else:
                     record(key, carry_state)
 
-        compressed = self.norm(compressed)
-        freqs_t = self.freqs_cis.index_select(0, freq_idx)  # [B, rd//2]
-        apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
+        # norm + freq gather + rope in one launch (kernel/triton/dsv4/norm_rope.py):
+        # the gather and the rope tail were two dispatches for rd floats each, on a
+        # row the norm kernel already had in registers.
+        compressed = rms_norm_rope_decode(
+            compressed, self.norm.weight, self.norm.eps,
+            self.freqs_cis, freq_idx, rd,
+        )
         if self.rotate:
             compressed = hadamard_transform(compressed)
             fp4_act_quant_inplace(compressed, 32)
@@ -586,7 +590,7 @@ class Indexer(nn.Module):
         B = x.size(0)
         ratio, rd = self.compress_ratio, self.rope_head_dim
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
-        apply_rotary_emb_decode(q[..., -rd:], self.freqs_cis.index_select(0, pos))  # per-row freqs
+        apply_rotary_emb_decode(q[..., -rd:], self.freqs_cis, positions=pos)  # per-row freqs
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
         # Advance the indexer's own compressor (writes this token's idx key to idx_pool per row).
@@ -633,7 +637,7 @@ class Indexer(nn.Module):
         ratio, rd = self.compress_ratio, self.rope_head_dim
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb_decode(
-            q[..., -rd:].unsqueeze(1), self.freqs_cis.index_select(0, pos)
+            q[..., -rd:].unsqueeze(1), self.freqs_cis, positions=pos
         )
         q = hadamard_transform(q)
         fp4_act_quant_inplace(q, 32)
