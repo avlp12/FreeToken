@@ -67,7 +67,7 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, co
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
-        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+        &x[(int64_t)off * (int64_t)kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
   }
 }
 
