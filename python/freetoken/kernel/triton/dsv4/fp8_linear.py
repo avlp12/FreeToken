@@ -22,6 +22,8 @@ Assumes ``K % 128 == 0`` and ``N % 128 == 0`` (true for every DeepSeek-V4 projec
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -36,6 +38,13 @@ from freetoken.kernel.triton.e4m3_compat import (
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
+
+# ``FREETOKEN_DSV4_FUSED_GEMV=0`` reverts the T=1 decode path to the pre-fusion three
+# launches (act_quant -> gemv -> splitk reduce). The fused kernel is bit-identical at the
+# shipped configs, so this is an escape hatch, not a numerics switch.
+_USE_FUSED = os.environ.get("FREETOKEN_DSV4_FUSED_GEMV", "1").lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 # ======================================================================================
@@ -304,6 +313,262 @@ def _splitk_reduce_kernel(part_ptr, out_ptr, N, SPLIT_K: tl.constexpr,
     tl.store(out_ptr + offs, acc.to(OUT), mask=mask)
 
 
+# ======================================================================================
+# Fused decode GEMV: act-quant in the prologue, split-k reduce in the epilogue.
+#
+# The unfused decode path is three launches per projection (``_act_quant_fp8_kernel`` ->
+# ``_fp8_act_gemv_splitk_kernel`` -> ``_splitk_reduce_kernel``), and at T=1 the first and
+# last are pure dispatch: ~1.0us each for a kernel that touches K bytes. On the DSV4
+# decode step that is 322 projections x 3 = 966 graph nodes/token; the two bookend
+# kernels alone burn ~0.62 ms/token of GPU time for ~0 arithmetic.
+#
+# The fused kernel folds both away:
+#   * PROLOGUE -- every program quantizes the 128-wide activation slice it is about to
+#     consume, in registers, with the *same* arithmetic as ``_act_quant_fp8_kernel``
+#     (amax -> ue8m0 exponent via ``_log2_ceil`` -> clamp -> e4m3 round). The activation
+#     row is at most 16 KB and every program reads the same bytes, so the redundant
+#     re-quantization is served from L2 and costs no DRAM traffic. This makes the
+#     activation operand BIT-IDENTICAL to the materialized one, by construction.
+#   * EPILOGUE -- at ``SPLIT_K == 1`` the accumulator IS the result, so the program
+#     stores it straight to ``out``; that is exactly what ``_splitk_reduce_kernel``
+#     would have computed (``0.0 + part[0]``). At ``SPLIT_K > 1`` the k-partitions
+#     still have to meet somewhere, so the last one to arrive at an n-tile does the
+#     reduce itself (``_EP_LOCK``): each program stores its partial, then bumps
+#     a per-tile arrival counter with an acq_rel GPU-scope atomic; the program that
+#     gets ``SPLIT_K - 1`` back resets the counter and sums the SPLIT_K partials in
+#     index order -- the SAME order, and therefore the same fp32 rounding, as
+#     ``_splitk_reduce_kernel``. No program ever spins, so there is nothing to
+#     deadlock, and the counter is left at 0 for the next replay.
+#
+# Both epilogues are bit-identical to the unfused path at a matching (BLOCK_N, SPLIT_K),
+# not merely close -- ``tests/kernels/test_dsv4_fp8_fused_gemv.py`` pins that.
+# ======================================================================================
+_EP_DIRECT = 0   # SPLIT_K == 1: store the accumulator as the result
+_EP_PART = 1     # write partials; caller runs _splitk_reduce_kernel (parity reference)
+_EP_LOCK = 2     # write partials; the last arrival at the tile reduces them
+
+
+@triton.jit
+def _fp8_fused_gemv_kernel(
+    x_ptr,            # [G, K] UNQUANTIZED activation (bf16/fp16/fp32)
+    w_ptr,            # [N, K] float8_e4m3fn (or its uint8 view)
+    sb_ptr,           # [N//128, K//128] uint8 (e8m0 weight codes)
+    o_ptr,            # _EP_DIRECT: [N] out dtype; else [SPLIT_K, N] fp32 partials
+    out_ptr,          # _EP_LOCK: [N] out dtype (unused otherwise)
+    lock_ptr,         # _EP_LOCK: [n_tiles] int32 arrival counters, zero on entry+exit
+    N, K,
+    stride_xg, stride_xk, stride_wn, stride_wk, stride_sbn, stride_sbk,
+    stride_ok, stride_on,
+    GROUP_ROWS: tl.constexpr,   # output rows fed by one activation row (N when G == 1)
+    BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    OUT: tl.constexpr, EPILOGUE: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    sn = offs_n // 128
+    # Grouped (block-diagonal) form: output rows [g*GROUP_ROWS, (g+1)*GROUP_ROWS) read
+    # activation row g. BLOCK_N divides GROUP_ROWS, so a tile never straddles two groups
+    # and the group index is a scalar.
+    xg = x_ptr + (pid_n * BLOCK_N // GROUP_ROWS) * stride_xg
+    k_per = K // SPLIT_K
+    k_start = pid_k * k_per
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k0 in range(0, k_per, 128):
+        offs_k = k_start + k0 + tl.arange(0, 128)
+        # --- fused act_quant, bit-identical to _act_quant_fp8_kernel ---
+        xv = tl.load(xg + offs_k * stride_xk).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(xv)), 1e-4)
+        e = _log2_ceil(amax * (1.0 / 448.0))
+        sca = tl.exp2(e.to(tl.float32))
+        q = tl.clamp(xv / sca, -448.0, 448.0)
+        if e4m3_native_cx():
+            a = q.to(tl.float8e4nv).to(tl.float32)
+        else:
+            a = round_e4m3(q)
+        # --- the GEMV body, unchanged ---
+        w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        if e4m3_native_cx():
+            w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        else:
+            w = e4m3_u8_to_f32(tl.load(w_ptrs, mask=n_mask[:, None], other=0))
+        kb = (k_start + k0) // 128
+        sb_code = tl.load(sb_ptr + sn * stride_sbn + kb * stride_sbk, mask=n_mask, other=0)
+        scb = tl.exp2(sb_code.to(tl.float32) - 127.0)
+        acc += tl.sum(w * a[None, :], axis=1) * scb * sca
+    if EPILOGUE == 0:      # _EP_DIRECT
+        tl.store(o_ptr + offs_n * stride_on, acc.to(OUT), mask=n_mask)
+    elif EPILOGUE == 1:    # _EP_PART
+        tl.store(o_ptr + pid_k * stride_ok + offs_n * stride_on, acc, mask=n_mask)
+    else:                  # _EP_LOCK -- last k-partition of this tile reduces in place
+        p_ptrs = o_ptr + pid_k * stride_ok + offs_n * stride_on
+        tl.store(p_ptrs, acc, mask=n_mask, cache_modifier=".cg")
+        tl.debug_barrier()  # every thread's partial is written before we announce arrival
+        arrivals = tl.atomic_add(lock_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+        if arrivals == SPLIT_K - 1:
+            # Leave the counter at 0 so the buffer is reusable (and CUDA-graph replayable)
+            # with no host-side reset.
+            tl.atomic_xchg(lock_ptr + pid_n, 0, sem="relaxed", scope="gpu")
+            tot = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for k in tl.static_range(SPLIT_K):
+                tot += tl.load(o_ptr + k * stride_ok + offs_n * stride_on,
+                               mask=n_mask, other=0.0, cache_modifier=".cg")
+            tl.store(out_ptr + offs_n, tot.to(OUT), mask=n_mask)
+
+
+# Swept-best FUSED decode GEMV config per (N, K) -> (BLOCK_N, SPLIT_K, num_warps,
+# num_stages), from ``benchmarks/bench_dsv4_fp8_gemv.py --sweep`` on an RTX 5090
+# (170 SMs, 128 MB L2, 1.79 TB/s), measured DRAM-bound inside a CUDA graph.
+#
+# The fused epilogue makes SPLIT_K free of launch cost, so these run far narrower tiles
+# (BLOCK_N 2-8) and more k-partitions than the unfused table could afford: with the
+# reduce as a separate launch, every extra k-partition had to pay for itself twice over.
+# Narrow tiles are what buys the bandwidth here -- one token's GEMV has only N/BLOCK_N
+# x SPLIT_K programs to fill 170 SMs with memory-level parallelism.
+_FUSED_DECODE_CFG: dict[tuple[int, int], tuple[int, int, int, int]] = {
+    (1024, 4096): (4, 8, 1, 1),     # wq_a
+    (32768, 1024): (32, 1, 1, 3),   # wq_b
+    (512, 4096): (2, 8, 1, 3),      # attn wkv
+    (4096, 8192): (8, 4, 1, 3),     # wo_b
+    (2048, 4096): (4, 4, 1, 3),     # shared w1 / w3
+    (4096, 2048): (4, 2, 1, 1),     # shared w2
+    (8192, 1024): (4, 1, 1, 3),     # indexer wq_b
+    (8192, 4096): (8, 2, 1, 1),     # wo_a, grouped (FREETOKEN_WO_A_FP8)
+}
+
+
+def _fused_cfg(N: int, K: int) -> tuple[int, int, int, int]:
+    cfg = _FUSED_DECODE_CFG.get((N, K))
+    if cfg is not None:
+        bn, sk, nw, ns = cfg
+    else:
+        bn, sk, nw = _decode_cfg(N, K)
+        ns = 3
+    sk = max(1, min(sk, K // 128))
+    while sk > 1 and (K // sk) % 128:  # every k-slice must stay a whole number of blocks
+        sk //= 2
+    return bn, sk, nw, ns
+
+
+# Per-device arrival counters for the _EP_LOCK epilogue. One int32 per n-tile; the
+# kernel leaves every entry back at 0, so ONE buffer serves every projection and survives
+# CUDA-graph replay untouched (nothing has to reset it between calls). Sized once for the
+# widest decode grid with headroom, so it is allocated exactly once per device.
+#
+# The buffer is shared across call sites, which is safe because the decode step issues its
+# projections on ONE stream: kernels are serialized, so no two GEMVs ever hold the counters
+# at the same time. Two GEMVs on concurrent streams would race, hence the single-stream
+# assumption is load-bearing.
+_LOCK_SLOTS = 1 << 14
+_LOCKS: dict[torch.device, torch.Tensor] = {}
+
+
+def _locks(device: torch.device, n_tiles: int) -> torch.Tensor | None:
+    """The arrival-counter buffer, or None if it would have to be allocated mid-capture
+    (the caller then takes the two-launch epilogue, which needs no counters)."""
+    buf = _LOCKS.get(device)
+    if buf is None or buf.numel() < n_tiles:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(max(n_tiles, _LOCK_SLOTS), dtype=torch.int32, device=device)
+        _LOCKS[device] = buf
+    return buf
+
+
+def fused_fp8_gemv(
+    x: torch.Tensor,            # [G, K] or [K] unquantized activation
+    weight: torch.Tensor,       # [N, K] float8_e4m3fn (kernel view already applied)
+    sb: torch.Tensor,           # [N//128, K//128] uint8 e8m0
+    out_dtype: torch.dtype,
+    *,
+    group_rows: int | None = None,
+    cfg: tuple[int, int, int, int] | None = None,
+    epilogue: int | None = None,
+) -> torch.Tensor:
+    """Single-launch FP8 block-scaled GEMV: activation quantized in the prologue,
+    split-k reduced in the epilogue. ``group_rows`` selects the block-diagonal (grouped)
+    form used by ``wo_a`` -- output rows ``[g*group_rows, (g+1)*group_rows)`` consume
+    activation row ``g``. ``epilogue`` forces ``_EP_PART`` (two launches) for parity
+    testing; the default picks ``_EP_DIRECT`` / ``_EP_LOCK`` by ``SPLIT_K``."""
+    N, K = weight.shape
+    x2 = x.reshape(-1, K)
+    G = x2.shape[0]
+    gr = N if group_rows is None else group_rows
+    assert gr * G == N, (gr, G, N)
+    BLOCK_N, split_k, num_warps, num_stages = cfg or _fused_cfg(N, K)
+    assert gr % BLOCK_N == 0, (gr, BLOCK_N)
+    n_tiles = triton.cdiv(N, BLOCK_N)
+    ep = (_EP_DIRECT if split_k == 1 else _EP_LOCK) if epilogue is None else epilogue
+    out = torch.empty(N, dtype=out_dtype, device=x.device)
+    if ep == _EP_DIRECT:
+        assert split_k == 1
+        o, lock = out, out          # unused pointer args; the branch is constexpr-dead
+        stride_ok, stride_on = 0, out.stride(0)
+    else:
+        lock = out
+        if ep == _EP_LOCK:
+            lock = _locks(x.device, n_tiles)
+            if lock is None:  # counters not warmed up before capture -> two launches
+                ep, lock = _EP_PART, out
+        o = torch.empty((split_k, N), dtype=torch.float32, device=x.device)
+        stride_ok, stride_on = o.stride(0), o.stride(1)
+    _fp8_fused_gemv_kernel[(n_tiles, split_k)](
+        x2, weight, sb, o, out, lock, N, K,
+        x2.stride(0), x2.stride(1), weight.stride(0), weight.stride(1),
+        sb.stride(0), sb.stride(1), stride_ok, stride_on,
+        GROUP_ROWS=gr, BLOCK_N=BLOCK_N, SPLIT_K=split_k,
+        OUT=_TL_DTYPE[out_dtype], EPILOGUE=ep,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    if ep == _EP_PART:
+        _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
+            o, out, N, split_k, o.stride(0), o.stride(1),
+            BLOCK=256, OUT=_TL_DTYPE[out_dtype], num_warps=2,
+        )
+    return out
+
+
+def grouped_block_fp8_linear(
+    x: torch.Tensor,          # [..., G, D] bf16 (one activation row per output group)
+    weight: torch.Tensor,     # [G*R, D] float8_e4m3fn
+    scale: torch.Tensor,      # [G*R//128, D//128] e8m0
+    group_rows: int,          # R
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Block-diagonal FP8 linear: ``out[g*R + r] = sum_d x[g, d] * W[g*R + r, d]``.
+
+    This is the FP8 form of DSV4's ``wo_a`` grouped output projection (the reference
+    runs it as a bf16 ``einsum("bsgd,grd->bsgr")``). Decode (one token) is a single
+    fused GEMV launch; prefill falls back to one block GEMM per group.
+    """
+    assert weight.dtype == FP8
+    *lead, G, D = x.shape
+    NR, R = weight.shape[0], group_rows
+    assert weight.shape[1] == D and R * G == NR, (weight.shape, G, R)
+    compute_dtype = x.dtype if x.dtype in _TL_DTYPE else torch.bfloat16
+    sb = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
+    sb = sb.contiguous()
+    M = 1
+    for s in lead:
+        M *= s
+    if M == 1:
+        out = fused_fp8_gemv(
+            x, e4m3_kernel_view(weight), sb, compute_dtype, group_rows=R
+        ).reshape(*lead, NR)
+    else:
+        xm = x.reshape(M, G, D)
+        out = torch.cat(
+            [block_fp8_linear(xm[:, g], weight[g * R:(g + 1) * R],
+                              sb[g * R // 128:(g + 1) * R // 128])
+             for g in range(G)],
+            dim=-1,
+        ).reshape(*lead, NR)
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out
+
+
 # Swept-best decode GEMV config per (N, K) -> (BLOCK_N, SPLIT_K, num_warps).
 _DECODE_FP8_CFG = {
     (1024, 4096): (16, 16, 1),   # wq_a
@@ -353,12 +618,18 @@ def block_fp8_linear(
     weight: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    fused: bool | None = None,
 ) -> torch.Tensor:
     """``y = act_quant(x) @ weight^T`` (reference FP8 path).
 
     ``x``: ``[..., K]`` bf16; ``weight``: ``[N, K]`` float8_e4m3fn; ``scale``:
     ``[N//128, K//128]`` float8_e8m0fnu (weight block scale). Activation is quantized
     to FP8 with a per-128 ue8m0 scale; the GEMM applies both scales per 128-K block.
+
+    ``fused`` overrides the decode-path kernel choice (default: the module toggle, i.e.
+    the fused single-launch GEMV unless ``FREETOKEN_DSV4_FUSED_GEMV=0``). ``fused=False``
+    is the pre-fusion three-launch path, kept as the parity/benchmark reference.
     """
     assert weight.dtype == FP8
     *lead, K = x.shape
@@ -370,14 +641,25 @@ def block_fp8_linear(
     sb = sb.contiguous()
     w = e4m3_kernel_view(weight)
 
-    a_fp8, sa = act_quant_fp8(x, 128)  # [M,K] fp8, [M,K//128] e8m0 codes
-    M = a_fp8.shape[0]
+    M = 1
+    for s in lead:
+        M *= s
 
     if M == 1:
+        # Decode: one fused launch (act-quant prologue, split-k epilogue) instead of
+        # act_quant -> gemv -> reduce. See _fp8_fused_gemv_kernel.
+        if _USE_FUSED if fused is None else fused:
+            out = fused_fp8_gemv(x, w, sb, compute_dtype).reshape(*lead, N)
+            if bias is not None:
+                out = out + bias.to(out.dtype)
+            return out
+        a_fp8, sa = act_quant_fp8(x, 128)
         out = _fp8_act_gemv(a_fp8[0], sa[0], w, sb, compute_dtype).reshape(*lead, N)
         if bias is not None:
             out = out + bias.to(out.dtype)
         return out
+
+    a_fp8, sa = act_quant_fp8(x, 128)  # [M,K] fp8, [M,K//128] e8m0 codes
 
     out = torch.empty((M, N), dtype=compute_dtype, device=x.device)
     BLOCK_M = 32
@@ -399,4 +681,11 @@ def block_fp8_linear(
     return out
 
 
-__all__ = ["block_fp8_linear", "act_quant_fp8", "act_quant_fp8_inplace", "fp4_act_quant_inplace"]
+__all__ = [
+    "block_fp8_linear",
+    "grouped_block_fp8_linear",
+    "fused_fp8_gemv",
+    "act_quant_fp8",
+    "act_quant_fp8_inplace",
+    "fp4_act_quant_inplace",
+]
