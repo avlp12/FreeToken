@@ -583,9 +583,15 @@ def test_l2_stage_off_is_the_l1_graph():
 @pytest.mark.slow
 def test_forked_pull_overlaps():
     """The forked prefetch pull runs concurrently with compute: forking must beat the
-    identical prefetch work issued serially on the main stream."""
+    identical prefetch work issued serially on the main stream.
 
-    reps = 30
+    Timed as the best of several rounds rather than a single sample. This is a wall-clock
+    assertion on a box that may be running a server or another test suite, and
+    interference can only ever ADD time -- a single sample turns any passing job
+    elsewhere on the GPU into a red build here.
+    """
+
+    reps, rounds = 30, 3
 
     def timed(**kw) -> float:
         w = _Workload(mix=0.5, **kw)
@@ -597,17 +603,20 @@ def test_forked_pull_overlaps():
         xs = [
             torch.randn(1, DIM, generator=g).to(w.dev).bfloat16() for _ in range(reps + 5)
         ]
+        samples = []
         with torch.cuda.stream(stream):
-            for i in range(5):
-                w.hidden.copy_(xs[i])
-                graph.replay()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for i in range(reps):
-                w.hidden.copy_(xs[i + 5])
-                graph.replay()
-            torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / reps * 1e3
+            for _round in range(rounds):
+                for i in range(5):
+                    w.hidden.copy_(xs[i])
+                    graph.replay()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for i in range(reps):
+                    w.hidden.copy_(xs[i + 5])
+                    graph.replay()
+                torch.cuda.synchronize()
+                samples.append((time.perf_counter() - t0) / reps * 1e3)
+        return min(samples)
 
     base = timed(prefetch=False)
     serial = timed(prefetch=True, serial=True)
