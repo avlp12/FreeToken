@@ -101,7 +101,8 @@ def _assert_bf16_adjacent(got, ref, steps=2, min_eq=0.999, rel_l2=5e-4):
 @pytest.mark.parametrize("tokens", [1, 2, 5, 8, 32, 64])
 def test_stage_matches_reference(tokens):
     fn, scale, base, w = _params(tokens)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
     ry, rpost, rcomb = _ref_pre(x, fn, scale, base, w)
 
     stream, y, post, comb = hc_stage(
@@ -124,7 +125,8 @@ def test_mix_accuracy_not_worse_than_reference(tokens):
     ``post`` is the cleanest probe: it is one well-conditioned elementwise map away from
     the mix, with none of the Sinkhorn's iteration in between."""
     fn, scale, base, w = _params(tokens)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
     _, rpost, _ = _ref_pre(x, fn, scale, base, w)
     _, _, post, _ = hc_stage(
         x, None, fn, scale, base, hc_mult=HC, sinkhorn_iters=ITERS, hc_eps=EPS,
@@ -151,10 +153,11 @@ def test_reexpand_matches_standalone_kernel():
     cancellation cases by one bf16 step. Nothing else may move."""
     tokens = 8
     fn, scale, base, w = _params(23)
-    a = torch.randn(tokens, DIM, device=DEV, dtype=torch.bfloat16)
-    residual = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
-    post_in = torch.rand(tokens, HC, device=DEV, dtype=torch.float32) + 0.5
-    comb_in = torch.rand(tokens, HC, HC, device=DEV, dtype=torch.float32)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    a = torch.randn(tokens, DIM, generator=g, device=DEV, dtype=torch.bfloat16)
+    residual = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
+    post_in = torch.rand(tokens, HC, generator=g, device=DEV, dtype=torch.float32) + 0.5
+    comb_in = torch.rand(tokens, HC, HC, generator=g, device=DEV, dtype=torch.float32)
     stream, _, _, _ = hc_stage(
         None, (a, residual, post_in, comb_in), fn, scale, base, hc_mult=HC,
         sinkhorn_iters=ITERS, hc_eps=EPS, norm_eps=EPS, norm_weight=w,
@@ -168,10 +171,11 @@ def test_reexpand_matches_standalone_kernel():
 def test_stage_absorbs_pending_post(tokens):
     """The pending sublayer re-expand folded into the same launch."""
     fn, scale, base, w = _params(tokens + 100)
-    a = torch.randn(tokens, DIM, device=DEV, dtype=torch.bfloat16)
-    residual = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
-    post_in = torch.rand(tokens, HC, device=DEV, dtype=torch.float32) + 0.5
-    comb_in = torch.rand(tokens, HC, HC, device=DEV, dtype=torch.float32)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    a = torch.randn(tokens, DIM, generator=g, device=DEV, dtype=torch.bfloat16)
+    residual = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
+    post_in = torch.rand(tokens, HC, generator=g, device=DEV, dtype=torch.float32) + 0.5
+    comb_in = torch.rand(tokens, HC, HC, generator=g, device=DEV, dtype=torch.float32)
     comb_in /= comb_in.sum(-1, keepdim=True)
 
     rx = _ref_post(a, residual, post_in, comb_in)
@@ -220,7 +224,8 @@ def test_sinkhorn_iteration_count_is_load_bearing():
     different from 19, and must land closer to doubly stochastic."""
     tokens = 8
     fn, scale, base, w = _params(29)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16) * 2.0
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16) * 2.0
     outs = {}
     for iters in (2, 19, 20):
         _, _, _, comb = hc_stage(
@@ -241,7 +246,8 @@ def test_comb_is_doubly_stochastic():
     from doubly stochastic than the kernel it replaces."""
     tokens = 16
     fn, scale, base, w = _params(3)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16) * 3.0
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16) * 3.0
     _, _, _, comb = hc_stage(
         x, None, fn, scale, base, hc_mult=HC, sinkhorn_iters=ITERS, hc_eps=EPS,
         norm_eps=EPS, norm_weight=w, tokens=tokens, dim=DIM,
@@ -259,7 +265,8 @@ def test_comb_is_doubly_stochastic():
 def test_head_stage_matches_reference(with_norm):
     tokens = 4
     fn, scale, base, w = _params(11, mix=HC)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
     x2d = x.view(tokens, HCD)
     mixes = F.linear(x2d.float(), fn) * inv_rms(x2d, EPS)
     pre = torch.sigmoid(mixes * scale[:1] + base) + EPS
@@ -277,7 +284,8 @@ def test_head_stage_matches_reference(with_norm):
 def test_no_norm_weight():
     tokens = 4
     fn, scale, base, _ = _params(5)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
     ry, _, _ = _ref_pre(x, fn, scale, base, None)
     _, y, _, _ = hc_stage(
         x, None, fn, scale, base, hc_mult=HC, sinkhorn_iters=ITERS, hc_eps=EPS,
@@ -291,7 +299,8 @@ def test_repeated_launches_are_stable():
     workspace have to give the same answer every time."""
     tokens = 8
     fn, scale, base, w = _params(13)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
     first = None
     for _ in range(64):
         _, y, post, comb = hc_stage(
@@ -311,7 +320,8 @@ def test_graph_capture_replays():
     replay finds it armed rather than saturated."""
     tokens = 4
     fn, scale, base, w = _params(17)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    rng = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=rng, device=DEV, dtype=torch.bfloat16)
     out = torch.empty(tokens, DIM, device=DEV, dtype=torch.bfloat16)
     cb = torch.empty(tokens, HC, HC, device=DEV, dtype=torch.float32)
 
@@ -430,7 +440,8 @@ def test_pipeline_is_one_launch_per_site():
     flush costs an extra."""
     tokens, sites = 1, 6
     params = _chain_params(sites)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
 
     def count(call):
         call()
@@ -458,7 +469,8 @@ def test_pipeline_drift_stays_inside_the_chain_conditioning():
     element, i.e. the fused path stays inside the arithmetic's noise floor."""
     tokens, sites = 1, 12
     params = _chain_params(sites, seed=59)
-    x = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    x = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
 
     ref = _ref_chain(x, params, tokens)
     fus = _fused_chain(x, params, tokens)
@@ -478,10 +490,11 @@ def test_flush_matches_the_standalone_post_combine():
     """``hc_materialize`` is the reference kernel, unchanged -- it is what the DSpark
     auxiliary taps and the unfused path fall back to."""
     tokens = 4
-    a = torch.randn(tokens, DIM, device=DEV, dtype=torch.bfloat16)
-    res = torch.randn(tokens, HCD, device=DEV, dtype=torch.bfloat16)
-    post = torch.rand(tokens, HC, device=DEV) + 0.5
-    comb = torch.rand(tokens, HC, HC, device=DEV)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    a = torch.randn(tokens, DIM, generator=g, device=DEV, dtype=torch.bfloat16)
+    res = torch.randn(tokens, HCD, generator=g, device=DEV, dtype=torch.bfloat16)
+    post = torch.rand(tokens, HC, generator=g, device=DEV) + 0.5
+    comb = torch.rand(tokens, HC, HC, generator=g, device=DEV)
     st = HCState((tokens, 1, HC, DIM), pending=(a, res, post, comb))
     assert torch.equal(
         hc_materialize(st).view(tokens, HCD), _ref_post(a, res, post, comb)
