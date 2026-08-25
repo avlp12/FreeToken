@@ -319,21 +319,25 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         prefetcher = self.prefetcher
         if prefetcher is not None:
-            # This layer's rows, pulled on the forked stream one layer ago, must have
-            # landed before any of this layer's own cache bookkeeping runs -- the
-            # prefetch plan is single-buffered, exactly like the real one
-            # (freetoken/moe/prefetch.py explains why the join cannot come later).
-            prefetcher.join(cache, self.layer_id)
+            # The pull forked one layer ago is still in flight (the join is now down by
+            # the GEMM), so take the rows it is writing out of the victim pool this
+            # ensure is about to search -- otherwise copy_missing below could become a
+            # second writer for one of them. See freetoken/moe/prefetch.py.
+            prefetcher.before_ensure(cache, self.layer_id)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         if prefetcher is not None:
-            # Predict and start pulling layer L+1's experts while this layer's GEMM
-            # (queued right below) runs -- the whole point of the feature. topk_ids
-            # are slot ids by now: the rows this GEMM will read, which the speculative
-            # admission must not evict.
+            # Predict and start pulling layer L+1's (and L+2's) experts while this
+            # layer's GEMM (queued right below) runs -- the whole point of the feature.
+            # topk_ids are slot ids by now: the rows this GEMM will read, which the
+            # speculative admissions must not evict.
             ctx = self.prefetch_ctx
             if ctx is not None:
                 prefetcher.schedule(cache, self.layer_id, ctx[0], ctx[1], topk_ids)
+            # ... and only here, with everything else already enqueued, wait for the
+            # rows this layer's GEMM needs. The join runs unconditionally: this layer
+            # may have nothing to prefetch and still be owed a pull by its predecessor.
+            prefetcher.before_gemm(cache, self.layer_id)
         return self._expert_gemm(
             cache,
             hidden_states,

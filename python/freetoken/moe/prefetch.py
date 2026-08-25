@@ -1,4 +1,4 @@
-"""In-graph L+1 MoE expert prefetch -- env-gated, OFF by default.
+"""In-graph L+1 / L+2 MoE expert prefetch -- env-gated, OFF by default.
 
 Enabled by ``FREETOKEN_MOE_PREFETCH=1`` (or ``--moe-prefetch``, which sets it).
 With the flag unset the cache allocates no prefetch state, every offload MoE layer
@@ -24,11 +24,12 @@ What runs where
 Per decode step, at every MoE layer L whose successor is also an offloaded MoE
 layer, after L's REAL ``ensure_experts``/``copy_missing`` and before L's expert GEMM::
 
-    MAIN    ... ensure(L) copy(L) | Gate_{L+1}(x_L) prefetch_ensure(L+1) [fork] ... GEMM(L)
-    BRANCH                                                    \\-> prefetch_copy(L+1) -[done]
+    MAIN  guard(L) ensure(L) copy(L) | Gate_{L+1}(x_L) pf_ensure(L+1)
+                                       Gate_{L+2}(x_L) pf_ensure(L+2) [fork] join(L) GEMM(L)
+    BRANCH                                      \\-> pf_copy(L+1) pf_copy(L+2) -[done_L]
 
-and the branch's completion event is joined on the main stream before layer L+1's
-expert GEMM (see ``join``), one layer later.
+with ``join(L)`` waiting on the done event layer ``L-1`` recorded -- so the window a
+pull has to hide in runs from layer L-1's fork all the way to layer L's GEMM.
 
 Ordering rules the implementation preserves:
 
@@ -36,9 +37,34 @@ Ordering rules the implementation preserves:
   program order. Only the pull forks, so the slot tables are never written
   concurrently.
 * the real ``copy_missing(L)`` still completes before ``GEMM(L)`` (untouched).
-* the prefetch pull for L+1 completes before ``GEMM(L+1)`` (the join).
+* the prefetch pull for L+1 completes before ``GEMM(L+1)`` (the join). The L+2 pull is
+  covered transitively: it is queued on the same branch ahead of layer L+1's pulls, so
+  the join at L+2 (which waits on layer L+1's done event) implies it.
 * the real path's single-buffered miss plan is never read or written by the
-  prefetch path -- that is what the second descriptor set on the cache is for.
+  prefetch path -- that is what the separate descriptor sets on the cache are for.
+* a descriptor set is only rewritten after every pull that reads it has retired --
+  that is what the PARITY index on those sets is for (see below).
+
+The second lookahead stage (L+2)
+--------------------------------
+The same hidden that predicts L+1 at 71.5% recall predicts L+2 at 65.3% (measured,
+routing trace v2). Pulling for L+2 from layer L gives a pull ~2.2ms of window instead
+of ~1.1ms, and -- more usefully on a link that arrives in bursts -- lets a layer whose
+L+1 prediction was wrong still have been covered two layers earlier.
+
+But those bytes cross the SAME saturated link, and the rank-limit table below is the
+lesson about what that costs. So the L+2 stage speculates NARROW: ``top-1`` by
+predicted score by default (``FREETOKEN_PREFETCH_L2_TOPK``, 0 disables the stage
+entirely), against ``top-3`` for L+1. Hash-router targets are exact and never
+truncated, at either distance.
+
+Double pulling is not a hazard the code has to defend against: the two stages predict
+DIFFERENT layers (L+1 and L+2), whose rows live in disjoint id spaces, so one layer's
+pair of admissions can never name the same row twice. Across layers, the row layer L
+admitted for L+2 is simply resident when layer L+1 stages its own L+2 prediction --
+``lru_ensure`` sees a hit and does not re-pull it. The only waste left is a row admitted
+at L for L+2 and evicted before L+1 runs, which is then re-pulled; the protections below
+make that rare rather than impossible, and it costs bytes, never correctness.
 
 Why a rank limit (FREETOKEN_PREFETCH_TOPK) exists
 -------------------------------------------------
@@ -82,50 +108,68 @@ staging area and no pinning: an entry admitted this step is the freshest thing i
 the cache, so the ordinary victim search will not take it back for many steps, and
 offline replay of the trace showed keep-wrong and discard-wrong worth the same.
 
-The two eviction hazards, and why neither is left to luck
---------------------------------------------------------
+Where the join goes: just before GEMM(L)
+---------------------------------------
+The join used to sit before layer L's real ``ensure_experts``. That was sound but
+short: it gave up the overlap against ``ensure_experts(L)``, ``copy_missing(L)`` and
+both lookahead Gates. It sat there because the prefetch plan was single-buffered
+exactly like the real one, so deferring the join past the next layer's staging let
+``prefetch_ensure`` overwrite ``evict_slots``/``num_indices`` while the branch's pull
+was still reading them -- the pull then lands wrong rows in wrong slots. That
+reproduced hard: a naive late join failed value identity in 4 of 4 runs under load.
+
+Two structural changes move the join to just before the expert GEMM.
+
+**Parity-indexed plans.** The descriptor sets are indexed ``(src_layer % 2, stage)``
+(``OffloadMoeCache.prefetch_plan_index``). Layer L's plans are overwritten by layer
+L+2, and layer L+1's join -- which precedes layer L+1's GEMM, hence everything layer
+L+2 does -- has already waited on layer L's done event. So no descriptor is ever
+rewritten while a pull reading it is in flight. ``MoePrefetcher.double_buffer = False``
+collapses the parity and restores the racy single-buffered layout, which is how the
+test proves the race is what the buffering fixes.
+
+**Re-protecting the in-flight pull's destinations.** With the join late, layer L+1's
+real ``ensure_experts`` now runs while layer L's pull is going. See hazard 2.
+
+The three eviction hazards, and why none is left to luck
+-------------------------------------------------------
 Speculation shares the LRU state with the real path, so a speculative admission can
-evict something. Two cases matter, and both are closed structurally rather than by
-hoping the cache is big enough (an early version relied on recency alone and DID
-corrupt outputs once the toy cache was thrashed hard enough -- the race is real, and
-it is timing dependent, which is the worst kind to ship on a hope):
+evict something. ``lru_ensure`` bumps ``lru_step`` on entry and refuses to evict slots
+whose ``usage`` equals the step it is about to compute; ``protect_slots`` writes that
+value, which shields the named rows from exactly ONE following call. Every protection
+below is therefore issued immediately before the call it must survive -- an early
+version relied on recency alone and DID corrupt outputs once the toy cache was thrashed
+hard enough. The race is real, and it is timing dependent, which is the worst kind to
+ship on a hope.
 
-1. ``prefetch_ensure(L+1)`` runs while ``GEMM(L)`` is still queued behind it on the
-   main stream, and the forked pull then writes the slots it admitted. Evicting a
-   slot ``GEMM(L)`` is about to read would overwrite a row mid-GEMM.
-   *Closed by* ``cache.protect_slots(topk_ids)`` immediately before the speculative
-   ensure: ``lru_ensure`` refuses to evict slots whose usage equals the step it is
-   about to compute, so writing that value into layer L's routed slots takes them out
-   of the victim pool for exactly that one call.
-2. ``ensure_experts(L+1)`` one layer later could evict a slot the branch pull is
-   still writing, after which ``copy_missing(L+1)`` writes the same slot from the
-   main stream -- two writers, one row.
-   *Closed by* joining the branch BEFORE layer L+1's real ensure, so the pull has
-   retired before any of L+1's bookkeeping runs.
+1. **Speculation evicting the current GEMM's rows.** ``prefetch_ensure`` runs while
+   ``GEMM(L)`` is still queued behind it on the main stream, and the forked pull then
+   writes the slots it admitted. Evicting a slot ``GEMM(L)`` is about to read would
+   overwrite a row mid-GEMM.
+   *Closed by* ``cache.protect_slots(topk_ids)`` before EACH lookahead ensure -- both
+   of them, since one protection covers one call.
+2. **The real path evicting an in-flight pull's destinations.** ``ensure_experts(L+1)``
+   now runs before the join, so it can pick a slot layer L's pull is still writing;
+   ``copy_missing(L+1)`` would then write the same row from the main stream. Two
+   writers, two streams, one row.
+   *Closed by* ``cache.protect_prefetch_plan`` on both of layer L's plan sets,
+   immediately before ``ensure_experts(L+1)`` (``MoePrefetcher.guard``). Only layer L's
+   fork can be in flight there: everything layer L-1 forked was joined at layer L.
+3. **The L+2 stage evicting what the L+1 stage just admitted.** The two lookahead
+   ensures are consecutive calls, so the second could take back the first's rows.
+   *Closed by* ``protect_prefetch_plan`` on the stage-0 plan before the stage-1 ensure.
 
-Where the join goes, and why not later
---------------------------------------
-The original design called for the join just before layer L+1's expert GEMM rather
-than before its ensure, for a wider overlap window. That is unsound as built, for a
-reason beyond hazard 2: the PREFETCH plan is single-buffered exactly like the real
-one. Deferring the join past ``schedule(L+2)`` lets ``prefetch_ensure(L+2)`` overwrite
-``prefetch_evict_slots``/``prefetch_num_indices`` while the branch's pull for L+1 is
-still reading them, so the pull lands wrong rows in wrong slots. It reproduced: with
-an exact lookahead -- the case where the GEMM's rows come from the branch rather than
-from the main-stream copy -- a late join failed the value-identity test in 4 of 4
-runs under load, while joining before the ensure never failed in any configuration.
+A speculative admission evicted LATER -- by layer L+1's own lookahead ensures, after
+the guard's one-call protection has lapsed -- is deliberately left alone: the only
+other writer for such a row is a later pull on the SAME branch stream, which is ordered
+behind the one in flight, so the last write and the slot table agree.
 
-Joining before the ensure gives up very little: only the overlap against
-``ensure_experts(L+1)`` (one small kernel) and ``copy_missing(L+1)``, which is itself
-a PCIe pull the prefetch would merely have contended with on the same link. Restoring
-the later join would require parity-indexed double buffering of the prefetch plan; it
-is not worth that for an overlap window with no bandwidth to gain.
-
-Independently of both hazards, ``cache_size >= 4 * K`` (K = predicted ids =
-batch x top_k) is required and enforced: the victim pool must still contain K
-evictable slots after the protected ones are removed, and ``lru_ensure`` has no
-defined behaviour when it cannot find enough. Layers failing the bound are skipped,
-once-logged -- the same decision on every step, so it stays capture-safe.
+Independently of all three, ``cache_size >= 4 * K`` (K = every predicted id this layer
+stages, both stages together) is required and enforced: the victim pool must still
+contain K evictable slots after the protected ones are removed, and ``lru_ensure`` has
+no defined behaviour when it cannot find enough. A layer that fails the bound drops the
+L+2 stage first and skips entirely only if L+1 alone will not fit -- once-logged, and
+the same decision on every step, so it stays capture-safe.
 """
 
 from __future__ import annotations
@@ -147,6 +191,23 @@ __all__ = ["MoePrefetcher", "get_prefetcher"]
 # the misses they remove, so this is the knob that decides whether the feature is a
 # win or a wash.
 TOPK_ENV = "FREETOKEN_PREFETCH_TOPK"
+# How many of the L+2 lookahead's predictions to pull, per layer. Default 1: the L+2
+# stage exists to cover what the L+1 stage misses and to smooth bursts, not to move
+# more bytes, and its recall (65.3%) is lower than L+1's. 0 disables the stage
+# entirely -- no second Gate call, no second ensure, no second pull, and the captured
+# graph is the L+1-only one kernel for kernel.
+L2_TOPK_ENV = "FREETOKEN_PREFETCH_L2_TOPK"
+L2_TOPK_DEFAULT = 1
+# Where the branch join goes. 1 (default) = just before the expert GEMM, the wide
+# window the parity-indexed descriptors make sound. 0 = the old placement, before the
+# layer's real ensure_experts. Kept as a knob purely so the placement can be A/B'd at
+# the server without a rebuild; both placements are correct.
+LATE_JOIN_ENV = "FREETOKEN_PREFETCH_LATE_JOIN"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else default
 
 
 class MoePrefetcher:
@@ -164,10 +225,11 @@ class MoePrefetcher:
         self.n_layers = 0
         self.top_k = 0
         self.n_experts = 0
-        # Layers with a pull in flight for the CURRENT forward. Host-side bookkeeping
-        # evaluated while the graph is traced, never during replay; the entry is
-        # popped by the join so an aborted forward cannot leave a stale one.
-        self._armed: dict[int, bool] = {}
+        # Layers that must join a pull before their GEMM, mapped to
+        # (source layer that forked it, how many stages it forked). Host-side
+        # bookkeeping evaluated while the graph is traced, never during replay; the
+        # entry is popped by the join so an aborted forward cannot leave a stale one.
+        self._armed: dict[int, tuple[int, int]] = {}
         self._skipped: set[int] = set()
         # Layers a fork was actually enqueued for, ever. Under CUDA graphs `schedule`
         # only runs while the graph is being traced, so a non-empty set is proof the
@@ -179,6 +241,14 @@ class MoePrefetcher:
         # 0 = pull every prediction. Replaced with the resolved limit by the first
         # register_gate, which is where the router's top_k becomes known.
         self.topk_limit = 0
+        # Second lookahead stage (L+2). 0 = the stage is off and nothing about the
+        # L+1-only graph changes.
+        self.l2_topk = max(0, _env_int(L2_TOPK_ENV, L2_TOPK_DEFAULT))
+        # Parity-indexed descriptor sets; False restores the racy single-buffered
+        # layout (tests only -- see the module docstring).
+        self.double_buffer = True
+        # Join before the expert GEMM (True) or before the layer's real ensure (False).
+        self.late_join = _env_int(LATE_JOIN_ENV, 1) != 0
 
     # ------------------------------------------------------------------ registry
     def register_gate(
@@ -258,6 +328,24 @@ class MoePrefetcher:
         """Whether ``layer_id`` schedules a prefetch of ``layer_id + 1``."""
         return self._eligible(cache, layer_id, layer_id + 1)
 
+    def stages(self, cache, layer_id: int) -> list[tuple[int, int]]:
+        """``(predicted layer, rank limit)`` per lookahead stage layer ``layer_id`` runs.
+
+        Empty when this layer prefetches nothing. Stage 0 (L+1) gates the whole schedule:
+        if L+1 is not a plain GPU offload MoE layer then nothing there will ever call
+        :meth:`join`, and an unjoined pull would outlive the descriptors it reads. Stage 1
+        (L+2) is additive and is dropped on its own when ineligible or switched off.
+
+        Host-side and capture-time constant, exactly like :meth:`ineligible_reason`, so
+        the set of fork edges in the captured graph is fixed.
+        """
+        if not self._eligible(cache, layer_id, layer_id + 1):
+            return []
+        out = [(layer_id + 1, self.topk_limit)]
+        if self.l2_topk and self._eligible(cache, layer_id, layer_id + 2):
+            out.append((layer_id + 2, self.l2_topk))
+        return out
+
     def describe(self, cache, layer_ids) -> str:
         """One-line boot summary: how many layers will prefetch, and why not the rest.
 
@@ -266,14 +354,21 @@ class MoePrefetcher:
         good" or "nothing ever got as far as evaluating a layer" -- so the enabled
         case now always says something.
         """
-        ok, reasons = [], {}
+        ok, l2, reasons = [], [], {}
         for layer_id in layer_ids:
             why = self.ineligible_reason(cache, layer_id, layer_id + 1)
             if why is None:
                 ok.append(layer_id)
+                if len(self.stages(cache, layer_id)) > 1:
+                    l2.append(layer_id)
             else:
                 reasons.setdefault(why, []).append(layer_id)
-        parts = [f"{len(ok)}/{len(layer_ids)} MoE layers prefetch L+1"]
+        join = "before GEMM" if self.late_join else "before ensure"
+        parts = [
+            f"{len(ok)}/{len(layer_ids)} MoE layers prefetch L+1 "
+            f"(top-{self.topk_limit or 'all'}), {len(l2)} also L+2 "
+            f"(top-{self.l2_topk or 'off'}), join {join}"
+        ]
         for why, ids in reasons.items():
             span = f"{ids[0]}..{ids[-1]}" if len(ids) > 3 else ",".join(map(str, ids))
             parts.append(f"{len(ids)} skipped ({span}): {why}")
@@ -305,60 +400,120 @@ class MoePrefetcher:
         Called on the main stream after this layer's real ``ensure_experts`` /
         ``copy_missing`` and before its expert GEMM.
         """
-        dst = layer_id + 1
-        if not self._eligible(cache, layer_id, dst):
-            return
-        if hidden is None or input_ids is None:
+        stages = self.stages(cache, layer_id)
+        if not stages or hidden is None or input_ids is None:
             return
 
-        # Lookahead router -- MAIN stream, serialized with every other ensure.
-        gate = self._gates[dst]
-        _weights, predicted = gate(hidden, input_ids)
+        # Lookahead routers -- MAIN stream, serialized with every other ensure.
         # Rank limit: keep only the highest-scoring predictions, which are the ones
         # most likely to be right. A hash router is exact by construction (it is a
         # token-id lookup, not a function of the hidden state) and its ids carry no
         # score order, so it is never truncated -- every row it names would have been
         # fetched by the real path anyway.
-        if self.topk_limit and not getattr(gate, "hash", False):
-            predicted = predicted[..., : self.topk_limit]
-        k = predicted.numel()
-        if cache.cache_size < 4 * k:
+        predictions = []
+        for dst, limit in stages:
+            gate = self._gates[dst]
+            _weights, predicted = gate(hidden, input_ids)
+            if limit and not getattr(gate, "hash", False):
+                predicted = predicted[..., :limit]
+            predictions.append((dst, predicted))
+
+        # Victim-pool budget over EVERY id this layer stages. Drop the L+2 stage first
+        # (it is the optional half); skip the layer only if L+1 alone will not fit.
+        while predictions and cache.cache_size < 4 * sum(p.numel() for _, p in predictions):
+            dst, predicted = predictions.pop()
+            if not predictions:
+                self._skip_once(
+                    dst,
+                    f"cache_size {cache.cache_size} < 4 * {predicted.numel()} predicted "
+                    "ids: too few evictable slots left once the current layer's rows "
+                    "are protected",
+                )
+                return
             self._skip_once(
                 dst,
-                f"cache_size {cache.cache_size} < 4 * {k} predicted ids: too few "
-                "evictable slots left once the current layer's rows are protected",
+                f"cache_size {cache.cache_size} leaves no victim-pool budget for the "
+                f"L+2 stage on top of L+1; predicting {dst} disabled",
             )
-            return
-        # Hazard 1 (see the module docstring): take this layer's live rows out of the
-        # speculative ensure's victim pool.
-        cache.protect_slots(active_slots)
-        cache.prefetch_ensure(dst, predicted)
+
+        plans = []
+        for stage, (dst, predicted) in enumerate(predictions):
+            plan = cache.prefetch_plan_index(layer_id, stage, self.double_buffer)
+            # Hazard 1: take this layer's live rows out of this ensure's victim pool.
+            # Protection lasts one call, so it is re-issued for the second stage.
+            cache.protect_slots(active_slots)
+            if stage:
+                # Hazard 3: and keep the previous stage's fresh admissions, whose pull
+                # is about to be forked, out of it too.
+                cache.protect_prefetch_plan(plans[-1])
+            cache.prefetch_ensure(dst, predicted, plan_index=plan)
+            plans.append(plan)
+            self.scheduled.add(dst)
 
         main = torch.cuda.current_stream(cache.device)
         branch = cache.prefetch_stream
-        fork_event = cache.prefetch_fork_events[dst]
-        done_event = cache.prefetch_done_events[dst]
-        # Fork: the branch starts only after the speculative ensure has produced the
-        # plan it is about to read.
+        fork_event = cache.prefetch_fork_events[layer_id]
+        done_event = cache.prefetch_done_events[layer_id]
+        # Fork: the branch starts only after the speculative ensures have produced the
+        # plans it is about to read. One fork and one done event per SOURCE layer,
+        # covering both stages -- the branch is a single stream, so the L+2 pull is
+        # ordered behind the L+1 pull and a later join subsumes both.
         fork_event.record(main)
         branch.wait_event(fork_event)
         with torch.cuda.stream(branch):
-            cache.prefetch_copy()
+            for plan in plans:
+                cache.prefetch_copy(plan_index=plan)
         done_event.record(branch)
-        self._armed[dst] = True
-        self.scheduled.add(dst)
+        self._armed[layer_id + 1] = (layer_id, len(plans))
+
+    # ------------------------------------------------------------- the two call sites
+    def before_ensure(self, cache, layer_id: int) -> None:
+        """Run at the top of layer ``layer_id``'s MoE block, before ``ensure_experts``.
+
+        Late join (the default): re-protect the destination slots of the pull still in
+        flight, so this layer's real ensure cannot hand one of those rows to
+        ``copy_missing`` as a second writer. Early join: the join itself, which retires
+        the pull outright and makes the protection moot.
+        """
+        if self.late_join:
+            self.guard(cache, layer_id)
+        else:
+            self.join(cache, layer_id)
+
+    def before_gemm(self, cache, layer_id: int) -> None:
+        """Run just before layer ``layer_id``'s expert GEMM. The join, when it is late."""
+        if self.late_join:
+            self.join(cache, layer_id)
+
+    def guard(self, cache, layer_id: int) -> None:
+        """Shield the in-flight pull's destination rows from this layer's real ensure.
+
+        Hazard 2 in the module docstring. Only the immediately preceding layer's fork can
+        be in flight here -- everything the layer before that forked was joined one layer
+        ago -- so the plan sets to protect are exactly that layer's.
+        """
+        armed = self._armed.get(layer_id)
+        if armed is None:
+            return
+        src, n_stages = armed
+        for stage in range(n_stages):
+            cache.protect_prefetch_plan(
+                cache.prefetch_plan_index(src, stage, self.double_buffer)
+            )
 
     def join(self, cache, layer_id: int) -> None:
-        """Order this layer's MoE block behind the pull scheduled for it one layer ago.
+        """Order this layer's expert GEMM behind the pull forked for it one layer ago.
 
-        Called immediately before the layer's real ``ensure_experts`` -- see the module
-        docstring for why it cannot be deferred to just before the expert GEMM.
+        Waits on the done event of the SOURCE layer, which covers both of that layer's
+        lookahead stages (single branch stream, so they are ordered) and, transitively,
+        every pull forked before it -- including the L+2 pull aimed at this layer from
+        two layers back.
         """
-        if not self._armed.pop(layer_id, False):
+        armed = self._armed.pop(layer_id, None)
+        if armed is None:
             return
-        torch.cuda.current_stream(cache.device).wait_event(
-            cache.prefetch_done_events[layer_id]
-        )
+        src, _n_stages = armed
+        torch.cuda.current_stream(cache.device).wait_event(cache.prefetch_done_events[src])
 
 
 _PREFETCHER: MoePrefetcher | None = None

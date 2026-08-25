@@ -67,6 +67,20 @@ PREFETCH_BPB_DEFAULT = 4
 # production shapes without editing code.
 COPY_BPB_ENV = "FREETOKEN_COPY_BPB"
 COPY_BPB_DEFAULT = 8
+# Prefetch miss-plan descriptor sets: PREFETCH_STAGES lookahead distances (stage 0 =
+# L+1, stage 1 = L+2) x PREFETCH_PARITY, the parity-indexed DOUBLE BUFFER that lets the
+# branch join move from before ensure(L+1) to just before GEMM(L+1).
+#
+# The lifetime argument, which is the whole reason the second index exists: the plans a
+# layer L stages live in parity ``L % 2`` and are read by the pulls layer L forks. The
+# next write to that parity is layer L+2's staging -- and layer L+1's join (before its
+# GEMM, hence before layer L+2 runs at all) has already waited on layer L's done event,
+# so every pull reading those descriptors has retired before anything overwrites them.
+# With a single buffer the overwrite would come from layer L+1, one layer too early,
+# which is exactly the race that made a naive late join fail value identity.
+PREFETCH_STAGES = 2
+PREFETCH_PARITY = 2
+PREFETCH_PLAN_SETS = PREFETCH_STAGES * PREFETCH_PARITY
 
 
 def moe_prefetch_enabled() -> bool:
@@ -325,21 +339,32 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
-        # ---- in-graph L+1 expert prefetch (FREETOKEN_MOE_PREFETCH) ----------------
-        # A SECOND, independent miss-plan descriptor set. The real decode path keeps
+        # ---- in-graph L+1/L+2 expert prefetch (FREETOKEN_MOE_PREFETCH) ------------
+        # SEPARATE, independent miss-plan descriptor sets. The real decode path keeps
         # sole ownership of evict_slots/src_indices/num_indices (single-buffered, and
         # consumed by copy_missing in the same layer), so a speculative admission can
-        # never clobber a plan the real path has staged but not yet copied.
+        # never clobber a plan the real path has staged but not yet copied; and the
+        # speculative plans are themselves double-buffered by source-layer parity so a
+        # pull may still be in flight when the NEXT layer stages its own (see
+        # PREFETCH_PLAN_SETS).
         self.prefetch_enabled = moe_prefetch_enabled()
         self.prefetch_bpb = _env_int(PREFETCH_BPB_ENV, PREFETCH_BPB_DEFAULT)
         self.copy_bpb = _env_int(COPY_BPB_ENV, COPY_BPB_DEFAULT)
+        # (evict_slots, src_indices, num_indices) per plan set, indexed by
+        # ``prefetch_plan_index(src_layer, stage)``.
+        self.prefetch_plans: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # Views onto the plan set the last ``prefetch_ensure`` wrote. Kept because the
+        # flashlib wrapper and the plan tests address the descriptors by these names;
+        # ``prefetch_copy``/``protect_prefetch_plan`` address a plan set explicitly.
         self.prefetch_evict_slots: torch.Tensor | None = None
         self.prefetch_src_indices: torch.Tensor | None = None
         self.prefetch_num_indices: torch.Tensor | None = None
         # The forked branch the prefetch pull runs on, plus one fork/join event pair
         # per layer. Allocated ONCE here (long before CUDA-graph capture) so the
         # captured graph sees stable stream/event handles, and one pair per layer so
-        # no event is recorded twice inside a single capture.
+        # no event is recorded twice inside a single capture. Both are indexed by the
+        # SOURCE layer (the layer that forks), not by the predicted layer: one fork per
+        # layer now covers both lookahead stages.
         self.prefetch_stream: torch.cuda.Stream | None = None
         self.prefetch_fork_events: list[torch.cuda.Event] = []
         self.prefetch_done_events: list[torch.cuda.Event] = []
@@ -348,7 +373,10 @@ class OffloadMoeCache:
         # is a fresh tensor each step under eager and a graph-pool tensor under capture,
         # so a persistent scratch keeps the kernel's operand address fixed.
         self._prefetch_scratch: dict[tuple[int, int], torch.Tensor] = {}
-        self._prefetch_src_layer: int | None = None
+        # Which layer's rows each plan set currently describes (None = never staged),
+        # and the plan set the last ``prefetch_ensure`` wrote.
+        self._prefetch_staged: list[int | None] = []
+        self._prefetch_last_plan = 0
         if self.prefetch_enabled:
             self._alloc_prefetch_plan()
             if self.device.type == "cuda":
@@ -372,15 +400,45 @@ class OffloadMoeCache:
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
         plan_slots = max(self.num_experts, self.cache_size)
-        self.prefetch_evict_slots = torch.empty(
-            (plan_slots,), dtype=torch.int32, device=self.device
-        )
-        self.prefetch_src_indices = torch.empty(
-            (plan_slots,), dtype=torch.int32, device=self.device
-        )
-        self.prefetch_num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self.prefetch_plans = [
+            (
+                torch.empty((plan_slots,), dtype=torch.int32, device=self.device),
+                torch.empty((plan_slots,), dtype=torch.int32, device=self.device),
+                torch.zeros((1,), dtype=torch.int64, device=self.device),
+            )
+            for _ in range(PREFETCH_PLAN_SETS)
+        ]
+        self._prefetch_staged = [None] * PREFETCH_PLAN_SETS
+        self._prefetch_last_plan = 0
+        self._bind_prefetch_plan(0)
         self._prefetch_scratch = {}
-        self._prefetch_src_layer = None
+
+    @staticmethod
+    def prefetch_plan_index(src_layer: int, stage: int, double_buffer: bool = True) -> int:
+        """Which descriptor set layer ``src_layer``'s stage-``stage`` lookahead uses.
+
+        ``double_buffer=False`` collapses every source layer onto parity 0, which is the
+        pre-double-buffering (single-buffered) layout. It exists so a test can reproduce
+        the plan-overwrite race a late join has when the descriptors are NOT parity
+        indexed -- see tests/moe/test_moe_prefetch_graph.py.
+        """
+        parity = (src_layer % PREFETCH_PARITY) if double_buffer else 0
+        return parity * PREFETCH_STAGES + stage
+
+    def _bind_prefetch_plan(self, plan_index: int) -> None:
+        """Point the ``prefetch_*`` descriptor names at one plan set."""
+        (
+            self.prefetch_evict_slots,
+            self.prefetch_src_indices,
+            self.prefetch_num_indices,
+        ) = self.prefetch_plans[plan_index]
+
+    @property
+    def _prefetch_src_layer(self) -> int | None:
+        """The layer the most recent ``prefetch_ensure`` staged (diagnostics only)."""
+        if not self._prefetch_staged:
+            return None
+        return self._prefetch_staged[self._prefetch_last_plan]
 
     def set_bank_sources(
         self,
@@ -949,20 +1007,44 @@ class OffloadMoeCache:
         Called with the current layer's routed slot ids right before the speculative
         ensure for L+1, so that speculation can never evict a row the current layer's
         expert GEMM -- still queued behind it on the main stream -- is about to read.
+        Protection lasts exactly one ``lru_ensure``, so a layer that stages two
+        lookahead ensures calls this before each of them.
         See ``offload_kernels.protect_slots``.
         """
         from freetoken.moe.offload_kernels import protect_slots
 
         protect_slots(self, slots)
 
-    def prefetch_ensure(self, layer_id: int, predicted_ids: torch.Tensor) -> None:
+    def protect_prefetch_plan(self, plan_index: int) -> None:
+        """Shield the destination slots of one staged prefetch plan from the next ensure.
+
+        The rows a forked pull is WRITING must not be handed to another writer while it
+        is in flight. With the join moved to just before the expert GEMM, layer L+1's
+        real ``ensure_experts`` runs while layer L's pull is still going: if it evicted
+        one of that pull's destination slots, ``copy_missing(L+1)`` would write the same
+        row from the main stream and the two writers would interleave. Re-protecting the
+        plan's ``evict_slots`` (masked by its device-side ``num_indices``) takes exactly
+        those rows out of that one call's victim pool.
+
+        Speculative admissions that layer L+1 then evicts a call or two later are fine:
+        by that point the only other writer for the row is a later pull on the SAME
+        branch stream, which is ordered behind the one in flight.
+        """
+        from freetoken.moe.offload_kernels import protect_slots
+
+        evict_slots, _src, num = self.prefetch_plans[plan_index]
+        protect_slots(self, evict_slots, count=num)
+
+    def prefetch_ensure(
+        self, layer_id: int, predicted_ids: torch.Tensor, plan_index: int = 0
+    ) -> None:
         """Speculatively admit ``layer_id``'s PREDICTED experts, into the second plan.
 
         Identical LRU bookkeeping to :meth:`ensure_experts` -- same slot_for_id /
         id_of_slot / usage / step tensors, so a correct prediction is simply a hit
         when the real ``ensure_experts`` runs one layer later -- but the resulting
-        miss plan lands in ``prefetch_evict_slots`` / ``prefetch_src_indices`` /
-        ``prefetch_num_indices``. The real path's single-buffered plan is untouched.
+        miss plan lands in plan set ``plan_index`` (see :meth:`prefetch_plan_index`),
+        never in the real path's single-buffered plan.
 
         ``predicted_ids`` is copied into persistent scratch first: ``lru_ensure``
         rewrites its query in place, and the caller's tensor is the lookahead Gate's
@@ -977,11 +1059,13 @@ class OffloadMoeCache:
         assert self.prefetch_enabled, "prefetch descriptors were not allocated"
         scratch = self.prefetch_scratch(layer_id, predicted_ids.numel())
         scratch.copy_(predicted_ids.reshape(-1))
-        self._prefetch_src_layer = layer_id
+        self._bind_prefetch_plan(plan_index)
+        self._prefetch_staged[plan_index] = layer_id
+        self._prefetch_last_plan = plan_index
         prefetch_ensure_experts(self, layer_id, scratch)
 
-    def prefetch_copy(self) -> None:
-        """Pull the rows the last :meth:`prefetch_ensure` admitted (second plan).
+    def prefetch_copy(self, plan_index: int | None = None) -> None:
+        """Pull the rows plan set ``plan_index`` admitted (default: the last staged).
 
         Meant to run on ``prefetch_stream``, forked behind that ensure. Uses
         ``prefetch_bpb`` blocks per bank rather than the serial path's grid: a wide
@@ -990,17 +1074,20 @@ class OffloadMoeCache:
         """
         assert self.banks, "set_bank_sources must register the banks first"
         assert self._copy_fused_ok, "prefetch requires the fused multi-bank copy plan"
-        layer_id = self._prefetch_src_layer
+        if plan_index is None:
+            plan_index = self._prefetch_last_plan
+        layer_id = self._prefetch_staged[plan_index]
         assert layer_id is not None, "no staged prefetch (prefetch_ensure first)"
+        evict_slots, src_indices, num_indices = self.prefetch_plans[plan_index]
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
         fast_index_copy_multi_jit(
             self._copy_dst_ptrs,
             self._copy_src_ptrs[layer_id],
             self._copy_feat_bytes,
-            self.prefetch_evict_slots,
-            self.prefetch_src_indices,
-            self.prefetch_num_indices,
+            evict_slots,
+            src_indices,
+            num_indices,
             blocks_per_bank=self.prefetch_bpb,
         )
 
@@ -1124,13 +1211,19 @@ class OffloadMoeCache:
             # ``pf_pulled + missing`` compared against a prefetch-off run's
             # ``missing_per_layer`` is the realized value of the lookahead.
             p_active, p_miss, p_calls = (int(x) for x in self.prefetch_stats.sum(0))
+            # Normalized by REAL layer-steps (``calls``), not by speculative ensures:
+            # with the L+2 stage on there are two lookahead ensures per layer, and
+            # dividing by those would report the average per SPECULATION while calling
+            # it per layer -- which reads as the L+2 stage moving fewer bytes when it
+            # is in fact moving more. Per layer-step is also the only denominator that
+            # keeps ``pf_pulled + missing`` the step's true per-layer PCIe row cost.
             out.update({
                 "pf_calls": p_calls,
-                "pf_predicted_per_layer": (p_active / p_calls) if p_calls else 0.0,
-                "pf_pulled_per_layer": (p_miss / p_calls) if p_calls else 0.0,
+                "pf_stages_per_layer": (p_calls / calls) if calls else 0.0,
+                "pf_predicted_per_layer": (p_active / calls) if calls else 0.0,
+                "pf_pulled_per_layer": (p_miss / calls) if calls else 0.0,
                 "pf_rows_per_layer_total": (
-                    (p_miss / p_calls if p_calls else 0.0)
-                    + (missing / calls if calls else 0.0)
+                    ((p_miss + missing) / calls) if calls else 0.0
                 ),
             })
         return out

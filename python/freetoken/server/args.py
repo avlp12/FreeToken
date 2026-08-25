@@ -380,11 +380,14 @@ def parse_args(
         action="store_true",
         default=ServerArgs.moe_prefetch,
         help=(
-            "Experimental: in-graph L+1 expert prefetch. At each offloaded MoE layer, "
-            "run the NEXT layer's own router on this layer's router input and pull the "
-            "predicted experts on a forked stream while this layer's GEMM runs "
-            "(FREETOKEN_PREFETCH_BPB tunes that pull's grid). Equivalent to "
-            "FREETOKEN_MOE_PREFETCH=1."
+            "Experimental: in-graph L+1/L+2 expert prefetch. At each offloaded MoE "
+            "layer, run the NEXT layer's own router on this layer's router input and "
+            "pull the predicted experts on a forked stream while this layer's GEMM "
+            "runs. Equivalent to FREETOKEN_MOE_PREFETCH=1. Tuned by "
+            "FREETOKEN_PREFETCH_BPB (the pull's grid), FREETOKEN_PREFETCH_TOPK (how "
+            "many L+1 predictions to pull), FREETOKEN_PREFETCH_L2_TOPK (the second "
+            "lookahead stage, 0 disables) and FREETOKEN_PREFETCH_LATE_JOIN (0 joins "
+            "the branch before the layer's ensure instead of before its GEMM)."
         ),
     )
 
