@@ -46,6 +46,13 @@ GGML_Q2_K = 10
 _QK_K = 256  # k-quant super-block
 _Q2_K_BYTES = 84  # 16 packed scale/min nibbles + 64 qs bytes + fp16 d + fp16 dmin
 
+# Bump whenever quantize_q2_k / _mxfp4_rows_to_q2_k's numerics change (the ALS fit, the
+# scale/min quantization, the qs bit layout, ...). checkpoint/convert.py folds this into an
+# FTW checkpoint's source fingerprint, so a re-encoder change is distinguishable from "same
+# GGUF, nothing changed" even though it produces different Q2_K bytes for the same input --
+# a stale FTW built with an older encoder is otherwise byte-identical-looking on disk.
+Q2K_REENCODE_VERSION = 1
+
 # One expert's worth of down rows per MXFP4 -> Q2_K chunk (H=4096 rows -> ~33 MB fp32).
 _REENCODE_EXPERTS_PER_RMS_SAMPLE = 64
 
@@ -400,6 +407,7 @@ def dummy_q2k_ud_expert_sources(
 
 __all__ = [
     "GGML_Q2_K",
+    "Q2K_REENCODE_VERSION",
     "quantize_q2_k",
     "q2k_ud_expert_specs",
     "load_q2k_ud_expert_sources",

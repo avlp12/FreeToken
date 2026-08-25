@@ -53,6 +53,21 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
     for f in files:
         st = os.stat(f)
         h.update(f"{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
+    # q2_k_ud: the routed experts are read from a SEPARATE GGUF (--expert-gguf), not
+    # model_path, so the loop above never sees it -- fold in its shard set (resolved to
+    # real files, so a differently-named-but-identical split set still matches) plus the
+    # MXFP4->Q2_K re-encoder's version, since that's the one place this provider changes
+    # the numbers rather than copying bytes: a re-encoder change must invalidate an old FTW
+    # even though the source GGUF itself didn't change.
+    gguf_path = getattr(getattr(model_config, "dsv4_args", None), "expert_gguf_path", None)
+    if gguf_path:
+        from freetoken.models.deepseek_v4.gguf_experts import Q2K_REENCODE_VERSION
+        from freetoken.models.gguf.reader import _split_shard_paths
+
+        h.update(f"q2k_reencode_version={Q2K_REENCODE_VERSION}|".encode())
+        for f in sorted(_split_shard_paths(gguf_path) or [gguf_path]):
+            st = os.stat(f)
+            h.update(f"expert_gguf:{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
     return h.hexdigest()[:16]
 
 # Checkpoint metadata to carry over so the FTW dir is a usable checkpoint on its own.
@@ -168,11 +183,23 @@ def convert_checkpoint(
     moe_backend: str = "offload",
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
+    expert_gguf: str | None = None,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
     The FTW format is TP-agnostic and conversion runs single-process, so the resulting
-    checkpoint records no TP layout and loads independently of the runtime TP setting."""
+    checkpoint records no TP layout and loads independently of the runtime TP setting.
+
+    ``expert_gguf``: DeepSeek-V4 only, mirrors ``--expert-gguf`` on the server -- convert
+    the routed experts from this GGUF (q2_k_ud: IQ2_XS/IQ3_XXS native rows, MXFP4 down rows
+    re-encoded to Q2_K) instead of ``model_path``'s own expert weights. Dense weights (and
+    everything else) still come from ``model_path``; the GGUF supplies only the offload
+    expert banks. The converted FTW dir embeds the banks and their per-layer quant-type
+    table, so a warm boot needs no re-parse of the (multi-GB, split-shard) GGUF -- but
+    ``--expert-gguf`` must still be passed at boot (cheap: a path check, not a parse) so
+    ``ModelConfig.expert_quant`` resolves to ``q2_k_ud`` the same way it would on a cold
+    boot; see ``engine.engine._apply_expert_gguf``.
+    """
     from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
     from freetoken.engine.config import EngineConfig
     from freetoken.models.weight import load_weight
@@ -195,7 +222,15 @@ def convert_checkpoint(
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
+                       dtype=dtype, moe_backend=moe_backend, expert_gguf=expert_gguf)
+    if expert_gguf:
+        # Must precede any expert_quant read below -- same ordering requirement as the
+        # server's _adjust_config (see its comment): this rewrites model_config.expert_quant
+        # to "q2_k_ud" and stashes the GGUF path on dsv4_args, in place, on the cached
+        # ModelConfig instance cfg.model_config below will return.
+        from freetoken.engine.engine import _apply_expert_gguf
+
+        _apply_expert_gguf(cfg, getattr(cfg.model_config, "dsv4_args", None) is not None)
     mc = cfg.model_config
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
@@ -219,6 +254,7 @@ def convert_checkpoint(
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
     num_layers = None
+    quant_types = None  # q2_k_ud only: {"gate_up": [ggml type per layer], "down": [...]}
     if offload:
         # Streamable formats (bf16, ds_fp4, nvfp4 on the triton backend, gpt-oss mxfp4, q4_0,
         # qwen3_5 fp8/bf16-dequant) write each layer to its own FTW entry as it completes (via
@@ -229,6 +265,10 @@ def convert_checkpoint(
         sink = _ConvertSink(writer)
         banks = load_expert_banks(model_path, mc, device=dev, dtype=dtype, layer_sink=sink)
         quant_format = banks.quant_format
+        # q2_k_ud only: a layer's rows do not all share one ggml type, so the per-layer
+        # type table travels as FTW metadata alongside the banks themselves (read back by
+        # ftw.load_ftw_banks and re-attached to ExpertBanks.quant_types).
+        quant_types = banks.quant_types
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
@@ -295,6 +335,11 @@ def convert_checkpoint(
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
+        # q2_k_ud only: {"gate_up": [ggml type per layer], "down": [...]} -- read back by
+        # ftw.load_ftw_banks and re-attached to ExpertBanks.quant_types, since the GEMV
+        # needs each layer's own decode type (see ExpertBanks.quant_types's docstring).
+        # None for every format whose banks are one uniform type (the common case).
+        "expert_bank_quant_types": quant_types,
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
     })

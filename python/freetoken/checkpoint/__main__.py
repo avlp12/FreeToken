@@ -28,6 +28,12 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                    help="offload (experts -> banks) or e.g. triton (experts stay dense)")
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
     p.add_argument("--device", default=None, help="CUDA device for repack (default cuda:0)")
+    p.add_argument("--expert-gguf", default=None,
+                   help="DeepSeek-V4 only, mirrors the server's --expert-gguf: convert the "
+                        "routed experts from this GGUF (q2_k_ud) instead of --model's own "
+                        "expert weights. Dense weights still come from --model; pass the "
+                        "same --expert-gguf again when serving the converted FTW dir (cheap "
+                        "path check -- the fast FTW load skips the actual GGUF re-parse).")
     ns = p.parse_args(argv)
 
     shard_limit = int(ns.shard_gib * (1 << 30))
@@ -36,6 +42,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, shard_limit=shard_limit, device=ns.device,
+        expert_gguf=ns.expert_gguf,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

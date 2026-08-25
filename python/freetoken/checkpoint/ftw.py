@@ -630,6 +630,10 @@ def load_ftw_banks(
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
         layer_residency=applied,
+        # q2_k_ud only: the per-layer ggml-type side table the converter wrote alongside
+        # the banks (checkpoint/convert.py); None for every uniform-type format, matching
+        # what a fresh (non-FTW) load of that format returns.
+        quant_types=reader.meta("expert_bank_quant_types"),
     )
 
 

@@ -540,6 +540,21 @@ def load_expert_banks(
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            # q2_k_ud's FTW banks carry their own quant_types and load correctly regardless,
+            # but model_config.expert_quant only becomes "q2_k_ud" via --expert-gguf (see
+            # engine._apply_expert_gguf) -- everything that reads expert_quant BEFORE this
+            # point (bank-size estimates, backend legality) ran against whatever the
+            # checkpoint's own config declares. --expert-gguf stays cheap on this path (a
+            # path check, not a GGUF parse), so warn rather than silently trusting the
+            # mismatch.
+            if (banks.quant_format == "q2_k_ud"
+                    and getattr(model_config, "expert_quant", None) != "q2_k_ud"):
+                logger.warning_rank0(
+                    f"expert banks: FTW checkpoint {model_path} holds q2_k_ud banks but "
+                    f"this boot's model_config.expert_quant={getattr(model_config, 'expert_quant', None)!r} "
+                    "-- pass --expert-gguf <path> again (same as the cold-boot conversion) "
+                    "so expert_quant resolves correctly; the FTW load itself is unaffected."
+                )
             _log_bank_alignment(banks)
             return banks
 
