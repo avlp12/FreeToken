@@ -577,12 +577,19 @@ class OffloadMoELayer(MoELayer):
             # Prefill runs the same vector kernel rather than the grouped MMQ the dense
             # formats use: ggml_moe_a8 is not pitch-aware and rejects a nonzero
             # row_pitch_bytes, so MMQ cannot read these banks at any batch size.
+            #
+            # What prefill DOES get is weight-reuse batching inside that vector
+            # kernel (`is_prefill=True`): one block serves N routed rows sharing an
+            # expert, so the weight row is read once per N rows instead of once per
+            # row. Bit-identical output, ~N-fold less weight traffic. Decode passes
+            # False and takes the untouched unbatched path.
             from freetoken.moe.fused_q2_k_ud import fused_experts_q2k_ud
 
             gate_up, down = views
             return fused_experts_q2k_ud(
                 hidden_states, gate_up, down, topk_weights, topk_ids,
                 self.gguf_gate_up_qtype, self.gguf_down_qtype, self.swiglu_limit,
+                is_prefill=is_prefill,
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

@@ -16,6 +16,7 @@
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
+#include "moe_vec_batched.cuh"
 // clang-format off
 
 // Q8 gemv
@@ -850,6 +851,139 @@ torch::Tensor ggml_moe_a8_vec(
   return Y;
 }
 
+// FreeToken: weight-reuse batched sibling of ``ggml_moe_a8_vec``.
+//
+// Identical semantics and -- deliberately -- identical output BITS. The only
+// difference is scheduling: N routed rows that share an expert are handled by
+// one CUDA block, so the expert's weight row is pulled from HBM once per N rows
+// instead of once per row. See moe_vec_batched.cuh for the rationale and for why
+// the batching cannot perturb a single float.
+//
+// It is exposed as a SEPARATE entry point rather than an extra argument on
+// ``ggml_moe_a8_vec`` so the original kernel stays byte-for-byte reachable for
+// A/B comparison (which is exactly what the equality test does).
+//
+// ``perm`` is an int32 CUDA tensor of routed-row indices grouped so that every
+// aligned run of ``batch_n`` entries belongs to a single expert, with -1 in the
+// alignment padding. Its length must be a multiple of ``batch_n`` and may be
+// LONGER than ``tokens * top_k``: the host sizes it to a fixed worst-case bound
+// (``routed + num_experts * (batch_n - 1)``, rounded up) so that building it
+// never needs a device->host sync. The surplus entries are all -1 and their
+// groups exit on the first instruction.
+//
+// ``out``, when supplied, is written in place instead of allocating a fresh
+// zeroed tensor. Only real routed rows are ever stored to -- which is what lets
+// a test poison the buffer and prove the padding lanes never wrote.
+torch::Tensor ggml_moe_a8_vec_batched(
+    torch::Tensor X,  // input
+    torch::Tensor W,  // expert weights
+    torch::Tensor topk_ids,
+    torch::Tensor perm,
+    int64_t top_k,
+    int64_t type,
+    int64_t row,
+    int64_t tokens,
+    int64_t row_pitch_bytes,
+    int64_t batch_n,
+    std::optional<torch::Tensor> out) {
+  TORCH_CHECK(
+      moe_vec_batched_has_type(type),
+      "ggml_moe_a8_vec_batched: no batched kernel for ggml type ",
+      type,
+      " (covered: 10 Q2_K, 17 IQ2_XS, 18 IQ3_XXS). Use ggml_moe_a8_vec.");
+  TORCH_CHECK(batch_n >= 2, "ggml_moe_a8_vec_batched: batch_n must be >= 2 (got ", batch_n, ")");
+  TORCH_CHECK(
+      perm.is_cuda() && perm.is_contiguous() && perm.scalar_type() == torch::kInt,
+      "ggml_moe_a8_vec_batched: perm must be a contiguous int32 CUDA tensor");
+  const int64_t padded_total = perm.numel();
+  TORCH_CHECK(
+      padded_total % batch_n == 0,
+      "ggml_moe_a8_vec_batched: perm length (",
+      padded_total,
+      ") is not a multiple of batch_n (",
+      batch_n,
+      ")");
+
+  int col = X.sizes()[1];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y;
+  if (out.has_value()) {
+    Y = out.value();
+    TORCH_CHECK(
+        Y.is_cuda() && Y.is_contiguous() && Y.scalar_type() == X.scalar_type() && Y.dim() == 2 &&
+            Y.sizes()[0] == tokens * top_k && Y.sizes()[1] == row,
+        "ggml_moe_a8_vec_batched: `out` must be a contiguous CUDA tensor of X's dtype "
+        "with shape [tokens * top_k, row]");
+  } else {
+    Y = torch::zeros({tokens * top_k, row}, options);
+  }
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8_vec_batched", [&] {
+    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    switch (type) {
+      case 10:
+        moe_vec_batched_q2_K_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            (const int*)perm.data_ptr(),
+            top_k,
+            padded_total,
+            col,
+            row,
+            quant_X.stride(0),
+            row_pitch_bytes,
+            batch_n,
+            stream);
+        break;
+      case 17:
+        moe_vec_batched_iq2_xs_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            (const int*)perm.data_ptr(),
+            top_k,
+            padded_total,
+            col,
+            row,
+            quant_X.stride(0),
+            row_pitch_bytes,
+            batch_n,
+            stream);
+        break;
+      case 18:
+        moe_vec_batched_iq3_xxs_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            (const int*)perm.data_ptr(),
+            top_k,
+            padded_total,
+            col,
+            row,
+            quant_X.stride(0),
+            row_pitch_bytes,
+            batch_n,
+            stream);
+        break;
+    }
+  });
+  return Y;
+}
+
+// Which ggml types the batched path can serve. Callers check this and fall back
+// to ``ggml_moe_a8_vec`` rather than eating a TORCH_CHECK on an exotic bank.
+bool ggml_moe_vec_batched_supported(int64_t type) {
+  return moe_vec_batched_has_type(type);
+}
+
 int64_t ggml_moe_get_block_size(int64_t type) {
   switch (type) {
     case 2:
@@ -909,5 +1043,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("row"),
       py::arg("tokens"),
       py::arg("row_pitch_bytes") = 0);
+  m.def(
+      "ggml_moe_a8_vec_batched",
+      &ggml_moe_a8_vec_batched,
+      "",
+      py::arg("X"),
+      py::arg("W"),
+      py::arg("topk_ids"),
+      py::arg("perm"),
+      py::arg("top_k"),
+      py::arg("type"),
+      py::arg("row"),
+      py::arg("tokens"),
+      py::arg("row_pitch_bytes") = 0,
+      py::arg("batch_n") = 8,
+      py::arg("out") = py::none());
+  m.def("ggml_moe_vec_batched_supported", &ggml_moe_vec_batched_supported, "");
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
 }

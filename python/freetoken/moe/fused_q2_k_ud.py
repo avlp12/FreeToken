@@ -17,12 +17,128 @@ matching how the loader lays the bank out.
 
 MMQ (``ggml_moe_a8``) is not an option here at any batch size: it is not
 pitch-aware and rejects a nonzero ``row_pitch_bytes``. Prefill therefore runs the
-same vector kernel -- correct, just slower than a grouped GEMM would be.
+same vector kernel -- but it runs the WEIGHT-REUSE BATCHED variant of it.
+
+Prefill weight reuse
+--------------------
+``moe_vec_q`` gives one CUDA block to each (routed row, weight row) pair, and each
+block streams its expert's weight row from HBM. At an 8192-token chunk with
+top_k = 6 that is 49152 routed rows over 256 experts, so every expert's weight
+matrix is re-read ~192 times per layer -- 20.4 TB per chunk, ~69% of the card's
+HBM roofline, 89% of prefill wall time.
+
+``ggml_moe_a8_vec_batched`` amortizes that: N routed rows that share an expert are
+computed by one block, which reads the weight row once and feeds it to N different
+activation rows. Each output is still the same dot product accumulated in the same
+order, so the batched path is BIT-IDENTICAL to the unbatched one -- see
+``csrc/gguf/moe_vec_batched.cuh`` and ``tests/kernels/test_moe_vec_batched.py``.
+
+The N rows must share an expert, which is what ``_expert_group_perm`` below
+arranges. That permutation is built ONCE per call and drives BOTH GEMVs: the
+gate_up call runs with (tokens = T, top_k = 6) and the down call with
+(tokens = T * 6, top_k = 1), but a routed-row index means the same thing in each,
+so one grouping is valid for both.
+
+Decode (T = 1) keeps taking the unbatched path untouched: there is nothing to
+amortize when the handful of routed rows mostly hold distinct experts, and the
+extra sort would be pure overhead on the latency-critical path.
+
+``FREETOKEN_MOE_PREFILL_BATCH`` sets N (default 8). ``0`` or ``1`` restores the
+unbatched prefill kernel for A/B comparison.
 """
 
 from __future__ import annotations
 
+import os
+import warnings
+
 import torch
+
+# Batch widths the CUDA side instantiates (MOE_VEC_BATCH_WIDTHS in
+# moe_vec_batched.cuh). 0/1 mean "no batching".
+_BATCH_WIDTHS = (2, 4, 8, 16)
+_DEFAULT_BATCH = 8
+
+
+def _read_batch_env() -> int:
+    raw = os.getenv("FREETOKEN_MOE_PREFILL_BATCH")
+    if raw is None:
+        return _DEFAULT_BATCH
+    raw = raw.strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"FREETOKEN_MOE_PREFILL_BATCH={raw!r} is not an integer; "
+            f"using the default {_DEFAULT_BATCH}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_BATCH
+    if n in (0, 1):
+        return 0
+    if n not in _BATCH_WIDTHS:
+        warnings.warn(
+            f"FREETOKEN_MOE_PREFILL_BATCH={n} is not one of {_BATCH_WIDTHS} "
+            f"(0/1 disable batching); using the default {_DEFAULT_BATCH}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_BATCH
+    return n
+
+
+# Read once at import, like ``offload_cache._FUSED_COPY``: the per-layer path must
+# not pay an environment lookup, and the value must not shift mid-run underneath a
+# captured CUDA graph.
+_PREFILL_BATCH = _read_batch_env()
+
+
+def _expert_group_perm(topk_ids: torch.Tensor, num_experts: int, n: int) -> torch.Tensor:
+    """Routed-row indices grouped ``n``-per-expert, padded with -1.
+
+    Returns an int32 tensor whose every aligned run of ``n`` entries belongs to a
+    single expert. Values are indices into the flattened ``[tokens * top_k]``
+    routed-row range; -1 marks alignment padding, which the kernel computes but
+    never stores.
+
+    The length is a FIXED worst-case bound -- ``routed + num_experts * (n - 1)``
+    rounded up to a multiple of ``n`` -- not the exact padded total. The exact
+    total is data-dependent, and reading it would mean a device->host sync in the
+    per-layer path, the very stall class this change exists to remove. The surplus
+    entries stay -1 and their blocks exit on the first instruction; at the
+    production shape (routed 49152, 256 experts, n = 8) the slack is 3.6% of the
+    groups. A fixed length is also what keeps the launch shape independent of the
+    routing data.
+
+    Everything here is vectorized and sync-free. Note ``scatter_add_`` rather than
+    ``torch.bincount``: bincount has to learn the max element to size its output,
+    which syncs.
+    """
+    dev = topk_ids.device
+    flat = topk_ids.reshape(-1).long()
+    routed = flat.numel()
+
+    # Stable sort, so the grouping is deterministic run to run and a failure is
+    # reproducible. `order` holds routed-row indices ordered by expert.
+    sorted_experts, order = torch.sort(flat, stable=True)
+
+    counts = torch.zeros(num_experts, dtype=torch.long, device=dev)
+    counts.scatter_add_(0, flat, torch.ones_like(flat))
+    padded_counts = ((counts + (n - 1)) // n) * n
+
+    # Position i in `order` sits at `starts[e] + within` and must land at
+    # `padded_starts[e] + within`. The `within` cancels, leaving a per-expert shift.
+    starts = torch.cumsum(counts, 0) - counts
+    padded_starts = torch.cumsum(padded_counts, 0) - padded_counts
+    shift = padded_starts - starts
+
+    bound = routed + num_experts * (n - 1)
+    bound = -(-bound // n) * n
+    perm = torch.full((bound,), -1, dtype=torch.int32, device=dev)
+    dest = torch.arange(routed, device=dev) + shift[sorted_experts]
+    perm[dest] = order.to(torch.int32)
+    return perm
 
 
 def fused_experts_q2k_ud(
@@ -34,13 +150,22 @@ def fused_experts_q2k_ud(
     gate_up_qtype: int,
     down_qtype: int,
     swiglu_limit: float,
+    *,
+    is_prefill: bool = False,
 ) -> torch.Tensor:
     """Routed-expert output summed over the top-k routes (excludes the shared expert).
 
     ``topk_ids`` already index the bank rows: cache slots on the decode path,
     materialized layer positions (position == expert id) on the streaming prefill path.
+
+    ``is_prefill`` selects the weight-reuse batched GEMV. It changes throughput
+    only -- the returned values are bit-identical either way.
     """
-    from freetoken.kernel.gguf import ggml_moe_a8_vec
+    from freetoken.kernel.gguf import (
+        ggml_moe_a8_vec,
+        ggml_moe_a8_vec_batched,
+        ggml_moe_vec_batched_supported,
+    )
     from freetoken.kernel.triton.dsv4.fused_moe import fused_swiglu
 
     num_tokens = hidden_states.shape[0]
@@ -48,20 +173,49 @@ def fused_experts_q2k_ud(
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
 
+    batch_n = _PREFILL_BATCH if is_prefill else 0
+    if (
+        batch_n
+        and num_tokens * top_k >= batch_n
+        and ggml_moe_vec_batched_supported(int(gate_up_qtype))
+        and ggml_moe_vec_batched_supported(int(down_qtype))
+    ):
+        # One permutation, both GEMVs -- the routed-row index space is shared.
+        perm = _expert_group_perm(topk_ids, gate_up_q.shape[0], batch_n)
+    else:
+        perm = None
+
     # gate_up: [T*top_k, 2I] -> clamped swiglu -> [T*top_k, I]
-    gate_up = ggml_moe_a8_vec(
-        hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_qtype), n2, num_tokens,
-        gate_up_q.shape[2],
-    )
+    if perm is None:
+        gate_up = ggml_moe_a8_vec(
+            hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_qtype), n2, num_tokens,
+            gate_up_q.shape[2],
+        )
+    else:
+        gate_up = ggml_moe_a8_vec_batched(
+            hidden_states, gate_up_q, topk_ids, perm, top_k, int(gate_up_qtype), n2,
+            num_tokens, gate_up_q.shape[2], batch_n,
+        )
     inter = fused_swiglu(gate_up, swiglu_limit)
     # down: each of the T*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(
-        inter, down_q, topk_ids, 1, int(down_qtype), h, num_tokens * top_k,
-        down_q.shape[2],
-    )
-    out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
-        out.dtype
-    )
+    if perm is None:
+        out = ggml_moe_a8_vec(
+            inter, down_q, topk_ids, 1, int(down_qtype), h, num_tokens * top_k,
+            down_q.shape[2],
+        )
+    else:
+        out = ggml_moe_a8_vec_batched(
+            inter, down_q, topk_ids, perm, 1, int(down_qtype), h, num_tokens * top_k,
+            down_q.shape[2], batch_n,
+        )
+    # In place, deliberately. ``out`` is a fresh kernel allocation that nothing
+    # else aliases, and an out-of-place ``*`` would hold a SECOND
+    # [T, top_k, H] tensor live alongside it -- 805 MB of avoidable transient peak
+    # at a 16 K chunk, on a card where prefill already runs close enough to the
+    # 32 GiB ceiling that the allocator starts thrashing. Same multiply, same
+    # order, so the bit-identical equality tests are unaffected.
+    out = out.reshape(num_tokens, top_k, h)
+    out.mul_(topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype))
     return out.sum(dim=1)
 
 

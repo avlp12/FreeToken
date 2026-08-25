@@ -13,6 +13,7 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import pathlib
 import shutil
@@ -47,6 +48,29 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _sources_digest() -> str:
+    """Content hash of every source file in ``csrc/gguf/``.
+
+    ``torch.utils.cpp_extension.load`` decides whether to rebuild by hashing the
+    files named in ``sources`` plus the build flags -- and ``sources`` is just
+    ``gguf_kernel.cu``. Edit any of the ``.cuh`` headers it pulls in and that hash
+    is unchanged, so ``load`` short-circuits and silently hands back the STALE
+    ``.so``: the kernel you are editing is not the kernel that runs, and nothing
+    says so. (ninja tracks the header deps correctly via ``-MD``; it just never
+    gets asked.)
+
+    Folding a digest of the directory into an otherwise-dead ``-D`` puts the
+    headers back inside the rebuild key, so a header edit rebuilds exactly once
+    and an untouched tree still skips the build.
+    """
+    h = hashlib.sha256()
+    for f in sorted(_CSRC.iterdir()):
+        if f.suffix in (".cu", ".cuh", ".h"):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
@@ -57,7 +81,14 @@ def _module():
     # g++ we have (12/13/15) rejects under C++17. C++20 (P0634) makes ``typename``
     # implicit in a static_cast type-id, so the rewritten form compiles. torch only
     # appends its own ``-std=c++17`` when no ``-std=`` is present, so this wins.
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr", "-std=c++20"]
+    extra_cuda_cflags = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "-std=c++20",
+        # Unused by the code; present only to pull the .cuh headers into
+        # load()'s rebuild key. See _sources_digest.
+        f"-DFREETOKEN_GGUF_SRC_DIGEST=g{_sources_digest()}",
+    ]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
@@ -154,6 +185,59 @@ def ggml_moe_a8_vec(
     )
 
 
+def ggml_moe_vec_batched_supported(quant_type: int) -> bool:
+    """Whether :func:`ggml_moe_a8_vec_batched` has a kernel for ``quant_type``.
+
+    Only the ggml types the ``q2_k_ud`` expert banks hold are instantiated
+    (Q2_K = 10, IQ2_XS = 17, IQ3_XXS = 18): every (type, batch width) pair is a
+    separate kernel, and blanket instantiation across all 19 types would multiply
+    JIT build time for launchers nothing calls. Callers check this and fall back
+    to :func:`ggml_moe_a8_vec` rather than eating a hard error.
+    """
+    return bool(_module().ggml_moe_vec_batched_supported(quant_type))
+
+
+def ggml_moe_a8_vec_batched(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    perm: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+    row_pitch_bytes: int = 0,
+    batch_n: int = 8,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Weight-reuse batched sibling of :func:`ggml_moe_a8_vec`.
+
+    Same arguments, same semantics, same output BITS. The difference is purely how
+    work is scheduled: ``batch_n`` routed rows that share an expert are handled by
+    one CUDA block, so the expert's weight row crosses the memory bus once per
+    ``batch_n`` rows instead of once per row. Each output element is still the
+    identical dot product accumulated in the identical order, which is why the
+    tests assert ``torch.equal`` and not ``allclose``.
+
+    ``perm`` is an int32 CUDA tensor of routed-row indices grouped so that every
+    aligned run of ``batch_n`` entries belongs to a single expert, with -1 in the
+    alignment padding (see ``freetoken.moe.fused_q2_k_ud._expert_group_perm``). Its
+    length must be a multiple of ``batch_n`` and may exceed ``tokens * top_k``:
+    the builder sizes it to a fixed worst-case bound so it never needs a host
+    sync, and the surplus -1 groups exit immediately.
+
+    ``out``, when given, is written in place. Only real routed rows are ever
+    stored to, so a poisoned ``out`` proves the padding lanes stayed silent.
+
+    Not every quant type has a batched kernel -- ask
+    :func:`ggml_moe_vec_batched_supported` first.
+    """
+    return _module().ggml_moe_a8_vec_batched(
+        x, weight, topk_ids, perm, top_k, quant_type, row, tokens,
+        row_pitch_bytes, batch_n, out,
+    )
+
+
 def ggml_moe_get_block_size(quant_type: int) -> int:
     return _module().ggml_moe_get_block_size(quant_type)
 
@@ -164,5 +248,7 @@ __all__ = [
     "ggml_mul_mat_a8",
     "ggml_moe_a8",
     "ggml_moe_a8_vec",
+    "ggml_moe_a8_vec_batched",
+    "ggml_moe_vec_batched_supported",
     "ggml_moe_get_block_size",
 ]
