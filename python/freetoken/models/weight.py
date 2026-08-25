@@ -225,7 +225,15 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    adapt: bool = True,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Stream a model's dense weights in the RUNTIME form the engine should load.
+
+    ``adapt=False`` yields the STORAGE form instead, skipping the model's
+    ``adapt_weights`` hook. That is what FTW conversion wants: the stored bytes must be
+    independent of the environment the converter happened to run under, so that one FTW
+    serves every setting the hook can resolve at serve time.
+    """
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
     # decided at conversion (offload -> experts live in banks, not here); a backend mismatch
@@ -234,26 +242,35 @@ def load_weight(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
 
+    _config, spec = _spec_for_model_path(model_path)
+    # The model's ``adapt_weights(stream, model_path)`` hook, applied to BOTH branches.
+    # An FTW stores whatever iter_weights yielded at CONVERSION time, but the model is
+    # built from the environment at SERVE time -- so anything the env decides has to be
+    # decided HERE, not at conversion, or one FTW stops serving both settings. Models put
+    # the env-independent STORAGE form in iter_weights and resolve the runtime form in
+    # this hook (deepseek_v4/weight.py, for wo_a). Models without the hook are unaffected.
+    adapter = _model_override(spec, "adapt_weights") if adapt else None
+
     if is_ftw_checkpoint(model_path):
         # The FTW dense shard stores whatever existed at conversion, including the vision
         # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
         skip_vision = not vision_load_enabled()
-        for name, tensor in iter_ftw_weights(model_path):
-            if skip_vision and name.startswith(VISION_KEY_PREFIXES):
-                continue
-            yield name, tensor
-        return
-
-    _config, spec = _spec_for_model_path(model_path)
-    iter_weights = _load_attr(spec.module, spec.iter_weights)
-    yield from iter_weights(
-        model_path,
-        device,
-        include_moe_experts=include_moe_experts,
-        include_non_moe=True,
-    )
+        stream = (
+            (name, tensor)
+            for name, tensor in iter_ftw_weights(model_path)
+            if not (skip_vision and name.startswith(VISION_KEY_PREFIXES))
+        )
+    else:
+        iter_weights = _load_attr(spec.module, spec.iter_weights)
+        stream = iter_weights(
+            model_path,
+            device,
+            include_moe_experts=include_moe_experts,
+            include_non_moe=True,
+        )
+    yield from (adapter(stream, model_path) if adapter is not None else stream)
 
 
 def load_moe_expert_sources(

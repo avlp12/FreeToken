@@ -243,8 +243,14 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
+    # adapt=False: store the model's STORAGE form, never the runtime form this converter
+    # process's environment happens to resolve. An FTW has to be independent of the env it
+    # was built under -- otherwise a serve-time switch (FREETOKEN_WO_A_FP8) gets baked in
+    # at conversion and the checkpoint only serves the setting it was converted with. The
+    # per-model adapt_weights hook re-applies at load (models/weight.py::load_weight).
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
+                                              include_moe_experts=include_moe_experts,
+                                              adapt=False),
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1

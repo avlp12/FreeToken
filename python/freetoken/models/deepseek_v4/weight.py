@@ -1,10 +1,25 @@
 """Weight loading for DeepSeek-V4-Flash (engine path).
 
-  - :func:`iter_weights` streams resident (non-expert) tensors keyed to engine param
-    names; model's ``load_state_dict`` casts each. ``wo_a`` dequantized to bf16 to match
-    the reference bf16 einsum.
+  - :func:`iter_weights` streams resident (non-expert) tensors in their STORAGE form,
+    keyed to engine param names; model's ``load_state_dict`` casts each.
+  - :func:`adapt_weights` turns the storage form into the RUNTIME form for this process.
   - :func:`load_dsfp4_expert_sources` packs routed FP4 experts into pinned CPU banks for
     the offload cache. DeepSeek FP4: e8m0 per-32 block scale, no global scale.
+
+Storage form vs runtime form
+----------------------------
+An FTW checkpoint stores exactly what ``iter_weights`` yielded at CONVERSION time, but
+the model is built from the environment at SERVE time. Anything the env decides must
+therefore be decided at LOAD, not at conversion, or one FTW stops serving both settings.
+
+``wo_a`` is the case that matters here: the checkpoint holds it as block-scaled FP8, the
+reference runs it as a bf16 einsum, and ``FREETOKEN_WO_A_FP8`` picks between them. So
+``iter_weights`` always yields the checkpoint's own FP8 weight + e8m0 scale -- the same
+pass-through every other FP8 projection (``wo_b``, ``wq_a``, ...) already gets -- and
+:func:`adapt_weights`, which ``models.weight.load_weight`` applies to the safetensors
+stream and to an FTW replay alike, folds the pair back into one bf16 tensor when the flag
+is off. One FTW serves both modes, and there is no double-quantization question because
+nothing is ever re-quantized.
 """
 
 from __future__ import annotations
@@ -22,7 +37,7 @@ from tqdm import tqdm
 from freetoken.models.loader import drop_page_cache
 
 from .args import DeepseekV4Args, load_args
-from .layers import wo_a_fp8
+from .layers import FP8, wo_a_fp8
 from .parallel import div_tp, shard, tp_info
 
 
@@ -66,12 +81,19 @@ def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 1
 
     scale is e8m0 exponent codes, ``value = 2^(code-127)`` (Triton FP8 GEMM convention).
     Used for ``wo_a`` to match the reference's bf16 einsum.
+
+    On the FTW path this now runs at LOAD (43 layers of [8192, 4096]) rather than once at
+    conversion, so the whole-grid ``repeat_interleave`` it used to materialize -- a 134 MB
+    fp32 temporary per layer -- is replaced by a broadcast over the blocked view. Same
+    per-element fp32 product in the same order, so the result is bit-identical.
     """
     n, k = weight.shape
-    codes = scale.view(torch.uint8).to(torch.float32)
-    s = torch.exp2(codes - 127.0)
-    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:n, :k]
-    return (weight.to(torch.float32) * s).to(torch.bfloat16)
+    s = torch.exp2(scale.view(torch.uint8).to(torch.float32) - 127.0)
+    if n % block or k % block:  # ragged tail: fall back to the expanded grid
+        s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:n, :k]
+        return (weight.to(torch.float32) * s).to(torch.bfloat16)
+    w = weight.to(torch.float32).view(n // block, block, k // block, block)
+    return (w * s[:, None, :, None]).to(torch.bfloat16).view(n, k)
 
 
 def quantize_fp8_block(weight: torch.Tensor, block: int = 128):
@@ -94,18 +116,81 @@ def quantize_fp8_block(weight: torch.Tensor, block: int = 128):
 
 
 def _wo_a(name: str, weight: torch.Tensor, scale: torch.Tensor) -> Iterator:
-    """Yield the attention output projection's ``wo_a`` in whichever form this process
-    runs: bf16 (dequantized, the reference einsum) or the checkpoint's FP8 + e8m0 scale.
+    """Yield ``wo_a`` in its STORAGE form: the checkpoint's FP8 weight and e8m0 scale,
+    passed through unchanged and sharded on the same axis.
 
-    The FP8 form passes the checkpoint tensors through UNCHANGED -- no re-quantization,
-    so the only numeric change versus the reference is where the dequant happens (in the
-    GEMV's per-128-block accumulator instead of at load) plus the activation quant.
+    Deliberately independent of ``FREETOKEN_WO_A_FP8`` -- see the module docstring. The
+    runtime form is chosen by :func:`adapt_weights` at load.
     """
-    if not wo_a_fp8():
-        yield name, shard(_dequant_fp8_block(weight, scale), 0)
-        return
     yield name, shard(weight, 0)
     yield f"{name}_scale", shard(scale, 0)
+
+
+_WO_A_SUFFIX = "wo_a"
+_WO_A_SCALE_SUFFIX = "wo_a_scale"
+
+
+def _is_wo_a(name: str) -> bool:
+    return name == _WO_A_SUFFIX or name.endswith("." + _WO_A_SUFFIX)
+
+
+def adapt_weights(stream: Iterator, model_path: str) -> Iterator:
+    """Storage form -> the runtime form this process's ``FREETOKEN_WO_A_FP8`` asks for.
+
+    ``models.weight.load_weight`` applies this to BOTH the safetensors stream and an FTW
+    replay, so the two agree by construction:
+
+      * flag ON  -- ``wo_a`` / ``wo_a_scale`` pass through to the grouped FP8 GEMV.
+      * flag OFF -- the pair folds into the one bf16 tensor the reference einsum wants.
+        Folded HERE, on the host, one layer at a time, so neither form is ever resident
+        for all 43 layers at once (doing it after the state dict lands on the GPU would
+        add a ~1.4 GB peak).
+
+    An FTW converted before ``wo_a`` moved to storage form holds a bf16 ``wo_a`` and no
+    scale. With the flag off that streams through untouched -- old checkpoints keep
+    working. With the flag on it is refused here, naming the fix, rather than surfacing
+    later as a bare "Missing weight for ... wo_a_scale" from ``load_state_dict``.
+    """
+    fp8 = wo_a_fp8()
+    pending: dict[str, torch.Tensor] = {}   # wo_a seen, waiting for its scale
+    scales: dict[str, torch.Tensor] = {}    # scale seen first (order-independent)
+
+    def _fold(base: str) -> Iterator:
+        if base in pending and base in scales:
+            yield base, _dequant_fp8_block(pending.pop(base), scales.pop(base))
+
+    for name, tensor in stream:
+        if _is_wo_a(name):
+            if tensor.dtype is not FP8:
+                if fp8:
+                    raise RuntimeError(
+                        f"FREETOKEN_WO_A_FP8=1 needs a checkpoint that stores wo_a as FP8 "
+                        f"plus its e8m0 scale, but '{name}' in {model_path} is "
+                        f"{tensor.dtype} with no '{name}_scale' beside it. This is an FTW "
+                        f"converted before wo_a moved to its storage form. Rebuild it with "
+                        f"'ft checkpoint --model <source> --out <dir>' (repeating whatever "
+                        f"--expert-gguf it was built with) -- the new FTW serves both "
+                        f"settings -- or unset FREETOKEN_WO_A_FP8 to serve this one as it is."
+                    )
+                yield name, tensor  # legacy bf16 storage, flag off: unchanged
+                continue
+            if fp8:
+                yield name, tensor
+            else:
+                pending[name] = tensor
+                yield from _fold(name)
+            continue
+        if name.endswith(_WO_A_SCALE_SUFFIX) and _is_wo_a(name[: -len("_scale")]):
+            if fp8:
+                yield name, tensor
+            else:
+                scales[name[: -len("_scale")]] = tensor
+                yield from _fold(name[: -len("_scale")])
+            continue
+        yield name, tensor
+    assert not pending and not scales, (
+        f"wo_a storage tensors left unpaired: {sorted(set(pending) | set(scales))}"
+    )
 
 
 def iter_weights(
@@ -119,7 +204,8 @@ def iter_weights(
 
     Routed FP4 experts come from the offload cache, so ``include_moe_experts`` must be
     False (DeepSeek-V4 only runs ``--moe-backend offload``). Tensors yielded in checkpoint
-    dtype (fp8 + e8m0 preserved); ``wo_a`` dequantized to bf16 to match the reference einsum.
+    dtype (fp8 + e8m0 preserved), ``wo_a`` included -- see the module docstring on storage
+    vs runtime form, and :func:`adapt_weights` for the load-time half.
     """
     if include_moe_experts:
         raise ValueError(
@@ -165,10 +251,10 @@ def iter_weights(
             yield from linear(f"{a}.wq_b", split=0)  # column-parallel over heads
             yield from linear(f"{a}.wkv")
             yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum)
-            # unless FREETOKEN_WO_A_FP8 keeps it FP8. Rows are o_groups blocks of
-            # o_lora_rank, so a dim-0 split hands each rank whole groups -- matching the
-            # heads its wq_b shard produced; the 128-row scale grid splits the same way.
+            # wo_a: FP8 + e8m0 straight from the checkpoint (adapt_weights picks the
+            # runtime form). Rows are o_groups blocks of o_lora_rank, so a dim-0 split
+            # hands each rank whole groups -- matching the heads its wq_b shard produced;
+            # the 128-row scale grid splits on the same axis.
             yield from _wo_a(f"{a}.wo_a", get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale"))
             yield from linear(f"{a}.wo_b", split=1)  # row-parallel; all-reduced in _wo
             yield f"{a}.attn_sink", shard(get(f"{a}.attn_sink"), 0)
@@ -502,6 +588,8 @@ def load_dsfp4_expert_sources_parallel(
 
 __all__ = [
     "iter_weights",
+    "adapt_weights",
+    "quantize_fp8_block",
     "load_dsfp4_expert_sources",
     "load_dsfp4_expert_sources_parallel",
     "is_expert_tensor",

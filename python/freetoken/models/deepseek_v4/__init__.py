@@ -16,7 +16,7 @@ addressed by page tables, and sparse attention is a physical-slot gather (see
 from .args import DeepseekV4Args, load_args
 from .config import parse_config
 from .model import DeepseekV4ForCausalLM
-from .weight import iter_weights, load_dsfp4_expert_sources
+from .weight import adapt_weights, iter_weights, load_dsfp4_expert_sources
 
 __all__ = [
     "DeepseekV4Args",
@@ -24,5 +24,9 @@ __all__ = [
     "parse_config",
     "DeepseekV4ForCausalLM",
     "iter_weights",
+    # models.weight.load_weight's per-model load-time hook (storage form -> runtime form;
+    # see weight.py's module docstring). It has to be reachable from the PACKAGE, because
+    # ModelSpec.module names the package rather than the weight module.
+    "adapt_weights",
     "load_dsfp4_expert_sources",
 ]
