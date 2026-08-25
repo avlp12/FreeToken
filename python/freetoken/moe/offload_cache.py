@@ -39,6 +39,20 @@ _FALSEY = {"0", "false", "no", "off", ""}
 # stream's own DMA duration, and host time blocked on the ready event before the GEMM.
 _PREFILL_TRACE = os.getenv("FREETOKEN_PREFILL_TRACE", "0").strip().lower() not in _FALSEY
 
+# Diagnostic ONLY (FREETOKEN_PREFILL_COPY_MULT=N): stream each prefill layer's bank N
+# times instead of once. Results stay CORRECT -- the repeats rewrite identical bytes --
+# so this prices the H2D's interference with the concurrent expert GEMM without
+# perturbing any math. Measuring the slope in N and extrapolating to N=0 gives what a
+# "stream the bank less often" optimization (cross-chunk reuse) could actually buy.
+#
+# The tempting experiment -- SKIPPING the copies -- is not sound here. Priming a buffer
+# with zeros makes these codebook formats degenerate (every IQ2_XS grid lookup hits
+# entry 0, so the dequant becomes a perfect-cache-hit workload and looks ~2.7x faster
+# than reality), and priming with some other layer's real bytes is rejected outright,
+# correctly, because a layer's qtype is not shared across layers (down is IQ3_XXS on
+# some layers and Q2_K on others).
+_PREFILL_COPY_MULT = max(1, int(os.getenv("FREETOKEN_PREFILL_COPY_MULT", "1") or 1))
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -852,8 +866,9 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            for _ in range(_PREFILL_COPY_MULT):
+                for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                    buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -1029,6 +1044,16 @@ class OffloadMoeCache:
         total_gib = per_layer * len(dma) / 2**30
         busy = sum(dma) / 1e3
         dma_sorted = sorted(dma)
+        # Allocator churn shows up here: a cudaMalloc retry synchronizes the DEVICE,
+        # which drains the prefill copy stream and un-hides the expert-bank H2D.
+        ms = torch.cuda.memory_stats(self.device)
+        logger.info(
+            f"prefill-alloc: retries={ms.get('num_alloc_retries', 0)} "
+            f"ooms={ms.get('num_ooms', 0)} "
+            f"reserved={ms.get('reserved_bytes.all.current', 0) / 2**30:.2f}GiB "
+            f"peak={ms.get('reserved_bytes.all.peak', 0) / 2**30:.2f}GiB "
+            f"alloc_peak={ms.get('allocated_bytes.all.peak', 0) / 2**30:.2f}GiB"
+        )
         gemm = [a.elapsed_time(b) for a, b in tr.get("gemm_ev", [])]
         gemm_s = sum(gemm) / 1e3
         logger.info(
