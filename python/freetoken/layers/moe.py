@@ -25,6 +25,21 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Per-layer numeric audit of the prefill expert GEMM (FREETOKEN_PREFILL_AUDIT=1).
+# Runs BOTH the dequant-GEMM and the vec path on every layer's real activations and
+# logs their relative L2. Doubles prefill cost and syncs per layer: diagnostics only.
+_PREFILL_AUDIT = os.getenv("FREETOKEN_PREFILL_AUDIT", "0").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+}
+
+from freetoken.utils import init_logger  # noqa: E402
+
+logger = init_logger(__name__)
+
 
 class MoELayer(BaseOP):
     def __init__(
@@ -431,6 +446,8 @@ class OffloadMoELayer(MoELayer):
                 _g1.record()
                 _tr.setdefault("gemm_ev", []).append((_g0, _g1))
                 _tr["tokens"] = hidden_states.shape[0]
+            if _PREFILL_AUDIT:
+                self._audit_prefill_gemm(cache, hidden_states, topk_weights, topk_ids, views, out)
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
@@ -444,6 +461,49 @@ class OffloadMoELayer(MoELayer):
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
+        )
+
+    def _audit_prefill_gemm(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        views: tuple[torch.Tensor, ...],
+        out: torch.Tensor,
+    ) -> None:
+        """Log this layer's prefill output error against the OTHER expert-GEMM path.
+
+        FREETOKEN_PREFILL_AUDIT=1 only. Runs the layer a second time with the
+        dequant-GEMM flag flipped and reports relative L2, so the numeric cost of
+        the bf16 grouped GEMM is measured on REAL routed activations rather than on
+        synthetic ones. Doubles prefill cost and syncs per layer -- never in production.
+        """
+        from freetoken.moe import prefill_dequant_gemm as _dq
+
+        saved = _dq.ENABLED
+        try:
+            _dq.ENABLED = not saved
+            alt = self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+        finally:
+            _dq.ENABLED = saved
+        ref = alt if saved else out  # the vec path is always the reference
+        new = out if saved else alt
+        denom = ref.float().norm().clamp_min(1e-12)
+        rel = ((new.float() - ref.float()).norm() / denom).item()
+        logger.info(
+            f"prefill-audit: layer={self.layer_id} tokens={hidden_states.shape[0]} "
+            f"rel_l2={rel:.4e} max_abs={(new.float() - ref.float()).abs().max().item():.4e} "
+            f"finite={bool(torch.isfinite(new).all().item())}"
         )
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:

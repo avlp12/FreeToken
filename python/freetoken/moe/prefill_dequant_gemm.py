@@ -78,11 +78,21 @@ _DEFAULT_TILE = 16
 
 # Below this many tokens in the chunk, fall back to the vec path: the dequant is
 # a FIXED ~14 ms per layer (all 256 experts, whatever the routing), so a chunk
-# too small to amortize it loses. Measured crossover on an RTX 5090 at the
-# production geometry is ~900 tokens (768: 0.90x, 1024: 1.12x, 2048: 2.02x,
-# 8192: 6.25x), so 1024 is the first measured win. See
-# ``benchmarks/bench_prefill_dequant_gemm.py``.
-_DEFAULT_MIN_TOKENS = 1024
+# too small to amortize it loses.
+#
+# The isolated benchmark (``benchmarks/bench_prefill_dequant_gemm.py``) puts the
+# crossover near 900 tokens, but that bench holds both banks RESIDENT. In the live
+# server the expert bank is streaming over PCIe during the GEMM, and the dequant
+# writes ~12.9 GB of bf16 per layer, so the two contend for HBM and the crossover
+# moves out. Measured end-to-end on the real server (wall, dequant vs vec):
+#   2073 tok  3.98s vs 4.45s  -> vec wins
+#   2552 tok  4.33s vs 4.32s  -> tie
+#   4124 tok  6.67s vs 4.47s  -> dequant 1.49x
+#   6180 tok  9.85s vs 4.90s  -> dequant 2.01x
+#   8220 tok 14.34s vs 6.50s  -> dequant 2.21x
+# So the default sits just above the measured tie, which is what keeps small
+# prompts from regressing. Trust the server number over the bench number.
+_DEFAULT_MIN_TOKENS = 2560
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
