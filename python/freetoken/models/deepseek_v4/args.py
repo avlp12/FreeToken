@@ -97,6 +97,16 @@ class DeepseekV4Args:
         if isinstance(self.dspark_target_layer_ids, list):
             self.dspark_target_layer_ids = tuple(self.dspark_target_layer_ids)
 
+        # profile: temporary env override for the hyper-connection Sinkhorn iteration
+        # count, so a sensitivity sweep does not need a checkpoint edit. Applied in
+        # __post_init__ so every construction path (load_args, defaults) sees it.
+        _hc_iters = os.environ.get("FREETOKEN_HC_SINKHORN_ITERS")
+        if _hc_iters:
+            _v = int(_hc_iters)
+            if _v < 1:
+                raise ValueError("FREETOKEN_HC_SINKHORN_ITERS must be >= 1")
+            self.hc_sinkhorn_iters = _v
+
     @property
     def nope_head_dim(self) -> int:
         return self.head_dim - self.rope_head_dim
