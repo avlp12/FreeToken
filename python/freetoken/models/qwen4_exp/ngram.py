@@ -361,8 +361,14 @@ class Qwen4PLELayer(BaseOP):
             conv = F.silu(conv)
             # state update: append the current normed step
             new_tail = torch.cat([tail[:, :, 1:], normed.unsqueeze(-1).to(tail.dtype)], dim=-1)
-            self._conv_tail.index_copy_(0, idx, new_tail)
-            self._tok_hist.index_copy_(0, idx, hist[:, 1:])
+            # index_copy_ requires a long index (fla.cache_indices is int32, same as
+            # every other CUDA-graph-safe index tensor in the engine; plain indexing
+            # above (self._tok_hist[idx], self._conv_tail[idx]) accepts int32 fine, but
+            # index_copy_'s ATen kernel is stricter). Cast locally rather than widening
+            # cache_indices itself, which other consumers may rely on staying int32.
+            idx64 = idx.long()
+            self._conv_tail.index_copy_(0, idx64, new_tail)
+            self._tok_hist.index_copy_(0, idx64, hist[:, 1:])
             return gated + conv
 
         # ---- prefill (varlen; per-request loop, correctness over speed in P0) ----

@@ -613,7 +613,17 @@ class OffloadMoeCache:
             # payload-only copy walks. For a bank whose expert is a flat vector this is
             # feat itself and the two notions coincide.
             sub_pitch = per_layer[0].shape[-1] * per_layer[0].element_size()
-            if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
+            # Row bytes must be a multiple of 8, not 16: fast_index_copy_multi (unpitched
+            # mode) copies each bank row with 16-byte (uint4) units when feat is 16-aligned,
+            # else falls back to 8-byte (uint2) units -- see the narrow8 branch there. An
+            # 8-byte stride keeps every expert row's start address aligned regardless of the
+            # expert index (feat % 8 == 0 => ps*feat % 8 == 0 for any integer ps), so the
+            # fallback is exact, not a truncated/lossy copy -- just half the vector width.
+            # fp8_block's per-block weight_scale_inv planes hit this (Qwen3.8-Flash-Next:
+            # gate_up_scale 400 B is already 16-aligned; down_scale 200 B needs the 8-byte
+            # path). Every shipped WEIGHT bank stays comfortably 16-aligned (multi-MB rows)
+            # and takes the unchanged fast path.
+            if feat % 8 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
                 if layer_id in self._unpinned_layers:

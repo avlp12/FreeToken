@@ -77,11 +77,55 @@ def _default_worker_threads(feature_size: int) -> int:
     return 32
 
 
+# uint4 package load_vec/store_vec use in the single-bank JIT kernel (fast_index_copy.cuh).
+# A legal worker_feature_size must be a multiple of _LOAD_VEC_UNIT_BYTES * worker_threads
+# (that product is kBytesPerLoop in load_vec/store_vec's static_assert) -- not just a
+# divisor of feature_size, which is the only thing the shrink loop used to check.
+_LOAD_VEC_UNIT_BYTES = 16
+
+
 def _shrink_worker_feature_size(feature_size: int, worker_feature_size: int) -> int:
+    """Largest legal worker_feature_size <= min(feature_size, worker_feature_size).
+
+    Two conditions, both required by the single-bank compile-time-templated JIT kernel
+    (``FastIndexCopyKernel`` / ``load_vec``/``store_vec`` in fast_index_copy.cuh):
+
+    1. ``feature_size % wfs == 0`` -- an integer number of workers tile the row.
+    2. ``wfs % (_LOAD_VEC_UNIT_BYTES * worker_threads) == 0`` -- load_vec/store_vec's
+       ``static_assert(kBytes % kBytesPerLoop == 0, ...)``.
+
+    ``worker_threads`` is whatever :func:`_default_worker_threads` picks for this
+    ``feature_size`` (every caller derives both from the same ``feature_size``).
+
+    Some feature sizes have NO legal ``wfs`` at all: e.g. 200 and 400 bytes, the
+    fp8_block ``weight_scale_inv`` row widths on Qwen3.8-Flash-Next -- the divisors of
+    200/400 never intersect a reachable ``kUnit * kThreads`` of {128, 256, 512}. The old
+    code silently returned an illegal value anyway (it only ever checked condition 1),
+    which handed the JIT compiler an impossible template instantiation and surfaced
+    30+ seconds later as an inscrutable nvcc ``static_assert`` deep in server boot.
+    Raise here instead, immediately, naming the offending feature size, so whoever hits
+    this learns about the structural mismatch instead of decoding a template dump.
+    Banks this narrow belong on ``fast_index_copy_multi_jit`` (the runtime-sized
+    multi-bank path), which has no such compile-time width constraint.
+    """
+    worker_threads = _default_worker_threads(feature_size)
+    bytes_per_loop = _LOAD_VEC_UNIT_BYTES * worker_threads
     if feature_size < worker_feature_size:
         worker_feature_size = feature_size
-    while feature_size % worker_feature_size != 0 and worker_feature_size > 128:
+    while worker_feature_size > 128 and (
+        feature_size % worker_feature_size != 0 or worker_feature_size % bytes_per_loop != 0
+    ):
         worker_feature_size //= 2
+    if feature_size % worker_feature_size != 0 or worker_feature_size % bytes_per_loop != 0:
+        raise RuntimeError(
+            f"fast_index_copy: no legal worker_feature_size exists for "
+            f"feature_size={feature_size} bytes (worker_threads={worker_threads}, "
+            f"needs a divisor of {feature_size} that is also a multiple of "
+            f"{bytes_per_loop} = {_LOAD_VEC_UNIT_BYTES} (uint4 bytes) * {worker_threads} "
+            "threads). The single-bank compile-time-templated fast_index_copy_jit "
+            "kernel cannot serve this row width at all -- route this bank through "
+            "fast_index_copy_multi_jit (the runtime-sized multi-bank copy path) instead."
+        )
     return worker_feature_size
 
 

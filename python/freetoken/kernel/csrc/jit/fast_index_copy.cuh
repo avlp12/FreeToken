@@ -520,15 +520,27 @@ __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
     const int64_t stride = static_cast<int64_t>(kBlocksPerBank) * kNumThreads;
 
     // 16-byte (uint4) units moved per bank row, and -- pitched only -- per weight row.
+    // UNPITCHED only: a bank whose row byte count is not a multiple of 16 (fp8_block's
+    // narrow per-block weight_scale_inv planes -- e.g. Qwen3.8-Flash-Next's down_scale
+    // at 200 B/expert) falls back to 8-byte (uint2) units. This is exact, not a
+    // truncated copy: the offload cache's eligibility check (OffloadMoeCache.
+    // _build_copy_plan) only ever enables the fused path when every bank's feat is a
+    // multiple of 8, and an 8-byte-aligned feat keeps every expert row's start address
+    // 8-byte aligned regardless of the expert index (ps*feat % 8 == 0 for any integer
+    // ps), so uint2 loads/stores stay correctly aligned across the whole bank. Pitched
+    // mode (mixed-quant GGUF weight rows) never sees byte counts this narrow in
+    // practice and keeps its existing kUnit=16 assumption untouched.
     int64_t units;
     uint32_t sub_units = 0;
     int64_t pitch = 0;
+    bool narrow8 = false;
     if constexpr (kPitched) {
         pitch = p.row_pitch[b];
         sub_units = static_cast<uint32_t>(p.copy_bytes[b] >> 4);
         units = (feat / pitch) * static_cast<int64_t>(sub_units);
     } else {
-        units = feat >> 4;
+        narrow8 = (feat & 15) != 0;
+        units = narrow8 ? (feat >> 3) : (feat >> 4);
     }
     const int64_t total = n * units;
 
@@ -545,13 +557,20 @@ __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
             const uint32_t sub = r32 / sub_units;              // weight row within the expert
             col = static_cast<int64_t>(sub) * pitch
                 + (static_cast<int64_t>(r32 - sub * sub_units) << 4);
+        } else if (narrow8) {
+            col = rem << 3;  // byte offset within the row, 8-byte units
         } else {
             col = rem << 4;  // byte offset within the row
         }
         const int64_t pd = static_cast<int64_t>(di[row]);
         const int64_t ps = static_cast<int64_t>(si[row]);
-        const uint4 v = *reinterpret_cast<const uint4*>(src + ps * feat + col);
-        *reinterpret_cast<uint4*>(dst + pd * feat + col) = v;
+        if (narrow8) {
+            const uint2 v = *reinterpret_cast<const uint2*>(src + ps * feat + col);
+            *reinterpret_cast<uint2*>(dst + pd * feat + col) = v;
+        } else {
+            const uint4 v = *reinterpret_cast<const uint4*>(src + ps * feat + col);
+            *reinterpret_cast<uint4*>(dst + pd * feat + col) = v;
+        }
     }
 }
 
