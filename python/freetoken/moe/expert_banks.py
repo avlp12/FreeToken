@@ -31,6 +31,36 @@ logger = init_logger(__name__)
 _ALIGN = 4096  # PCIe/page block size fast_index_copy_multi_jit's zero-copy pull needs rows aligned to
 
 
+def _warn_stale_q2k_ud_banks(banks: "ExpertBanks", model_path: str) -> None:
+    """Say so when a q2_k_ud FTW predates native MXFP4 support.
+
+    Such a checkpoint loads and decodes perfectly -- it carries its own bank shapes and
+    its own per-layer ggml types, so it is internally consistent and refusing it would
+    be wrong. It is just the OLD numbers: its ``ffn_down_exps`` for the layers unsloth
+    quantised at 4.25 bpw were dequantized and re-encoded to Q2_K to fit a 784 B row
+    pitch, which measures 0.279 relative L2 against the reference weights where the
+    native rows measure 0.000.
+
+    Q2_K in the down table is the tell: the GGUF never stores that type there, so it can
+    only have come from the retired re-encoder.
+    """
+    from freetoken.models.deepseek_v4.gguf_experts import GGML_Q2_K
+
+    types = (banks.quant_types or {}).get("down") if banks.quant_format == "q2_k_ud" else None
+    if not types:
+        return
+    stale = [i for i, t in enumerate(types) if int(t) == GGML_Q2_K]
+    if not stale:
+        return
+    logger.warning_rank0(
+        f"expert banks: FTW checkpoint {model_path} was built before native MXFP4 "
+        f"support: its down rows for layer(s) {stale} are Q2_K re-encodes of MXFP4 "
+        "(~0.28 relative L2 against the reference weights, vs 0.00 for the native "
+        "rows). It serves correctly, just at the old quality -- rebuild with "
+        "`ft checkpoint --model <src> --out <dir> --expert-gguf <gguf>` to recover it."
+    )
+
+
 def _log_bank_alignment(banks: "ExpertBanks") -> None:
     """Startup diagnostic (once, right after the banks are built): log each host bank's
     base alignment, and warn if any layer landed off a 4096-byte boundary.
@@ -555,6 +585,7 @@ def load_expert_banks(
                     "-- pass --expert-gguf <path> again (same as the cold-boot conversion) "
                     "so expert_quant resolves correctly; the FTW load itself is unaffected."
                 )
+            _warn_stale_q2k_ud_banks(banks, model_path)
             _log_bank_alignment(banks)
             return banks
 

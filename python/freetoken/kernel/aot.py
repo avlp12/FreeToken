@@ -136,6 +136,18 @@ def _batch_memcpy_spec() -> KernelSpec:
     return KernelSpec(name=_make_name("batch_memcpy"), build=build)
 
 
+def _memcpy2d_spec() -> KernelSpec:
+    def build(build_directory: pathlib.Path) -> object:
+        return load_jit(
+            "memcpy2d",
+            cuda_files=["memcpy2d.cuh"],
+            cuda_wrappers=[("memcpy2d", "&Memcpy2D::run")],
+            build_directory=str(build_directory),
+        )
+
+    return KernelSpec(name=_make_name("memcpy2d"), build=build)
+
+
 def _radix_spec() -> KernelSpec:
     def build(build_directory: pathlib.Path) -> object:
         return load_aot("radix", cpp_files=["radix.cpp"], build_directory=str(build_directory))
@@ -156,6 +168,8 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=64))
     specs.append(_batch_memcpy_spec())
+    # payload-only whole-layer prefill fill for a mixed-quant bank (q2_k_ud)
+    specs.append(_memcpy2d_spec())
     specs.append(_radix_spec())
 
     names = [spec.name for spec in specs]

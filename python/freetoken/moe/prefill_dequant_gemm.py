@@ -143,6 +143,29 @@ _ROW_BYTES: dict[tuple[int, int], int] = {}
 # Geometries whose pad tail has already been proven zero, so the check is paid
 # once per bank shape rather than once per layer.
 _PAD_CHECKED: set[tuple[int, int, int, int]] = set()
+# Cleared by disable_pad_tail_check when the DEVICE bank stops being the right place
+# to look for that evidence.
+_PAD_CHECK_ENABLED = True
+
+
+def disable_pad_tail_check(reason: str) -> None:
+    """Stop asserting that a device bank's row tail is zero.
+
+    Called by OffloadMoeCache once per-layer copy widths are live. Slots are shared
+    across layers, and a layer whose native row IS the bank pitch has no padding at
+    all, so once copies stop rewriting the whole row its real weights survive in the
+    tail a narrower layer would call padding -- correct data that this check would
+    reject. The evidence it provided moves to the host banks, where those bytes really
+    are padding; see OffloadMoeCache._verify_host_pad_tails.
+    """
+    global _PAD_CHECK_ENABLED
+    if _PAD_CHECK_ENABLED:
+        from freetoken.utils import init_logger
+
+        init_logger(__name__).info_rank0(
+            f"prefill dequant-GEMM: device pad-tail check off ({reason})"
+        )
+    _PAD_CHECK_ENABLED = False
 
 
 def native_row_bytes(qtype: int, ncols: int) -> int:
@@ -178,7 +201,12 @@ def _check_pad_tail(bank: torch.Tensor, qtype: int, ncols: int, native: int) -> 
     dead before trusting the geometry. Costs one reduction on one expert slot,
     cached by (qtype, nrows, ncols, pitch) -- the same for all 43 layers of a
     bank, so a handful of checks per process.
+
+    Off entirely once the cache declares per-layer copy widths -- see
+    :func:`disable_pad_tail_check` for why the device bank stops being evidence.
     """
+    if not _PAD_CHECK_ENABLED:
+        return
     nrows, pitch = bank.shape[1], bank.shape[2]
     key = (int(qtype), int(nrows), int(ncols), int(pitch))
     if key in _PAD_CHECKED or native == pitch:

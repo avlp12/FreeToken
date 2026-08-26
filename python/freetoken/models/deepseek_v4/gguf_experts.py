@@ -58,13 +58,19 @@ _Q2_K_BYTES = 84  # 16 packed scale/min nibbles + 64 qs bytes + fp16 d + fp16 dm
 # Bump whenever the BYTES this loader writes into a bank change for an unchanged GGUF:
 # a re-encoder numerics change (the ALS fit, the scale/min quantization, the qs bit
 # layout), a pitch change, a type-table change. checkpoint/convert.py folds this into an
-# FTW checkpoint's source fingerprint, so an FTW built by an older loader refuses to load
-# with a rebuild message instead of being silently mis-decoded -- it is otherwise
-# byte-identical-looking on disk.
+# FTW checkpoint's source fingerprint, which is what distinguishes "same GGUF, nothing
+# changed" from "same GGUF, this loader now writes different bytes" -- otherwise the two
+# are byte-identical-looking on disk.
 #
-# 2: the down bank went from a 784 B IQ3_XXS pitch with layers 26/42 re-encoded to Q2_K,
-#    to a 1088 B MXFP4 pitch with those layers carried natively. Both the row stride and
-#    those layers' declared ggml type changed, so a v1 FTW is unreadable by this code.
+# It does NOT make an older FTW refuse to load, and it should not: an FTW carries its own
+# bank shapes and its own per-layer ggml types, so a v1 checkpoint still decodes exactly
+# as it was written. It is simply the OLD quality. The signal for that is a warning at
+# load (see moe.expert_banks._warn_stale_q2k_ud_banks), not a refusal to serve a
+# checkpoint that is internally consistent.
+#
+# 2: the down bank went from a 784 B IQ3_XXS pitch with layers 26/42 dequantized and
+#    re-encoded to Q2_K (0.279 relative L2 against the reference weights), to a 1088 B
+#    MXFP4 pitch with those layers carried natively (0.000).
 Q2K_REENCODE_VERSION = 2
 
 # One expert's worth of down rows per MXFP4 -> Q2_K chunk (H=4096 rows -> ~33 MB fp32).
@@ -212,23 +218,29 @@ def q2k_ud_expert_specs(args: DeepseekV4Args) -> dict[str, tuple[tuple[int, ...]
     }
 
 
-# Which banks are worth copying at their native width rather than at the full pitch on
-# a decode miss (see OffloadMoeCache.set_layer_copy_bytes). Not a correctness knob --
-# both settings copy the same payload -- but fewer PCIe bytes is not automatically less
-# PCIe time. Skipping the padding tail breaks each expert's read into one run per weight
-# row, and whether the shorter runs pay for the bytes they save depends on the geometry.
-# Measured on this box (PCIe 5.0 under WSL2 GPU-PV, 128 experts x 1024 rows, reproducible
-# across trials; tests/kernels/test_pitched_index_copy.py asserts both):
+# Which banks are worth copying at their native width on a DECODE miss (see
+# OffloadMoeCache.set_layer_copy_bytes). Not a correctness knob -- both settings deliver
+# the same payload -- but on that path fewer bytes is not automatically less time. A
+# decode miss is a zero-copy pull KERNEL reading pinned host memory, and skipping the
+# padding tail breaks each expert's read into one run per weight row; whether the shorter
+# runs pay for the bytes they save depends on the geometry. Measured on this box (PCIe 5.0
+# under WSL2 GPU-PV, 128 experts x 1024 rows, reproducible across trials;
+# tests/kernels/test_pitched_index_copy.py asserts both):
 #
 #   gate_up  1568 B pitch -> 1184 B IQ2_XS payload:   76% of the bytes,  78% of the time
 #   down     1088 B pitch ->  784 B IQ3_XXS payload:  72% of the bytes, 149% of the time
 #
-# So gate_up narrows and down does not. The follow-up that would win the down bank too is
-# to store a narrow layer's rows COMPACTED inside its expert slice and give the GEMV an
-# expert stride separate from its row pitch -- the copy is contiguous on both sides then
-# and the efficiency question disappears -- but that also moves the prefill GEMM's
-# slicing, so it is not folded in here.
-_COPY_NARROW_BANKS = ("gate_up",)
+# So gate_up narrows on decode and down does not. The PREFILL layer fill narrows BOTH --
+# it is a DMA transfer, and the copy engine's 2D mode takes the same skip at ~93% of its
+# linear bandwidth, so there the bytes translate straight into time. The cache keeps the
+# two tables apart; this constant only names the decode set.
+#
+# The follow-up that would win the down bank on decode too is to store a narrow layer's
+# rows COMPACTED inside its expert slice and give the GEMV an expert stride separate from
+# its row pitch -- the copy is contiguous on both sides then and the efficiency question
+# disappears -- but that also moves the prefill GEMM's slicing, so it is not folded in
+# here.
+DECODE_NARROW_BANKS = ("gate_up",)
 
 
 def q2k_ud_layer_copy_bytes(
@@ -243,10 +255,13 @@ def q2k_ud_layer_copy_bytes(
     ``ncols`` is recoverable from the shape (the down bank has one row per hidden unit,
     gate_up has two per intermediate unit).
 
+    Reports the honest native width for EVERY bank; which of them a given copy path
+    actually narrows is the cache's business (``decode_narrow``, from
+    :data:`DECODE_NARROW_BANKS`), because the answer differs between the decode pull
+    kernel and the prefill DMA.
+
     Returns ``None`` if any layer's type is not one the kernels can size, which puts
-    every bank back on full-pitch copies -- the pre-existing behaviour. Only the banks
-    in :data:`_COPY_NARROW_BANKS` are narrowed; the rest are reported at their pitch,
-    which the cache treats as "nothing to do".
+    every bank back on full-pitch copies -- the pre-existing behaviour.
     """
     from freetoken.kernel.gguf import ggml_type_row_bytes
 
@@ -259,9 +274,6 @@ def q2k_ud_layer_copy_bytes(
         pitch = int(bank_sources[name][0].shape[-1])
         widths = []
         for layer, qtype in enumerate(types):
-            if name not in _COPY_NARROW_BANKS:
-                widths.append(pitch)
-                continue
             try:
                 native = int(ggml_type_row_bytes(int(qtype), int(ncols[name])))
             except (ValueError, RuntimeError, ImportError):
@@ -500,6 +512,7 @@ __all__ = [
     "quantize_q2_k",
     "q2k_ud_expert_specs",
     "q2k_ud_layer_copy_bytes",
+    "DECODE_NARROW_BANKS",
     "load_q2k_ud_expert_sources",
     "dummy_q2k_ud_expert_sources",
 ]

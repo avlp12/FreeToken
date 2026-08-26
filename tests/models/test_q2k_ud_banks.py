@@ -65,10 +65,48 @@ def test_slot_bytes_match_the_vram_budget():
 
 
 def test_reencode_version_was_bumped_past_the_narrow_down_bank():
-    """A v1 FTW has 784 B down rows and calls layers 26/42 Q2_K; this code would read
-    it at 1088 B and decode those rows as MXFP4. The fingerprint has to differ or that
-    checkpoint loads silently and produces garbage."""
+    """The converter's source fingerprint has to change, or `ft checkpoint` cannot tell
+    "same GGUF, nothing changed" from "same GGUF, this loader now writes different
+    bytes" -- the two are byte-identical-looking on disk."""
     assert Q2K_REENCODE_VERSION >= 2
+
+
+def test_a_pre_mxfp4_ftw_is_flagged_but_not_rejected(monkeypatch):
+    """A v1 FTW carries its own shapes and types, so it decodes exactly as written and
+    refusing it would be wrong. It is just the old quality, and that deserves saying."""
+    from types import SimpleNamespace
+
+    from freetoken.moe import expert_banks
+
+    said: list[str] = []
+    # freetoken's loggers set propagate=False, so caplog never sees them.
+    monkeypatch.setattr(
+        expert_banks.logger, "warning_rank0", lambda msg, *a, **k: said.append(str(msg))
+    )
+
+    layers = 43
+    down = [GGML_IQ3_XXS] * layers
+    fresh = SimpleNamespace(
+        quant_format="q2_k_ud",
+        quant_types={"gate_up": [GGML_IQ2_XS] * layers, "down": list(down)},
+    )
+    expert_banks._warn_stale_q2k_ud_banks(fresh, "/models/v3")
+    assert not said, "a native-MXFP4 checkpoint must not warn"
+
+    # A format with no per-layer type table at all must not trip over it either.
+    expert_banks._warn_stale_q2k_ud_banks(
+        SimpleNamespace(quant_format="bf16", quant_types=None), "/models/dense"
+    )
+    assert not said
+
+    down[26] = down[42] = GGML_Q2_K
+    stale = SimpleNamespace(
+        quant_format="q2_k_ud",
+        quant_types={"gate_up": [GGML_IQ2_XS] * layers, "down": down},
+    )
+    expert_banks._warn_stale_q2k_ud_banks(stale, "/models/v2")
+    assert len(said) == 1
+    assert "[26, 42]" in said[0] and "ft checkpoint" in said[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -166,14 +204,25 @@ def test_copy_widths_are_the_native_row_bytes():
 
     got = q2k_ud_layer_copy_bytes(_bank_stub(layers), qtypes)
     assert got is not None
-    # gate_up narrows: 42 layers of IQ2_XS at 1184, one of IQ3_XXS at the full pitch.
+    # gate_up: 42 layers of IQ2_XS at 1184, one of IQ3_XXS whose native row IS the pitch.
     assert got["gate_up"][26] == GU_PITCH
     assert got["gate_up"][0] == got["gate_up"][42] == 1184
     assert sum(w == 1184 for w in got["gate_up"]) == 42
-    # down does NOT narrow -- see _COPY_NARROW_BANKS; every layer reports the pitch,
-    # which the cache reads as "nothing to do".
-    assert set(got["down"]) == {DN_PITCH}
+    # down: 41 layers of IQ3_XXS at 784, and the two MXFP4 layers at the full pitch.
+    assert got["down"][26] == got["down"][42] == DN_PITCH
+    assert got["down"][0] == 784
+    assert sum(w == 784 for w in got["down"]) == 41
     assert all(w % 16 == 0 for ws in got.values() for w in ws)
+
+
+def test_decode_narrows_only_the_bank_where_it_pays():
+    """The table above is honest about both banks; the DECODE path deliberately uses
+    only part of it, while the prefill DMA uses all of it. Both are measured facts, not
+    structural ones -- tests/kernels/test_pitched_index_copy.py holds the measurements.
+    """
+    from freetoken.models.deepseek_v4.gguf_experts import DECODE_NARROW_BANKS
+
+    assert tuple(DECODE_NARROW_BANKS) == ("gate_up",)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the gguf kernel module")

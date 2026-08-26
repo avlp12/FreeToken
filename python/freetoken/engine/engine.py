@@ -863,13 +863,17 @@ class Engine:
             if banks.quant_format == "q2_k_ud":
                 # Same per-layer type table, read for a different purpose: a layer whose
                 # rows are narrower than its bank's pitch does not need the padding tail
-                # copied over PCIe on a decode miss. Declared here rather than inside the
+                # copied over the interconnect. Declared here rather than inside the
                 # cache because only the format knows how to turn a ggml type into a row
                 # width; None (unknown type) leaves every bank on full-pitch copies.
-                from freetoken.models.deepseek_v4.gguf_experts import q2k_ud_layer_copy_bytes
+                from freetoken.models.deepseek_v4.gguf_experts import (
+                    DECODE_NARROW_BANKS,
+                    q2k_ud_layer_copy_bytes,
+                )
 
                 cache.set_layer_copy_bytes(
-                    q2k_ud_layer_copy_bytes(cache.bank_sources, banks.quant_types)
+                    q2k_ud_layer_copy_bytes(cache.bank_sources, banks.quant_types),
+                    decode_narrow=DECODE_NARROW_BANKS,
                 )
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
