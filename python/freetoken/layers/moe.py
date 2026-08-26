@@ -651,6 +651,21 @@ class OffloadMoELayer(MoELayer):
                 self.gguf_gate_up_qtype, self.gguf_down_qtype, self.swiglu_limit,
                 is_prefill=is_prefill,
             )
+        if fmt == "q4_k_ud":
+            # Native GGUF unsloth UD-Q4_K_XL experts (Qwen4-Exp / Qwen3.8-Flash-Next):
+            # same dequant-in-kernel grouped GEMV + padded-pitch banks as q2_k_ud, but
+            # with this LAYER's Q4_K/Q5_K (gate_up) and Q5_1/Q8_0 (down) types, and
+            # plain (unclamped) SwiGLU -- this architecture has no swiglu_limit. See
+            # freetoken.moe.fused_q4_k_ud for why prefill has no weight-reuse batching
+            # branch (no batched kernel exists for these ggml types).
+            from freetoken.moe.fused_q4_k_ud import fused_experts_q4k_ud
+
+            gate_up, down = views
+            return fused_experts_q4k_ud(
+                hidden_states, gate_up, down, topk_weights, topk_ids,
+                self.gguf_gate_up_qtype, self.gguf_down_qtype, self.activation,
+                is_prefill=is_prefill,
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

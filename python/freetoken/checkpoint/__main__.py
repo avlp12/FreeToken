@@ -29,11 +29,12 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
     p.add_argument("--device", default=None, help="CUDA device for repack (default cuda:0)")
     p.add_argument("--expert-gguf", default=None,
-                   help="DeepSeek-V4 only, mirrors the server's --expert-gguf: convert the "
-                        "routed experts from this GGUF (q2_k_ud) instead of --model's own "
-                        "expert weights. Dense weights still come from --model; pass the "
-                        "same --expert-gguf again when serving the converted FTW dir (cheap "
-                        "path check -- the fast FTW load skips the actual GGUF re-parse).")
+                   help="DeepSeek-V4 or qwen4_exp only, mirrors the server's --expert-gguf: "
+                        "convert the routed experts from this GGUF (q2_k_ud / q4_k_ud) "
+                        "instead of --model's own expert weights. Dense weights still come "
+                        "from --model; pass the same --expert-gguf again when serving the "
+                        "converted FTW dir (cheap path check -- the fast FTW load skips the "
+                        "actual GGUF re-parse).")
     ns = p.parse_args(argv)
 
     shard_limit = int(ns.shard_gib * (1 << 30))

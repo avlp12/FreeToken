@@ -50,6 +50,10 @@ class Qwen4ExpArgs:
     model_path: str | None = None
     # MTP drafter config, preserved for a later phase (dropped from loading in P0).
     mtp: dict = field(default_factory=dict)
+    # --expert-gguf: set post-parse (object.__setattr__, this dataclass is frozen) by
+    # engine.engine._apply_expert_gguf, the same seam DeepseekV4Args.expert_gguf_path
+    # uses. Read by moe.expert_banks._q4_k_ud_banks.
+    expert_gguf_path: str | None = None
 
     @property
     def ple_layer_indices(self) -> tuple[int, ...]:

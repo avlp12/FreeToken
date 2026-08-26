@@ -860,19 +860,25 @@ class Engine:
             for layer in layers:
                 layer.gguf_gate_up_qtype = banks.quant_types["gate_up"][layer.layer_id]
                 layer.gguf_down_qtype = banks.quant_types["down"][layer.layer_id]
-            if banks.quant_format == "q2_k_ud":
+            if banks.quant_format in ("q2_k_ud", "q4_k_ud"):
                 # Same per-layer type table, read for a different purpose: a layer whose
                 # rows are narrower than its bank's pitch does not need the padding tail
                 # copied over the interconnect. Declared here rather than inside the
                 # cache because only the format knows how to turn a ggml type into a row
                 # width; None (unknown type) leaves every bank on full-pitch copies.
-                from freetoken.models.deepseek_v4.gguf_experts import (
-                    DECODE_NARROW_BANKS,
-                    q2k_ud_layer_copy_bytes,
-                )
+                if banks.quant_format == "q2_k_ud":
+                    from freetoken.models.deepseek_v4.gguf_experts import (
+                        DECODE_NARROW_BANKS,
+                        q2k_ud_layer_copy_bytes as layer_copy_bytes_fn,
+                    )
+                else:
+                    from freetoken.models.qwen4_exp.gguf_experts import (
+                        DECODE_NARROW_BANKS,
+                        q4k_ud_layer_copy_bytes as layer_copy_bytes_fn,
+                    )
 
                 cache.set_layer_copy_bytes(
-                    q2k_ud_layer_copy_bytes(cache.bank_sources, banks.quant_types),
+                    layer_copy_bytes_fn(cache.bank_sources, banks.quant_types),
                     decode_narrow=DECODE_NARROW_BANKS,
                 )
         if cache.decode_target in ("cpu", "hybrid"):
@@ -1879,21 +1885,43 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     return requested
 
 
-def _apply_expert_gguf(config: EngineConfig, is_dsv4: bool) -> None:
-    """Resolve ``--expert-gguf``: switch the routed experts onto the GGUF q2_k_ud banks.
+# checkpoint architecture (an attribute name on ModelConfig, non-None iff that
+# architecture) -> (expert_quant value --expert-gguf resolves to, the args
+# instance's attribute that stashes the GGUF path). Dispatching on architecture
+# rather than deleting the "unsupported architecture" check keeps a mismatched
+# GGUF/checkpoint pairing (e.g. a DSV4 GGUF against a qwen4_exp checkpoint) a
+# loud failure -- see also the general.architecture / geometry cross-check each
+# format's own loader runs (gguf_experts._validate_metadata).
+_EXPERT_GGUF_FORMATS = {
+    "dsv4_args": "q2_k_ud",
+    "qwen4_args": "q4_k_ud",
+}
 
-    Runs at config-resolution time, before anything downstream reads ``expert_quant``. The
-    path is stashed on the ``dsv4_args`` instance ``ModelConfig`` carries -- the same
-    instance the ``q2_k_ud`` bank provider reads.
+
+def _apply_expert_gguf(config: EngineConfig) -> None:
+    """Resolve ``--expert-gguf``: switch the routed experts onto their format's GGUF banks.
+
+    Runs at config-resolution time, before anything downstream reads ``expert_quant``.
+    Supported today: DeepSeek-V4 (``q2_k_ud``, DSV4's clamped-SwiGLU IQ-quant banks) and
+    qwen4_exp (``q4_k_ud``, Qwen4-Exp's plain-SwiGLU Q4_K/Q5_K/Q5_1/Q8_0 banks) -- picked by
+    which opaque args instance ``model_config`` carries, never by deleting the "unsupported
+    architecture" check. The path is stashed on that same args instance -- the instance the
+    format's bank provider (moe.expert_banks._q2_k_ud_banks / _q4_k_ud_banks) reads.
     """
     model_config = config.model_config
-    if not is_dsv4:
+    args_attr = quant_format = None
+    for attr, fmt in _EXPERT_GGUF_FORMATS.items():
+        if getattr(model_config, attr, None) is not None:
+            args_attr, quant_format = attr, fmt
+            break
+    if args_attr is None:
         arch = getattr(model_config, "architectures", ["?"])[0]
+        supported = ", ".join(f"{fmt} ({attr})" for attr, fmt in _EXPERT_GGUF_FORMATS.items())
         raise ValueError(
-            f"--expert-gguf is DeepSeek-V4 only (this checkpoint is {arch}): the q2_k_ud "
-            "bank layout and its clamped-SwiGLU GEMV are specific to DSV4's expert geometry"
+            f"--expert-gguf is not implemented for this checkpoint's architecture "
+            f"({arch}); supported: {supported}"
         )
-    if getattr(config, "speculative_dspark", False):
+    if quant_format == "q2_k_ud" and getattr(config, "speculative_dspark", False):
         raise ValueError(
             "--expert-gguf cannot be combined with --speculative-dspark: the GGUF carries "
             "no mtp.* drafter experts, so the drafter's MoE layers would have no banks "
@@ -1907,10 +1935,13 @@ def _apply_expert_gguf(config: EngineConfig, is_dsv4: bool) -> None:
             f"--expert-gguf {path!r} is neither a .gguf file nor a directory holding a "
             "llama.cpp split-GGUF shard set (*-00001-of-0000N.gguf ...)"
         )
-    object.__setattr__(model_config, "expert_quant", "q2_k_ud")
-    model_config.dsv4_args.expert_gguf_path = path
+    object.__setattr__(model_config, "expert_quant", quant_format)
+    # object.__setattr__ works on both the frozen args dataclass (Qwen4ExpArgs)
+    # and the mutable one (DeepseekV4Args), so one line covers both without a
+    # frozen/not-frozen branch.
+    object.__setattr__(getattr(model_config, args_attr), "expert_gguf_path", path)
     logger.info_rank0(
-        f"--expert-gguf: routed experts served from {path} (expert_quant=q2_k_ud)"
+        f"--expert-gguf: routed experts served from {path} (expert_quant={quant_format})"
     )
 
 
@@ -2124,10 +2155,11 @@ def _adjust_config(config: EngineConfig):
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
-    # Must precede the expert_quant read below: --expert-gguf rewrites it to "q2_k_ud",
-    # and every later decision here (backend legality, bench profile key) keys on it.
+    # Must precede the expert_quant read below: --expert-gguf rewrites it to
+    # "q2_k_ud" (DSV4) or "q4_k_ud" (qwen4_exp), and every later decision here
+    # (backend legality, bench profile key) keys on it.
     if getattr(config, "expert_gguf", None):
-        _apply_expert_gguf(config, is_dsv4)
+        _apply_expert_gguf(config)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
     if not is_moe:

@@ -131,6 +131,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # pitch rather than the bank mixing row strides. gate_up [L*E, 2I, H//256*98],
     # down [L*E, H, I//256*98].
     "q2_k_ud": ("gate_up", "down"),
+    # native GGUF unsloth UD-Q4_K_XL Qwen4-Exp (Qwen3.8-Flash-Next) experts: both
+    # banks stored at a uniform pitch wide enough for that bank's widest layer --
+    # gate_up mostly Q4_K with one Q5_K layer -> Q5_K pitch (1760 B at H=2560);
+    # down mostly Q5_1 with five Q8_0 layers -> Q8_0 pitch (680 B at I=640). See
+    # freetoken.models.qwen4_exp.gguf_experts for the per-layer type table.
+    "q4_k_ud": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -178,6 +184,15 @@ _BANK_BYTES_PER_EXPERT = {
     # copied at their 1184 B IQ2_XS width rather than at the 1568 B pitch, which more than
     # pays for the wider down rows (see gguf_experts.q2k_ud_layer_copy_bytes).
     "q2_k_ud": lambda H, I: 2 * I * (H // 256 * 98) + H * (I // 32 * 17),
+    # gate_up rows at the Q5_K pitch (176 B / 256-element super-block, already a
+    # 16 B multiple), down rows at the Q8_0 NATIVE width (34 B / 32-element
+    # block) rounded up to the next 16 B multiple -- moe_vec_resolve_pitch
+    # requires row_pitch_bytes % 16 == 0 and Q8_0's native 680 B at I=640 is
+    # not one (688 is). At H=2560, I=640 that is 2,252,800 + 1,761,280 =
+    # 4,014,080 B per (expert, layer) -- 91.9 GiB total across 512 experts x
+    # 48 layers, vs 112.5 GiB for the fp8_block bank it replaces. See
+    # freetoken.models.qwen4_exp.gguf_experts._align16 / q4k_ud_expert_specs.
+    "q4_k_ud": lambda H, I: 2 * I * (H // 256 * 176) + H * (((I // 32 * 34) + 15) // 16 * 16),
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),

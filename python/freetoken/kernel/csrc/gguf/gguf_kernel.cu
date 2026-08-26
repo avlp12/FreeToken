@@ -185,6 +185,12 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      default:
+        // Y was torch::empty'd above and no case ran: without this check an
+        // unmatched type silently returns UNINITIALIZED memory as the GEMV
+        // result instead of failing. See the module-level hazard note in
+        // ggml_moe_a8_vec below.
+        TORCH_CHECK(false, "ggml_mul_mat_vec_a8: unsupported ggml type ", type);
     }
   });
   return Y;
@@ -328,6 +334,10 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+      default:
+        // Same hazard as ggml_mul_mat_vec_a8 above: Y is pre-allocated and an
+        // unmatched type would silently return it uninitialized.
+        TORCH_CHECK(false, "ggml_mul_mat_a8: unsupported ggml type ", type);
     }
   });
   return Y;
@@ -546,6 +556,10 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        // Same hazard as ggml_mul_mat_vec_a8 above: Y is pre-allocated and an
+        // unmatched type would silently return it uninitialized.
+        TORCH_CHECK(false, "ggml_moe_a8: unsupported ggml type ", type);
     }
   });
   return Y;
@@ -862,6 +876,13 @@ torch::Tensor ggml_moe_a8_vec(
             row_pitch_bytes,
             stream);
         break;
+      default:
+        // Y was torch::zeros'd above and no case ran: without this check an
+        // unmatched type silently returns an ALL-ZERO GEMV result -- indistinguishable
+        // from a correctly-computed answer of zero, i.e. silent corruption, not a
+        // crash. This is the exact hazard the q4_k_ud bring-up was told to close
+        // before widening the type surface this switch dispatches over.
+        TORCH_CHECK(false, "ggml_moe_a8_vec: unsupported ggml type ", type);
     }
   });
   return Y;
@@ -1005,6 +1026,12 @@ torch::Tensor ggml_moe_a8_vec_batched(
             batch_n,
             stream);
         break;
+      default:
+        // Defense in depth: moe_vec_batched_has_type(type) above already rejects
+        // any type without a case here, so this should be unreachable -- but an
+        // unmatched case would otherwise silently return `out` (or a freshly
+        // zeroed Y) untouched, the same silent-zero hazard ggml_moe_a8_vec has.
+        TORCH_CHECK(false, "ggml_moe_a8_vec_batched: unsupported ggml type ", type);
     }
   });
   return Y;

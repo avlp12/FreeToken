@@ -349,6 +349,38 @@ def _q2_k_ud_banks(model_path, model_config, device, dtype, dummy, parallel=Fals
     )
 
 
+def _q4_k_ud_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q4_k_ud: the experts live in a split-GGUF "
+            "shard set (not safetensors), so the common reader doesn't apply -- it needs a "
+            "GGUF-native parallel reader (parse each shard's tensor table, chunked O_DIRECT)"
+        )
+    from freetoken.models.qwen4_exp.gguf_experts import load_q4k_ud_expert_sources
+
+    args = model_config.qwen4_args
+    assert args is not None, "q4_k_ud expert banks require qwen4_args on the model config"
+    gguf_path = getattr(args, "expert_gguf_path", None)
+    assert gguf_path or dummy, (
+        "q4_k_ud expert banks need the GGUF path in qwen4_args.expert_gguf_path "
+        "(set from --expert-gguf); see engine._apply_expert_gguf"
+    )
+    # Native GGUF Q4_K/Q5_K (gate_up) and Q5_1/Q8_0 (down) routed experts: packed
+    # block bytes streamed to the GPU and dequantized inside the borrowed ggml MoE
+    # kernels. Written as-loaded -> streamable (dummy fabricates in one shot, so it
+    # is never streamed). quant_types travels with the banks: like q2_k_ud, a
+    # layer's rows do NOT all share one ggml type, so the GEMV's per-call type is
+    # per layer, not per format.
+    sink = None if dummy else layer_sink
+    banks, quant_types = load_q4k_ud_expert_sources(
+        gguf_path, model_config, dummy=dummy, layer_sink=sink
+    )
+    return ExpertBanks(
+        "q4_k_ud", {name: banks[name] for name in _BANK_SCHEMAS["q4_k_ud"]},
+        quant_types=quant_types, streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -423,6 +455,7 @@ _PROVIDERS = {
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
     "q2_k_ud": _q2_k_ud_banks,
+    "q4_k_ud": _q4_k_ud_banks,
 }
 
 
@@ -570,20 +603,21 @@ def load_expert_banks(
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
-            # q2_k_ud's FTW banks carry their own quant_types and load correctly regardless,
-            # but model_config.expert_quant only becomes "q2_k_ud" via --expert-gguf (see
-            # engine._apply_expert_gguf) -- everything that reads expert_quant BEFORE this
-            # point (bank-size estimates, backend legality) ran against whatever the
-            # checkpoint's own config declares. --expert-gguf stays cheap on this path (a
-            # path check, not a GGUF parse), so warn rather than silently trusting the
-            # mismatch.
-            if (banks.quant_format == "q2_k_ud"
-                    and getattr(model_config, "expert_quant", None) != "q2_k_ud"):
+            # q2_k_ud/q4_k_ud's FTW banks carry their own quant_types and load correctly
+            # regardless, but model_config.expert_quant only becomes "q2_k_ud"/"q4_k_ud"
+            # via --expert-gguf (see engine._apply_expert_gguf) -- everything that reads
+            # expert_quant BEFORE this point (bank-size estimates, backend legality) ran
+            # against whatever the checkpoint's own config declares. --expert-gguf stays
+            # cheap on this path (a path check, not a GGUF parse), so warn rather than
+            # silently trusting the mismatch.
+            if (banks.quant_format in ("q2_k_ud", "q4_k_ud")
+                    and getattr(model_config, "expert_quant", None) != banks.quant_format):
                 logger.warning_rank0(
-                    f"expert banks: FTW checkpoint {model_path} holds q2_k_ud banks but "
-                    f"this boot's model_config.expert_quant={getattr(model_config, 'expert_quant', None)!r} "
-                    "-- pass --expert-gguf <path> again (same as the cold-boot conversion) "
-                    "so expert_quant resolves correctly; the FTW load itself is unaffected."
+                    f"expert banks: FTW checkpoint {model_path} holds {banks.quant_format} "
+                    f"banks but this boot's model_config.expert_quant="
+                    f"{getattr(model_config, 'expert_quant', None)!r} -- pass --expert-gguf "
+                    "<path> again (same as the cold-boot conversion) so expert_quant "
+                    "resolves correctly; the FTW load itself is unaffected."
                 )
             _warn_stale_q2k_ud_banks(banks, model_path)
             _log_bank_alignment(banks)

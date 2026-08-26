@@ -22,7 +22,10 @@ import torch
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q5_1 = 7
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_IQ2_XS = 17
 GGML_IQ3_XXS = 18
@@ -35,7 +38,10 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_F16: (1, 2),
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
+    GGML_Q5_1: (32, 24),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
     GGML_IQ2_XS: (256, 74),
     GGML_IQ3_XXS: (256, 98),
@@ -47,7 +53,10 @@ GGML_NAME = {
     GGML_F16: "F16",
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
+    GGML_Q5_1: "Q5_1",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
     GGML_IQ2_XS: "IQ2_XS",
     GGML_IQ3_XXS: "IQ3_XXS",
@@ -151,7 +160,10 @@ __all__ = [
     "GGML_F16",
     "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q5_1",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_IQ2_XS",
     "GGML_IQ3_XXS",

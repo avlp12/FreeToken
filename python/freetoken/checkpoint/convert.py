@@ -68,18 +68,26 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
     for f in files:
         st = os.stat(f)
         h.update(f"{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
-    # q2_k_ud: the routed experts are read from a SEPARATE GGUF (--expert-gguf), not
-    # model_path, so the loop above never sees it -- fold in its shard set (resolved to
-    # real files, so a differently-named-but-identical split set still matches) plus the
-    # MXFP4->Q2_K re-encoder's version, since that's the one place this provider changes
-    # the numbers rather than copying bytes: a re-encoder change must invalidate an old FTW
-    # even though the source GGUF itself didn't change.
-    gguf_path = getattr(getattr(model_config, "dsv4_args", None), "expert_gguf_path", None)
+    # q2_k_ud/q4_k_ud: the routed experts are read from a SEPARATE GGUF (--expert-gguf),
+    # not model_path, so the loop above never sees it -- fold in its shard set (resolved
+    # to real files, so a differently-named-but-identical split set still matches).
+    # q2_k_ud additionally folds in the MXFP4->Q2_K re-encoder's version, since that's the
+    # one place THAT provider changes the numbers rather than copying bytes: a re-encoder
+    # change must invalidate an old FTW even though the source GGUF itself didn't change.
+    # q4_k_ud never re-encodes (every ggml type it uses is natively kernel-supported), so
+    # it has no analogous version to fold in.
+    gguf_path = None
+    for attr in ("dsv4_args", "qwen4_args"):
+        gguf_path = getattr(getattr(model_config, attr, None), "expert_gguf_path", None)
+        if gguf_path:
+            break
     if gguf_path:
-        from freetoken.models.deepseek_v4.gguf_experts import Q2K_REENCODE_VERSION
         from freetoken.models.gguf.reader import _split_shard_paths
 
-        h.update(f"q2k_reencode_version={Q2K_REENCODE_VERSION}|".encode())
+        if getattr(model_config, "dsv4_args", None) is not None:
+            from freetoken.models.deepseek_v4.gguf_experts import Q2K_REENCODE_VERSION
+
+            h.update(f"q2k_reencode_version={Q2K_REENCODE_VERSION}|".encode())
         for f in sorted(_split_shard_paths(gguf_path) or [gguf_path]):
             st = os.stat(f)
             h.update(f"expert_gguf:{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
@@ -287,15 +295,16 @@ def convert_checkpoint(
     The FTW format is TP-agnostic and conversion runs single-process, so the resulting
     checkpoint records no TP layout and loads independently of the runtime TP setting.
 
-    ``expert_gguf``: DeepSeek-V4 only, mirrors ``--expert-gguf`` on the server -- convert
-    the routed experts from this GGUF (q2_k_ud: IQ2_XS/IQ3_XXS native rows, MXFP4 down rows
-    re-encoded to Q2_K) instead of ``model_path``'s own expert weights. Dense weights (and
-    everything else) still come from ``model_path``; the GGUF supplies only the offload
-    expert banks. The converted FTW dir embeds the banks and their per-layer quant-type
-    table, so a warm boot needs no re-parse of the (multi-GB, split-shard) GGUF -- but
-    ``--expert-gguf`` must still be passed at boot (cheap: a path check, not a parse) so
-    ``ModelConfig.expert_quant`` resolves to ``q2_k_ud`` the same way it would on a cold
-    boot; see ``engine.engine._apply_expert_gguf``.
+    ``expert_gguf``: DeepSeek-V4 or qwen4_exp only, mirrors ``--expert-gguf`` on the
+    server -- convert the routed experts from this GGUF (DSV4: q2_k_ud, IQ2_XS/IQ3_XXS
+    native rows, MXFP4 down rows re-encoded to Q2_K; qwen4_exp: q4_k_ud, Q4_K/Q5_K
+    gate_up and Q5_1/Q8_0 down native rows, no re-encoding) instead of ``model_path``'s
+    own expert weights. Dense weights (and everything else) still come from
+    ``model_path``; the GGUF supplies only the offload expert banks. The converted FTW
+    dir embeds the banks and their per-layer quant-type table, so a warm boot needs no
+    re-parse of the (multi-GB, split-shard) GGUF -- but ``--expert-gguf`` must still be
+    passed at boot (cheap: a path check, not a parse) so ``ModelConfig.expert_quant``
+    resolves the same way it would on a cold boot; see ``engine.engine._apply_expert_gguf``.
     """
     from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
     from freetoken.engine.config import EngineConfig
@@ -348,20 +357,16 @@ def convert_checkpoint(
                        dtype=dtype, moe_backend=moe_backend, expert_gguf=expert_gguf)
     mc = cfg.model_config
     if expert_gguf:
-        # DSV4-only. Passing a GGUF against qwen4_exp would rewrite expert_quant to
-        # q2_k_ud and then look for dsv4_args / gguf expert rows that do not exist.
-        if getattr(mc, "dsv4_args", None) is None:
-            raise SystemExit(
-                "--expert-gguf is DeepSeek-V4 only; qwen4_exp / fp8 safetensors convert "
-                "natively (omit the flag)"
-            )
+        # DSV4 (q2_k_ud) or qwen4_exp (q4_k_ud) only. Passing a GGUF against any other
+        # architecture has no args instance to stash the path on and no bank provider to
+        # read it -- _apply_expert_gguf raises loudly in that case rather than guessing.
         # Must precede any expert_quant read below -- same ordering requirement as the
         # server's _adjust_config (see its comment): this rewrites model_config.expert_quant
-        # to "q2_k_ud" and stashes the GGUF path on dsv4_args, in place, on the cached
+        # and stashes the GGUF path on the format's args instance, in place, on the cached
         # ModelConfig instance cfg.model_config below will return.
         from freetoken.engine.engine import _apply_expert_gguf
 
-        _apply_expert_gguf(cfg, True)
+        _apply_expert_gguf(cfg)
         mc = cfg.model_config
     # qwen4_exp model_type is "qwen4_exp" (no "moe" substring). is_moe is True only
     # when parse_config sets moe_enabled=True -- see /root/ftw_qwen_plan.md.
