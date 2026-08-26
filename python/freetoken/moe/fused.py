@@ -46,9 +46,15 @@ def fused_topk(
 
     from freetoken.kernel.backend import is_triton_kernels_installed
 
+    # triton_kernels.topk hard-requires a power-of-2 top-k (tl.arange(0, N_EXPTS_ACT)
+    # -> "arange's range must be a power of 2"). Qwen3.8-Flash-Next routes top-10, so
+    # non-pow2 k takes the numerically-equivalent torch router instead of crashing at
+    # kernel compile. Padding the kernel to 16 lanes is a later optimization.
+    topk_pow2 = (topk & (topk - 1)) == 0
+
     # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
     # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
-    if not is_triton_kernels_installed():
+    if not is_triton_kernels_installed() or not topk_pow2:
         global _warned_torch_topk
         if not _warned_torch_topk:
             _warned_torch_topk = True

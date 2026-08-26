@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import mmap
 import os
+import warnings
 
 import safetensors
 import torch
@@ -30,7 +32,15 @@ _PLE_PREFIX = "ple.ple_embedding."
 
 
 class _NGramTable:
-    """Lazy, mmap-backed reader of the sharded fp8 n-gram embedding table."""
+    """Lazy, mmap-backed reader of the sharded fp8 n-gram embedding table.
+
+    Dual path: if ``model.safetensors.index.json`` is present, keep the original
+    safetensors ``safe_open`` / ``get_tensor`` mmap. Otherwise parse the FTW
+    index (``freetoken_weight.json``) and mmap ``kind="ngram"`` tensors in
+    place. ``iter_ftw_ngrams`` materializes every n-gram tensor (~47 GiB) so
+    it is not used: this path only records ``(file, offset, shape, dtype)``
+    and gathers the requested rows.
+    """
 
     def __init__(self, model_path: str, layer_idx: int, split_parts: int):
         self.model_path = model_path
@@ -39,16 +49,100 @@ class _NGramTable:
         )
         self.split_parts = split_parts
         index_path = os.path.join(model_path, "model.safetensors.index.json")
-        with open(index_path) as fh:
-            self._weight_map = json.load(fh)["weight_map"]
         self._handles: dict[str, object] = {}
         self._shards: list[torch.Tensor | None] = [None] * split_parts
+        self._ftw_locs: dict[str, tuple] | None = None
+        if os.path.isfile(index_path):
+            with open(index_path) as fh:
+                self._weight_map = json.load(fh)["weight_map"]
+        else:
+            self._weight_map = {}
+            self._ftw_locs = self._load_ftw_ngram_locs()
         self.weight_scale = self._tensor(f"{self.key_base}.weight_scale").float().item()
-        shard0 = self._shard(0)
-        self.rows_per_shard = shard0.shape[0]
-        self.head_dim = shard0.shape[1]
+        if self._ftw_locs is not None:
+            _file, _off, shape, _dt, _nb = self._ftw_locs[f"{self.key_base}.shard_0.weight"]
+            self.rows_per_shard = int(shape[0])
+            self.head_dim = int(shape[1])
+        else:
+            shard0 = self._shard(0)
+            self.rows_per_shard = shard0.shape[0]
+            self.head_dim = shard0.shape[1]
+
+    def _load_ftw_ngram_locs(self) -> dict[str, tuple]:
+        """Index FTW ``kind=ngram`` tensors without reading their payloads."""
+        from freetoken.checkpoint.ftw import INDEX_NAME
+
+        index_path = os.path.join(self.model_path, INDEX_NAME)
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(
+                f"neither model.safetensors.index.json nor {INDEX_NAME} "
+                f"under {self.model_path}"
+            )
+        with open(index_path) as fh:
+            index = json.load(fh)
+        shards = sorted(index["shards"], key=lambda s: s["global_off"])
+        locs: dict[str, tuple] = {}
+        for t in index["tensors"]:
+            if t.get("kind") != "ngram":
+                continue
+            pieces: list[tuple[str, int, int]] = []
+            remaining = int(t["nbytes"])
+            pos = int(t["global_off"])
+            for sh in shards:
+                s0 = int(sh["global_off"])
+                s1 = s0 + int(sh["nbytes"])
+                if pos >= s1 or remaining <= 0:
+                    continue
+                if pos < s0:
+                    raise ValueError(f"FTW gap locating {t['name']}")
+                take = min(remaining, s1 - pos)
+                pieces.append((sh["file"], pos - s0, take))
+                pos += take
+                remaining -= take
+            if remaining:
+                raise ValueError(f"FTW range exceeds shards for {t['name']}")
+            if len(pieces) != 1:
+                raise ValueError(
+                    f"ngram tensor {t['name']} spans FTW files: {pieces}"
+                )
+            file, file_off, nbytes = pieces[0]
+            dtype = getattr(torch, t["dtype"])
+            locs[t["name"]] = (file, file_off, tuple(t["shape"]), dtype, nbytes)
+        for i in range(self.split_parts):
+            key = f"{self.key_base}.shard_{i}.weight"
+            if key not in locs:
+                raise KeyError(f"FTW ngram missing {key}")
+        return locs
+
+    def _ftw_u8(self, filename: str) -> torch.Tensor:
+        """Read-only mmap of one FTW shard file as a uint8 view (no copy)."""
+        cached = self._handles.get(filename)
+        if cached is not None:
+            return cached[-1]
+        path = os.path.join(self.model_path, filename)
+        fh = open(path, "rb")
+        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="The given buffer is not writable"
+                )
+                u8 = torch.frombuffer(mm, dtype=torch.uint8)
+            self._handles[filename] = (fh, mm, u8)
+        except (ValueError, RuntimeError, TypeError):
+            import numpy as np
+
+            arr = np.memmap(path, dtype=np.uint8, mode="r")
+            u8 = torch.from_numpy(arr)
+            self._handles[filename] = (fh, mm, arr, u8)
+        return u8
 
     def _tensor(self, key: str) -> torch.Tensor:
+        if self._ftw_locs is not None:
+            file, file_off, shape, dtype, nbytes = self._ftw_locs[key]
+            raw = self._ftw_u8(file)[file_off:file_off + nbytes]
+            viewed = raw.view(dtype)
+            return viewed if not shape else viewed.view(*shape)
         shard_file = self._weight_map[key]
         h = self._handles.get(shard_file)
         if h is None:
@@ -71,6 +165,21 @@ class _NGramTable:
         key = self.key_base.rsplit(".", 1)[0] + "." + name  # ...ple.ple_embedding.<name>
         return self._tensor(key).clone()
 
+    def _rows(self, shard_i: int, local: torch.Tensor) -> torch.Tensor:
+        """fp8 rows ``[N, head_dim]``. Source path uses the cached mmap shard;
+        FTW indexes the uint8 file view so only the selected row bytes are copied."""
+        if self._ftw_locs is None:
+            return self._shard(shard_i).index_select(0, local)
+        file, file_off, shape, dtype, nbytes = self._ftw_locs[
+            f"{self.key_base}.shard_{shard_i}.weight"
+        ]
+        row_nbytes = int(shape[1]) * dtype.itemsize
+        table = self._ftw_u8(file)[file_off:file_off + nbytes].view(
+            int(shape[0]), row_nbytes
+        )
+        gathered = table.index_select(0, local)
+        return gathered.view(dtype).view(local.numel(), int(shape[1]))
+
     def gather(self, ids: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
         """ids [*] int64 global rows -> [*, head_dim] dequantized embeddings (CPU gather,
         returned on ids' original device)."""
@@ -81,7 +190,7 @@ class _NGramTable:
         out = torch.empty(flat.shape[0], self.head_dim, dtype=out_dtype)
         for s in torch.unique(shard_idx).tolist():
             mask = shard_idx == s
-            rows = self._shard(int(s)).index_select(0, local[mask])
+            rows = self._rows(int(s), local[mask])
             out[mask] = rows.to(out_dtype) * self.weight_scale
         return out.to(device).reshape(*ids.shape, self.head_dim)
 
@@ -148,9 +257,12 @@ class Qwen4PLELayer(BaseOP):
         assert args.model_path, "qwen4_args.model_path required for the n-gram table"
         self._table = _NGramTable(args.model_path, layer_idx, args.split_ngram_parts)
         # Checkpoint buffers (int64) -- authoritative over re-derivation from the seed.
-        self.layer_multipliers = self._table.buffer("layer_multipliers")
-        self.head_vocab_sizes = self._table.buffer("ngram_heads_vocab_sizes")
-        self.head_offsets = self._table.buffer("ngram_heads_offsets")
+        # Underscore names: BaseOP registers every non-underscore Tensor attribute as a
+        # REQUIRED state-dict entry, but these come from the n-gram table source (not
+        # iter_weights), so they must stay out of load_state_dict.
+        self._layer_multipliers = self._table.buffer("layer_multipliers")
+        self._head_vocab_sizes = self._table.buffer("ngram_heads_vocab_sizes")
+        self._head_offsets = self._table.buffer("ngram_heads_offsets")
         # Per-slot recurrent state, allocated lazily (slot count comes from the pool).
         self._tok_hist: torch.Tensor | None = None
         self._conv_tail: torch.Tensor | None = None
@@ -166,10 +278,10 @@ class Qwen4PLELayer(BaseOP):
                 slots, self.hc_count * self.hidden_size, self.state_len,
                 dtype=dtype, device=device,
             )
-            if self.layer_multipliers.device != device:
-                self.layer_multipliers = self.layer_multipliers.to(device)
-                self.head_vocab_sizes = self.head_vocab_sizes.to(device)
-                self.head_offsets = self.head_offsets.to(device)
+            if self._layer_multipliers.device != device:
+                self._layer_multipliers = self._layer_multipliers.to(device)
+                self._head_vocab_sizes = self._head_vocab_sizes.to(device)
+                self._head_offsets = self._head_offsets.to(device)
 
     def _reset_slots(self, idx: torch.Tensor):
         self._tok_hist.index_fill_(0, idx, self.eos)
@@ -186,11 +298,11 @@ class Qwen4PLELayer(BaseOP):
         for ngram in range(2, self.ngram_size + 1):
             start = (ngram - 2) * self.heads_per_ngram
             end = start + self.heads_per_ngram
-            mixed = shifted[0] * self.layer_multipliers[0]
+            mixed = shifted[0] * self._layer_multipliers[0]
             for pos in range(1, ngram):
-                mixed = torch.bitwise_xor(mixed, shifted[pos] * self.layer_multipliers[pos])
-            sizes = self.head_vocab_sizes[start:end]
-            offs = self.head_offsets[start:end]
+                mixed = torch.bitwise_xor(mixed, shifted[pos] * self._layer_multipliers[pos])
+            sizes = self._head_vocab_sizes[start:end]
+            offs = self._head_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes.view(1, 1, -1))
             blocks.append(ids + offs.view(1, 1, -1))
         ids = torch.cat(blocks, dim=-1)[:, -out_len:]  # [B, T, ngram_heads]

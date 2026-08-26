@@ -41,7 +41,11 @@ _EXPERT_RE = re.compile(
 _NGRAM_RE = re.compile(
     r"(ngram_embedding|embed_ngram|ngram_embed|ngram_table|split_ngram|"
     r"ple\.(?:embed|table|ngram|weight_part)|"
-    r"ple_embedding\.ngram)",
+    # Everything under ple_embedding.* is the n-gram module's domain: shards,
+    # weight_scale, head offsets/vocab_sizes AND layer_multipliers. The earlier
+    # narrower `ple_embedding\.ngram` silently dropped layer_multipliers (it is
+    # DENSE-classified but iter_weights skips it -> vanished from the FTW).
+    r"ple_embedding\.)",
     re.I,
 )
 _PLE_SMALL_RE = re.compile(

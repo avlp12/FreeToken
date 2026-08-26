@@ -24,6 +24,10 @@ class AttnType(str, Enum):
     # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
     # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache
     BSA = "bsa"
+    # Qwen QSA (Qwen3.8-Flash-Next / qwen4_exp): paged GQA K/V + a linear
+    # indexer-key buffer; the indexer pools 4-token blocks, top-k 512 of them,
+    # and the main GQA attends the selected tokens (+ incomplete tail).
+    QSA = "qsa"
 
     @property
     def backend_driven(self) -> bool:

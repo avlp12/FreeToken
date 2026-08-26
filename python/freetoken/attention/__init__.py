@@ -132,6 +132,24 @@ def create_m3_sparse_backend(config: ModelConfig):
     return M3SparseAttnBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa",
+    BackendInfo(
+        # FULL is declared so qwen4_exp can attach with a paged-GQA
+        # FullAttentionGroupConfig before AttnType.QSA lands on the group spec.
+        # Auto-resolve still prefers fa/fi/triton for FULL-only models; pass
+        # --attention-backend qsa. Do NOT set index_head_dim on that group
+        # (that would select BSAKVCache / page_size 128).
+        supported_types=frozenset({AttnType.QSA, AttnType.FULL}),
+        hybrid_linear_ok=True,
+    ),
+)
+def create_qsa_backend(config: ModelConfig):
+    from .qsa_sparse import QSASparseAttnBackend
+
+    return QSASparseAttnBackend(config)
+
+
 def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 
