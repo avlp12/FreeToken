@@ -49,6 +49,28 @@ class CppArgList(list[str]):
 
 
 class KernelConfig(NamedTuple):
+    """Launch config for the C++ JIT kernels (`jit/index.cu`, `jit/store.cu`).
+
+    ``use_pdl`` enables Programmatic Dependent Launch. It is False at every construction
+    site and it must STAY False until the hazard below is dealt with.
+
+    !! `__restrict__` and PDL are mutually exclusive -- llama.cpp PR #24030 !!
+    Those kernels declare their pointers `__restrict__` inside their `__grid_constant__`
+    param structs. `__restrict__` tells nvcc the pointees do not alias, which lets it hoist
+    a load across the `griddepcontrol.wait` that `device::PDL::wait<kUsePDL>()` emits -- so
+    the kernel could read the predecessor's buffer before the predecessor published it. The
+    failure mode is a silent wrong answer under specific timing, not a crash. Setting
+    ``use_pdl=True`` WITHOUT first stripping `__restrict__` from the matching param struct
+    reintroduces exactly the race #24030 had to fix.
+
+    Nor would it pay: on the DSV4 decode path `store.cu` is never reached (the DSV4 pools
+    carry their own `store_kv`) and `index.cu` is a couple of launches per token. The
+    measured PDL win on this box is in the small Triton decode kernels -- see
+    `freetoken/kernel/triton/pdl.py`, gated separately by ``FREETOKEN_PDL`` and not exposed
+    to this hazard (Triton emits its own aliasing metadata, with no `__restrict__`
+    equivalent).
+    """
+
     num_threads: int
     max_occupancy: int
     use_pdl: bool

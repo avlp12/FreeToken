@@ -35,6 +35,12 @@ from freetoken.kernel.triton.e4m3_compat import (
     e4m3_u8_to_f32,
     round_e4m3,
 )
+from freetoken.kernel.triton.pdl import (
+    LEVEL_GEMV,
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_enabled,
+)
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
@@ -64,6 +70,7 @@ def _act_quant_fp8_kernel(
     x_ptr, y_ptr, s_ptr, M, N,
     stride_xm, stride_xn, stride_ym, stride_yn, stride_sm, stride_sn,
     BLOCK_M: tl.constexpr, BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """Per-row, per-``BLOCK`` FP8 quant with ue8m0 (pow2) scale. ``s`` holds e8m0 codes."""
     pid_m = tl.program_id(0)
@@ -71,6 +78,9 @@ def _act_quant_fp8_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_n * BLOCK + tl.arange(0, BLOCK)
     m_mask = offs_m < M
+    # `x_ptr` is the activation the predecessor just wrote; the index math above is not.
+    if ENABLE_PDL:
+        gdc_wait()
     x = tl.load(
         x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xn,
         mask=m_mask[:, None], other=0.0,
@@ -90,6 +100,9 @@ def _act_quant_fp8_kernel(
     )
     code = (e + 127).to(tl.uint8)
     tl.store(s_ptr + offs_m * stride_sm + pid_n * stride_sn, code, mask=m_mask)
+    # Both `y` and the scale codes feed the GEMV that follows, so trigger after both stores.
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def act_quant_fp8(x: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
@@ -104,10 +117,11 @@ def act_quant_fp8(x: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torc
     s = torch.empty((M, K // block), dtype=torch.uint8, device=x.device)
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M), K // block)
+    pdl = pdl_enabled()
     _act_quant_fp8_kernel[grid](
         x2d, y, s, M, K,
         x2d.stride(0), x2d.stride(1), y.stride(0), y.stride(1), s.stride(0), s.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK=block,
+        BLOCK_M=BLOCK_M, BLOCK=block, ENABLE_PDL=pdl, launch_pdl=pdl,
     )
     return y, s
 
@@ -276,6 +290,7 @@ def _fp8_act_gemv_splitk_kernel(
     N, K,
     stride_ak, stride_wn, stride_wk, stride_sbn, stride_sbk, stride_pk, stride_pn,
     BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -285,6 +300,11 @@ def _fp8_act_gemv_splitk_kernel(
     k_per = K // SPLIT_K
     k_start = pid_k * k_per
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    # `a_ptr`/`sa_ptr` come from the act-quant kernel that ran immediately before; the
+    # weights and their scales do not. Barrier after the index math, before the first
+    # activation load.
+    if ENABLE_PDL:
+        gdc_wait()
     for k0 in range(0, k_per, 128):
         offs_k = k_start + k0 + tl.arange(0, 128)
         a = tl.load(a_ptr + offs_k * stride_ak).to(tl.float32)
@@ -300,17 +320,26 @@ def _fp8_act_gemv_splitk_kernel(
         sca = tl.exp2(sa_code.to(tl.float32) - 127.0)
         acc += tl.sum(w * a[None, :], axis=1) * scb * sca
     tl.store(part_ptr + pid_k * stride_pk + offs_n * stride_pn, acc, mask=n_mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 @triton.jit
 def _splitk_reduce_kernel(part_ptr, out_ptr, N, SPLIT_K: tl.constexpr,
-                          stride_pk, stride_pn, BLOCK: tl.constexpr, OUT: tl.constexpr):
+                          stride_pk, stride_pn, BLOCK: tl.constexpr, OUT: tl.constexpr,
+                          ENABLE_PDL: tl.constexpr = False):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # `part_ptr` is written by the GEMV that ran immediately before us, so the barrier goes
+    # after the offset math and before the first partial load.
+    if ENABLE_PDL:
+        gdc_wait()
     for k in tl.static_range(SPLIT_K):
         acc += tl.load(part_ptr + k * stride_pk + offs * stride_pn, mask=mask, other=0.0)
     tl.store(out_ptr + offs, acc.to(OUT), mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 # ======================================================================================
@@ -362,6 +391,7 @@ def _fp8_fused_gemv_kernel(
     GROUP_ROWS: tl.constexpr,   # output rows fed by one activation row (N when G == 1)
     BLOCK_N: tl.constexpr, SPLIT_K: tl.constexpr,
     OUT: tl.constexpr, EPILOGUE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -375,6 +405,14 @@ def _fp8_fused_gemv_kernel(
     k_per = K // SPLIT_K
     k_start = pid_k * k_per
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    # PDL barrier. Everything above is address arithmetic over pointers the predecessor
+    # never writes (weights, scales, the activation *base*), so it is safe to run while
+    # the predecessor is still draining -- that overlap is the whole point. `x_ptr` IS
+    # predecessor-produced, and the first read of it is the `tl.load(xg + ...)` at the top
+    # of the k-loop, so the barrier goes here: after the math, before the first data read.
+    # It is outside the loop because `griddepcontrol.wait` only needs to be crossed once.
+    if ENABLE_PDL:
+        gdc_wait()
     for k0 in range(0, k_per, 128):
         offs_k = k_start + k0 + tl.arange(0, 128)
         # --- fused act_quant, bit-identical to _act_quant_fp8_kernel ---
@@ -415,6 +453,15 @@ def _fp8_fused_gemv_kernel(
                 tot += tl.load(o_ptr + k * stride_ok + offs_n * stride_on,
                                mask=n_mask, other=0.0, cache_modifier=".cg")
             tl.store(out_ptr + offs_n, tot.to(OUT), mask=n_mask)
+    # Trigger AFTER the last store on every epilogue path, including the _EP_LOCK reducer's
+    # store to `out_ptr` -- that is the value a successor consumes. The `if arrivals ==`
+    # branch has rejoined by here, so every program reaches this trigger (a block that
+    # skipped it would silently demote the whole grid's launch-completion event to plain
+    # grid completion). Non-reducing programs trigger right after their partial store,
+    # which is harmless: the dependent's `gdc_wait` clears only once ALL blocks have
+    # triggered, and the reducer's trigger is necessarily last.
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 # Swept-best FUSED decode GEMV config per (N, K) -> (BLOCK_N, SPLIT_K, num_warps,
@@ -513,18 +560,21 @@ def fused_fp8_gemv(
                 ep, lock = _EP_PART, out
         o = torch.empty((split_k, N), dtype=torch.float32, device=x.device)
         stride_ok, stride_on = o.stride(0), o.stride(1)
+    pdl = pdl_enabled(LEVEL_GEMV)   # projection GEMV: level 2, it regresses at level 1 shapes
+    pdl_reduce = pdl_enabled()      # the reduce is a light kernel and wins on its own
     _fp8_fused_gemv_kernel[(n_tiles, split_k)](
         x2, weight, sb, o, out, lock, N, K,
         x2.stride(0), x2.stride(1), weight.stride(0), weight.stride(1),
         sb.stride(0), sb.stride(1), stride_ok, stride_on,
         GROUP_ROWS=gr, BLOCK_N=BLOCK_N, SPLIT_K=split_k,
-        OUT=_TL_DTYPE[out_dtype], EPILOGUE=ep,
+        OUT=_TL_DTYPE[out_dtype], EPILOGUE=ep, ENABLE_PDL=pdl, launch_pdl=pdl,
         num_warps=num_warps, num_stages=num_stages,
     )
     if ep == _EP_PART:
         _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
             o, out, N, split_k, o.stride(0), o.stride(1),
-            BLOCK=256, OUT=_TL_DTYPE[out_dtype], num_warps=2,
+            BLOCK=256, OUT=_TL_DTYPE[out_dtype],
+            ENABLE_PDL=pdl_reduce, launch_pdl=pdl_reduce, num_warps=2,
         )
     return out
 
@@ -599,16 +649,20 @@ def _fp8_act_gemv(a_fp8: torch.Tensor, sa: torch.Tensor, weight: torch.Tensor,
     BLOCK_N, split_k, num_warps = _decode_cfg(N, K)
     n_tiles = triton.cdiv(N, BLOCK_N)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a_fp8.device)
+    pdl = pdl_enabled(LEVEL_GEMV)
+    pdl_reduce = pdl_enabled()
     _fp8_act_gemv_splitk_kernel[(n_tiles, split_k)](
         a_fp8, sa, weight, sb, part, N, K,
         a_fp8.stride(0), weight.stride(0), weight.stride(1),
         sb.stride(0), sb.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, SPLIT_K=split_k, num_warps=num_warps,
+        BLOCK_N=BLOCK_N, SPLIT_K=split_k, ENABLE_PDL=pdl, launch_pdl=pdl,
+        num_warps=num_warps,
     )
     out = torch.empty(N, dtype=out_dtype, device=a_fp8.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](
         part, out, N, split_k, part.stride(0), part.stride(1),
-        BLOCK=256, OUT=_TL_DTYPE[out_dtype], num_warps=2,
+        BLOCK=256, OUT=_TL_DTYPE[out_dtype],
+        ENABLE_PDL=pdl_reduce, launch_pdl=pdl_reduce, num_warps=2,
     )
     return out
 

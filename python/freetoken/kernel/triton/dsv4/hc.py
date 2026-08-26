@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 
@@ -22,16 +24,23 @@ def _hc_pre_combine_kernel(
     x_ptr, pre_ptr, y_ptr, M, D,
     stride_xm, stride_xh, stride_pm, stride_ym,
     HC: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     m = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < D
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # x_ptr/pre_ptr are the previous hc_post_combine's outputs; the first load of either
+    # is inside the h-loop, so the barrier goes once before it, after all index math.
+    if ENABLE_PDL:
+        gdc_wait()
     for h in tl.static_range(HC):
         xh = tl.load(x_ptr + m * stride_xm + h * stride_xh + offs, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(pre_ptr + m * stride_pm + h).to(tl.float32)
         acc += p * xh
     tl.store(y_ptr + m * stride_ym + offs, acc.to(OUT), mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 @triton.jit
@@ -39,10 +48,15 @@ def _hc_post_combine_kernel(
     a_ptr, res_ptr, post_ptr, comb_ptr, y_ptr, M, D,
     stride_am, stride_rm, stride_rh, stride_pm, stride_cm, stride_ym, stride_yh,
     HC: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     m = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < D
+    # a_ptr is the sublayer output the predecessor just wrote -- it is the first load in
+    # the kernel, so the barrier goes right before it, after the index math above.
+    if ENABLE_PDL:
+        gdc_wait()
     a = tl.load(a_ptr + m * stride_am + offs, mask=mask, other=0.0).to(tl.float32)
     # y[q,d] = post[q]*a[d] + sum_p comb[p,q]*res[p,d]  (reduction over comb's first axis)
     for q in tl.static_range(HC):
@@ -52,6 +66,8 @@ def _hc_post_combine_kernel(
             r = tl.load(res_ptr + m * stride_rm + p * stride_rh + offs, mask=mask, other=0.0).to(tl.float32)
             acc += c * r
         tl.store(y_ptr + m * stride_ym + q * stride_yh + offs, acc.to(OUT), mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def hc_pre_combine(x: torch.Tensor, pre: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -62,9 +78,10 @@ def hc_pre_combine(x: torch.Tensor, pre: torch.Tensor, out_dtype: torch.dtype) -
     y = torch.empty((M, D), dtype=out_dtype, device=x.device)
     BLOCK = 1024
     grid = (M, triton.cdiv(D, BLOCK))
+    pdl = pdl_enabled()
     _hc_pre_combine_kernel[grid](
         x, pre, y, M, D, x.stride(0), x.stride(1), pre.stride(0), y.stride(0),
-        HC=HC, BLOCK=BLOCK, OUT=_TL[out_dtype], num_warps=4,
+        HC=HC, BLOCK=BLOCK, OUT=_TL[out_dtype], ENABLE_PDL=pdl, launch_pdl=pdl, num_warps=4,
     )
     return y
 
@@ -82,11 +99,12 @@ def hc_post_combine(a: torch.Tensor, residual: torch.Tensor, post: torch.Tensor,
     y = torch.empty((M, HC, D), dtype=out_dtype, device=a.device)
     BLOCK = 1024
     grid = (M, triton.cdiv(D, BLOCK))
+    pdl = pdl_enabled()
     _hc_post_combine_kernel[grid](
         a, residual, post, comb, y, M, D,
         a.stride(0), residual.stride(0), residual.stride(1), post.stride(0), comb.stride(0),
         y.stride(0), y.stride(1),
-        HC=HC, BLOCK=BLOCK, OUT=_TL[out_dtype], num_warps=4,
+        HC=HC, BLOCK=BLOCK, OUT=_TL[out_dtype], ENABLE_PDL=pdl, launch_pdl=pdl, num_warps=4,
     )
     return y
 

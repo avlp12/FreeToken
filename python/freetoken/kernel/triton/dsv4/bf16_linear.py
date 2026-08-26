@@ -18,18 +18,26 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 
 @triton.jit
 def _bf16_gemv_fp32_kernel(
     x_ptr, w_ptr, out_ptr, N, K,
     stride_wn, stride_wk,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     w_row = w_ptr + offs_n[:, None] * stride_wn
     acc = tl.zeros((BLOCK_N,), tl.float32)
+    # `w_ptr` is a model weight (never written on the decode path), but `x_ptr` is the
+    # activation the predecessor just produced and the loop interleaves the two loads.
+    # Barrier here: after the row-pointer math, before the loop's first load.
+    if ENABLE_PDL:
+        gdc_wait()
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
@@ -38,6 +46,8 @@ def _bf16_gemv_fp32_kernel(
         xk = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         acc += tl.sum(w * xk[None, :], axis=1)
     tl.store(out_ptr + offs_n, acc, mask=n_mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -59,10 +69,15 @@ def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # BLOCK_K covering all of K avoids a K-loop. Tuned on H100 (~2 TB/s at N=1024).
     BLOCK_N = 2
     BLOCK_K = min(triton.next_power_of_2(K), 4096)
+    # LIGHT tier, not GEMV: this kernel only runs at M==1 and only for the small decode
+    # GEMVs (MoE router 256xD, compressor wkv/wgate), where PDL measured -9.0% at N=1024
+    # and -4.1% at N=4096. The regression that keeps the FP8 projections at LEVEL_GEMV is
+    # specific to their 2k-CTA shipped configs, and does not apply here.
+    pdl = pdl_enabled()
     _bf16_gemv_fp32_kernel[(triton.cdiv(N, BLOCK_N),)](
         x1, weight, out, N, K,
         weight.stride(0), weight.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, ENABLE_PDL=pdl, launch_pdl=pdl, num_warps=4,
     )
     return out.reshape(*lead, N)
 

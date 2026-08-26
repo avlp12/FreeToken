@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 
@@ -20,18 +22,27 @@ def _rmsnorm_kernel(
     x_ptr, w_ptr, out_ptr, M, D, eps,
     stride_xm, stride_om,
     BLOCK_D: tl.constexpr, HAS_W: tl.constexpr, compute_type: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     if row >= M:
         return
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
+    # The launcher below uses grid exactly (M,), so the guard above never fires and every
+    # program reaches the trigger at the end -- which is what the launch-completion event
+    # needs. (A block returning early would not break correctness; it would only demote the
+    # event to plain grid completion and forfeit the overlap.)
+    if ENABLE_PDL:
+        gdc_wait()
     x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / D
     y = x * tl.rsqrt(var + eps)
     if HAS_W:
         y = y * tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + row * stride_om + offs, y.to(compute_type), mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
@@ -43,24 +54,30 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     out = torch.empty_like(x2d, dtype=out_dtype)
     BLOCK_D = triton.next_power_of_2(D)
     num_warps = 4 if BLOCK_D <= 1024 else (8 if BLOCK_D <= 4096 else 16)
+    pdl = pdl_enabled()
     _rmsnorm_kernel[(M,)](
         x2d, weight, out, M, D, eps,
         x2d.stride(0), out.stride(0),
         BLOCK_D=BLOCK_D, HAS_W=weight is not None,
-        compute_type=_TL[out_dtype], num_warps=num_warps,
+        compute_type=_TL[out_dtype], ENABLE_PDL=pdl, launch_pdl=pdl, num_warps=num_warps,
     )
     return out.reshape(x.shape)
 
 
 @triton.jit
-def _inv_rms_kernel(x_ptr, o_ptr, D, eps, stride_xm, BLOCK_D: tl.constexpr):
+def _inv_rms_kernel(x_ptr, o_ptr, D, eps, stride_xm, BLOCK_D: tl.constexpr,
+                    ENABLE_PDL: tl.constexpr = False):
     row = tl.program_id(0)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    if ENABLE_PDL:
+        gdc_wait()
     for off in range(0, D, BLOCK_D):
         offs = off + tl.arange(0, BLOCK_D)
         v = tl.load(x_ptr + row * stride_xm + offs, mask=offs < D, other=0.0).to(tl.float32)
         acc += v * v
     tl.store(o_ptr + row, tl.rsqrt(tl.sum(acc, axis=0) / D + eps))
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def inv_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -89,9 +106,11 @@ def inv_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
     D = x.shape[-1]
     x2d = x.reshape(-1, D)
     out = torch.empty(x2d.shape[0], dtype=torch.float32, device=x.device)
+    pdl = pdl_enabled()
     _inv_rms_kernel[(x2d.shape[0],)](
         x2d, out, D, eps, x2d.stride(0),
-        BLOCK_D=min(2048, triton.next_power_of_2(D)), num_warps=8,
+        BLOCK_D=min(2048, triton.next_power_of_2(D)), ENABLE_PDL=pdl, launch_pdl=pdl,
+        num_warps=8,
     )
     return out.view(*x.shape[:-1], 1)
 

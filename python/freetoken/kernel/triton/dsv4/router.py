@@ -47,6 +47,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 
 def unfused_router() -> bool:
     """``FREETOKEN_UNFUSED_ROUTER=1`` -> take the pre-fusion torch chain.
@@ -100,12 +102,18 @@ def _router_kernel(
     RENORM: tl.constexpr,
     WANT_I32: tl.constexpr,
     WANT_SEL: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     m = tl.program_id(0)
     pos = tl.arange(0, TK)
     out_off = m * TOPK + pos
     out_mask = pos < TOPK
 
+    # scores_ptr is the router GEMV output the predecessor just wrote; it is the first
+    # predecessor-produced load in both the HASH and dense branches below (bias_ptr/
+    # tid_ptr/ids_ptr are constant tables). One barrier covers both branches.
+    if ENABLE_PDL:
+        gdc_wait()
     if HASH:
         # Hash routing: the expert set is a pure function of the token id, so no
         # scoring pass -- just the table row, then the gathered scores.
@@ -178,6 +186,8 @@ def _router_kernel(
         tl.store(i32_ptr + out_off, idx.to(tl.int32), mask=out_mask)
     if WANT_SEL:
         tl.store(sel_ptr + out_off, sel, mask=out_mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def fused_router(
@@ -217,6 +227,7 @@ def fused_router(
     idx32 = torch.empty((M, top_k), dtype=torch.int32, device=dev) if want_int32 else weights
     sel = torch.empty((M, top_k), dtype=torch.float32, device=dev) if want_sel else weights
 
+    pdl = pdl_enabled()
     _router_kernel[(M,)](
         scores,
         bias if bias is not None else scores,
@@ -233,6 +244,7 @@ def fused_router(
         RENORM=renormalize,
         WANT_I32=want_int32,
         WANT_SEL=want_sel,
+        ENABLE_PDL=pdl, launch_pdl=pdl,
         num_warps=4,
     )
     return (

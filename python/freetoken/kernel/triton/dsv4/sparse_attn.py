@@ -39,6 +39,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 BLOCK_H = 16
 # The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
 # a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
@@ -221,6 +223,7 @@ def _sparse_attn_splitk_merge_kernel(
     stride_ob, stride_om, stride_oh, stride_od,
     D: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """Stage 2: log-sum-exp merge over the splits. The attention sink joins here (once, as a
     null key with logit ``attn_sink[h]`` and zero value) exactly as v1 applies it at the end.
@@ -243,6 +246,11 @@ def _sparse_attn_splitk_merge_kernel(
     )
     lse_base = mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm + pid_h * stride_lh
 
+    # mid_o_ptr/mid_lse_ptr are the split-K partials the stage-1 kernel just wrote; the
+    # first load of either is inside the split loop, so one barrier goes before it.
+    # sink_ptr (a constant weight) and mid_base/lse_base (pure address math) are above.
+    if ENABLE_PDL:
+        gdc_wait()
     for split_id in tl.range(0, NUM_SPLITS, num_stages=2):
         partial = tl.load(mid_base + split_id * stride_ms)
         lse = tl.load(lse_base + split_id * stride_ls)
@@ -259,6 +267,8 @@ def _sparse_attn_splitk_merge_kernel(
         + offs_d * stride_od
     )
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty))
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def split_count(b: int, m: int, h: int, topk: int, device) -> int:
@@ -378,6 +388,7 @@ def _sparse_attn_paged_splitk(
         num_warps=8,
         num_stages=2,
     )
+    pdl = pdl_enabled()
     _sparse_attn_splitk_merge_kernel[(m, b, h)](
         mid_o, mid_lse, o, sink,
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
@@ -385,6 +396,7 @@ def _sparse_attn_paged_splitk(
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         D=d,
         NUM_SPLITS=n_splits,
+        ENABLE_PDL=pdl, launch_pdl=pdl,
         num_warps=4,
     )
     return o

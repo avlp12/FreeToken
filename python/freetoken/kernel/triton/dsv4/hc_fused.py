@@ -75,6 +75,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 # One token per program in the split-K body, so the whole 1.5 MB of ``hc_fn`` is read
@@ -121,6 +123,7 @@ def _hc_stage_kernel(
     BLK_K: tl.constexpr, BLK_Y: tl.constexpr, ITERS: tl.constexpr,
     HAS_POST: tl.constexpr, HAS_W: tl.constexpr, SINKHORN: tl.constexpr,
     OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     k = tl.program_id(0)
     tok = tl.program_id(1)
@@ -131,6 +134,11 @@ def _hc_stage_kernel(
 
     acc = tl.zeros((MIXP,), dtype=tl.float32)
     sq = tl.zeros((), dtype=tl.float32)
+    # x_ptr (or, under HAS_POST, a_ptr/res_ptr/ipost_ptr/icomb_ptr) is the residual stream
+    # written by the previous hyper-connection site; fn_ptr is a constant mixing weight
+    # loaded in the same loop, so one barrier before the loop covers both.
+    if ENABLE_PDL:
+        gdc_wait()
     for off in range(0, chunk, BLK_K):
         f = start + off + tl.arange(0, BLK_K)
         if HAS_POST:
@@ -224,6 +232,13 @@ def _hc_stage_kernel(
             y = y * tl.rsqrt(tl.sum(y * y, axis=0) / D + norm_eps)
             y = y * tl.load(nw_ptr + dof, mask=dmask, other=0.0).to(tl.float32)
         tl.store(out_ptr + tok * s_om + dof, y.to(OUT), mask=dmask)
+    # Every program reaches here -- the `if last` branch above fully rejoins, exactly like
+    # fp8_linear.py's _EP_LOCK epilogue. Only the last-arriving program's stores are what a
+    # successor actually reads, but triggering from the losers too is harmless: the
+    # successor's gdc_wait() only clears once EVERY program of this grid has triggered (or
+    # retired), so the effective release is still gated by the winner's store above.
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 @functools.lru_cache(maxsize=None)
@@ -298,6 +313,7 @@ def _launch(
         xo = torch.empty(tokens, hc_dim, dtype=out_dtype, device=device)
         x = xo
 
+    pdl = pdl_enabled()
     _hc_stage_kernel[(splitk, tokens)](
         x, a, res, ipost, icomb,
         hc_fn, hc_scale, hc_base, norm_weight if norm_weight is not None else out,
@@ -310,7 +326,7 @@ def _launch(
         HC=hc_mult, MIXN=mixn, MIXP=mixp, SPLITK=splitk,
         BLK_K=BLOCK_K, BLK_Y=triton.next_power_of_2(dim), ITERS=sinkhorn_iters,
         HAS_POST=pending is not None, HAS_W=norm_weight is not None, SINKHORN=sinkhorn,
-        OUT=_TL[out_dtype],
+        OUT=_TL[out_dtype], ENABLE_PDL=pdl, launch_pdl=pdl,
         num_warps=NUM_WARPS, num_stages=NUM_STAGES,
     )
     return xo, out, post, comb

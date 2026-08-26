@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 
 @triton.jit
 def _rope_decode_kernel(
@@ -29,6 +31,7 @@ def _rope_decode_kernel(
     IS_3D: tl.constexpr,
     HAS_POS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid_batch = tl.program_id(0)
     pid_head = tl.program_id(1)
@@ -46,6 +49,10 @@ def _rope_decode_kernel(
 
     offs_real = base + offs_pair * 2 * stride_x_dim
     offs_imag = base + (offs_pair * 2 + 1) * stride_x_dim
+    # x_ptr is the q/k/v projection output the predecessor just wrote; freq_row above is
+    # either a position-table gather (not predecessor-produced) or the program id itself.
+    if ENABLE_PDL:
+        gdc_wait()
     x_real = tl.load(x_ptr + offs_real, mask=mask, other=0.0).to(tl.float32)
     x_imag = tl.load(x_ptr + offs_imag, mask=mask, other=0.0).to(tl.float32)
 
@@ -63,6 +70,8 @@ def _rope_decode_kernel(
 
     tl.store(x_ptr + offs_real, out_real, mask=mask)
     tl.store(x_ptr + offs_imag, out_imag, mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def rope_decode_inplace(
@@ -101,13 +110,14 @@ def rope_decode_inplace(
     # (gathered [B, rd] row or the full [max_seq, rd] table), so contiguous() is free.
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     grid = (B, H, triton.cdiv(rope_dim // 2, 128))
+    pdl = pdl_enabled()
     _rope_decode_kernel[grid](
         xv, freqs_real, positions if positions is not None else freqs_real,
         rope_dim,
         xv.stride(0), xv.stride(1) if is_3d else 0, xv.stride(-1),
         freqs_real.stride(0), freqs_real.stride(1),
         IS_INVERSE=inverse, IS_3D=is_3d, HAS_POS=positions is not None,
-        BLOCK_SIZE=128,
+        BLOCK_SIZE=128, ENABLE_PDL=pdl, launch_pdl=pdl,
     )
     return x
 

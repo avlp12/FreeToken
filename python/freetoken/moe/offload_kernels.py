@@ -9,6 +9,8 @@ import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
@@ -102,6 +104,7 @@ def protect_slots(cache, slots: torch.Tensor, count: torch.Tensor | None = None)
     them for free.
     """
     n = slots.numel()
+    pdl = pdl_enabled()
     _protect_slots_kernel[(1,)](
         cache.usage,
         slots.reshape(-1),
@@ -110,20 +113,29 @@ def protect_slots(cache, slots: torch.Tensor, count: torch.Tensor | None = None)
         count if count is not None else cache.step,  # unused when HAS_COUNT is False
         HAS_COUNT=count is not None,
         BLOCK=triton.next_power_of_2(max(n, 1)),
+        ENABLE_PDL=pdl, launch_pdl=pdl,
     )
 
 
 @triton.jit
 def _protect_slots_kernel(
-    usage_ptr, slots_ptr, step_ptr, n, count_ptr, HAS_COUNT: tl.constexpr, BLOCK: tl.constexpr
+    usage_ptr, slots_ptr, step_ptr, n, count_ptr, HAS_COUNT: tl.constexpr, BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     off = tl.arange(0, BLOCK)
     lane = off < n
+    # slots_ptr (and, when HAS_COUNT, count_ptr) are the miss-plan outputs the caller's
+    # ensure_experts/prefetch rewrite just wrote (the rewritten slot ids / live count);
+    # `off`/`lane` above are pure index math.
+    if ENABLE_PDL:
+        gdc_wait()
     if HAS_COUNT:
         lane = lane & (off < tl.load(count_ptr))
     s = tl.load(slots_ptr + off, mask=lane, other=-1)
     step = tl.load(step_ptr) + 1
     tl.store(usage_ptr + s, step, mask=lane & (s >= 0))
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def ensure_experts_hybrid(

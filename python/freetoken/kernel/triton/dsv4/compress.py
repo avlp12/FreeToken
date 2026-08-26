@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 
@@ -24,6 +26,7 @@ def _gated_pool_kernel(
     stride_sb, stride_sr, stride_sd,
     stride_ob, stride_od,
     BLOCK_D: tl.constexpr, OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     b = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -31,6 +34,10 @@ def _gated_pool_kernel(
     kv_base = kv_ptr + b * stride_kb + offs * stride_kd
     sc_base = score_ptr + b * stride_sb + offs * stride_sd
     maxv = tl.full((BLOCK_D,), float("-inf"), tl.float32)
+    # `score` is produced by the gate projection immediately before; `kv` by the compressor
+    # write ahead of that. Barrier after both base pointers are formed.
+    if ENABLE_PDL:
+        gdc_wait()
     for r in range(R):
         s = tl.load(sc_base + r * stride_sr, mask=mask, other=float("-inf")).to(tl.float32)
         maxv = tl.maximum(maxv, s)
@@ -43,6 +50,8 @@ def _gated_pool_kernel(
         k = tl.load(kv_base + r * stride_kr, mask=mask, other=0.0).to(tl.float32)
         acc += w * k
     tl.store(out_ptr + b * stride_ob + offs * stride_od, (acc / denom).to(OUT), mask=mask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def gated_pool(kv: torch.Tensor, score: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -54,12 +63,13 @@ def gated_pool(kv: torch.Tensor, score: torch.Tensor, out_dtype: torch.dtype) ->
     out = torch.empty((B, D), dtype=out_dtype, device=kv.device)
     BLOCK_D = 256
     grid = (B, triton.cdiv(D, BLOCK_D))
+    pdl = pdl_enabled()
     _gated_pool_kernel[grid](
         kv, score, out, R, D,
         kv.stride(0), kv.stride(1), kv.stride(2),
         score.stride(0), score.stride(1), score.stride(2),
         out.stride(0), out.stride(1),
-        BLOCK_D=BLOCK_D, OUT=_TL[out_dtype], num_warps=4,
+        BLOCK_D=BLOCK_D, OUT=_TL[out_dtype], ENABLE_PDL=pdl, launch_pdl=pdl, num_warps=4,
     )
     return out.unsqueeze(1)
 

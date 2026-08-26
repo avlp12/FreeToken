@@ -37,6 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.pdl import gdc_launch_dependents, gdc_wait, pdl_enabled
+
 from .norm import _TL
 
 
@@ -56,16 +58,23 @@ def _rmsnorm_rope_kernel(
     HAS_W: tl.constexpr,
     IS_INVERSE: tl.constexpr,
     compute_type: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     if row >= M:
         return
+    # rms_norm_rope_decode's launcher below uses grid exactly (M,), so this guard never
+    # fires -- every program reaches the trigger at the end.
     # Rows are (batch, head) in row-major order, and RoPE frequencies are per
     # BATCH row -- every head of a token shares its position.
     batch = row // HEADS
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
+    # x_ptr is the q/kv/compressor projection output the predecessor just wrote; it is
+    # the first data load in the kernel, so the barrier goes right before it.
+    if ENABLE_PDL:
+        gdc_wait()
     x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
     # Same expression, BLOCK_D and num_warps as `_rmsnorm_kernel`, hence the same
     # reduction tree -- this is a Triton-to-Triton identity, not an ATen one.
@@ -110,6 +119,8 @@ def _rmsnorm_rope_kernel(
         out_im = yr * f_im + yi * f_re
     tl.store(out_ptr + row * stride_om + o_re, out_re.to(compute_type), mask=pmask)
     tl.store(out_ptr + row * stride_om + o_im, out_im.to(compute_type), mask=pmask)
+    if ENABLE_PDL:
+        gdc_launch_dependents()
 
 
 def rms_norm_rope_decode(
@@ -154,6 +165,7 @@ def rms_norm_rope_decode(
     # num_warps must match norm.rms_norm: it is what fixes the reduction tree, and
     # the reduction tree is what makes this bit-identical rather than merely close.
     num_warps = 4 if BLOCK_D <= 1024 else (8 if BLOCK_D <= 4096 else 16)
+    pdl = pdl_enabled()
     _rmsnorm_rope_kernel[(M,)](
         x2d, weight, out, freqs_real, positions,
         M, D, rope_dim, heads, eps,
@@ -164,6 +176,7 @@ def rms_norm_rope_decode(
         HAS_W=weight is not None,
         IS_INVERSE=inverse,
         compute_type=_TL[out_dtype],
+        ENABLE_PDL=pdl, launch_pdl=pdl,
         num_warps=num_warps,
     )
     return out.reshape(x.shape)
