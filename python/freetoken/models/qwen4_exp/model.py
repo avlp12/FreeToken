@@ -122,5 +122,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
 
+    def precompute_ngram_embed(self, batch) -> None:
+        """Run every PLE layer's host-mmap n-gram gather eagerly, before ``forward()``
+        may be dispatched through a captured CUDA graph. See
+        ``Qwen4PLELayer.precompute_decode_ngram`` for why this must happen outside
+        graph capture. Called by the engine for every decode step (captured or
+        eager) -- a no-op if this checkpoint has no PLE layers."""
+        for layer in self.model.layers.op_list:
+            if layer.ple is not None:
+                layer.ple.precompute_decode_ngram(batch)
+
 
 __all__ = ["Qwen4ExpForCausalLM"]

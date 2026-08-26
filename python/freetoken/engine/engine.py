@@ -1671,6 +1671,17 @@ class Engine:
             _t0.record(self.stream)
         with profile_ctx as prof:
             with self.ctx.forward_batch(batch):
+                if _dec:
+                    # Qwen4-Exp only: the PLE n-gram embedding is a host-mmap table
+                    # gather (CPU sync + data-dependent shard loop + unpinned H2D),
+                    # which is illegal to record inside a captured CUDA graph. Run it
+                    # here, eagerly, before any graph replay touches this batch, and
+                    # park the result in a stable-address per-slot buffer that the
+                    # (possibly captured) decode forward reads with a plain device
+                    # index_select. No-op for models without PLE layers (e.g. DSV4).
+                    precompute_ngram = getattr(self.model, "precompute_ngram_embed", None)
+                    if precompute_ngram is not None:
+                        precompute_ngram(batch)
                 if self.graph_runner.can_use_spec_cuda_graph(batch):
                     logits = self.graph_runner.replay_spec(batch)
                     target_features = self.graph_runner.dspark_spec_target_features(batch)

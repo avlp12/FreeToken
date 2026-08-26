@@ -266,6 +266,10 @@ class Qwen4PLELayer(BaseOP):
         # Per-slot recurrent state, allocated lazily (slot count comes from the pool).
         self._tok_hist: torch.Tensor | None = None
         self._conv_tail: torch.Tensor | None = None
+        # Per-slot n-gram embedding, filled by ``precompute_decode_ngram`` (eager,
+        # pre-graph) and read by the (possibly captured) decode forward. Stable
+        # address across replays -- see precompute_decode_ngram's docstring.
+        self._ngram_embed_buf: torch.Tensor | None = None
 
     # ---------- state pool ----------
 
@@ -278,6 +282,9 @@ class Qwen4PLELayer(BaseOP):
                 slots, self.hc_count * self.hidden_size, self.state_len,
                 dtype=dtype, device=device,
             )
+            self._ngram_embed_buf = torch.zeros(
+                slots, self.ple_embed_dim, dtype=dtype, device=device,
+            )
             if self._layer_multipliers.device != device:
                 self._layer_multipliers = self._layer_multipliers.to(device)
                 self._head_vocab_sizes = self._head_vocab_sizes.to(device)
@@ -286,6 +293,7 @@ class Qwen4PLELayer(BaseOP):
     def _reset_slots(self, idx: torch.Tensor):
         self._tok_hist.index_fill_(0, idx, self.eos)
         self._conv_tail.index_fill_(0, idx, 0.0)
+        self._ngram_embed_buf.index_fill_(0, idx, 0.0)
 
     # ---------- n-gram hashing ----------
 
@@ -308,6 +316,65 @@ class Qwen4PLELayer(BaseOP):
         ids = torch.cat(blocks, dim=-1)[:, -out_len:]  # [B, T, ngram_heads]
         emb = self._table.gather(ids, dtype)  # [B, T, heads, head_dim]
         return emb.flatten(-2)
+
+    # ---------- CUDA-graph hoist: eager pre-replay n-gram gather ----------
+
+    def precompute_decode_ngram(self, batch) -> None:
+        """Eagerly compute this decode step's n-gram embedding and advance the
+        per-slot token-history state, BEFORE any CUDA-graph replay touches this
+        layer. Called once per decode step by the engine, for both the captured and
+        the eager decode path (see ``engine.forward_batch`` / ``Qwen4ExpForCausalLM.
+        precompute_ngram_embed``).
+
+        Why this cannot live inside the captured decode forward: ``_NGramTable.
+        gather()`` syncs device->host (``.cpu()``), loops over a data-dependent set
+        of shard ids (``torch.unique(...).tolist()``), and copies back with an
+        unpinned H2D -- all three are illegal during CUDA graph capture (the first
+        raises "Cannot copy between CPU and CUDA tensors during CUDA graph capture
+        unless the CPU tensor is pinned").
+
+        Pinning the staging buffer does NOT fix this. A CUDA graph replays only the
+        GPU ops it recorded; host-side Python does not re-execute on replay. A
+        captured host-side gather would run once at capture time and every replay
+        after would silently reuse that one stale embedding -- wrong output, no
+        error, the worst failure mode here.
+
+        The PLE embedding is a pure function of recent token ids (see
+        ``_shift_right_ignore_eos``: only ``token_ids`` and ``eos`` feed the hash;
+        the multipliers / offsets / vocab sizes are constant checkpoint buffers), so
+        it can be computed here, outside the graph, and hoisted into a stable-address
+        per-slot buffer -- exactly the pattern this module already uses for
+        ``_tok_hist`` / ``_conv_tail`` recurrent state (mirrors the GDN conv-state
+        pattern this codebase captures today). The captured decode branch then only
+        does a device-side ``index_select`` against ``_ngram_embed_buf``, which is
+        capture-safe: a dynamic index driven by a device tensor needs no host sync,
+        only the *value* of ``idx`` may vary between replays, not the traced op.
+
+        Decode needs history: with ``ngram_size=3`` the hash at step *t* needs
+        tokens *t-2, t-1, t*, but only the newest token is fed to the model at
+        decode. ``_tok_hist[idx]`` carries the previous ``context_len`` (=2) ids per
+        slot from the last step; this reads it (old state) before overwriting it
+        with the new tail, same order as the pre-hoist decode forward used.
+        """
+        ctx = get_global_ctx()
+        pool = ctx.linear_state_pool
+        fla = batch.fla_metadata
+        if fla is None:
+            from freetoken.attention.linear import build_fla_metadata
+
+            fla = build_fla_metadata(batch, batch.input_ids.device)
+            batch.fla_metadata = fla
+        li = pool.local_index(self.layer_idx)
+        slots = pool.conv_states[li].shape[0]
+        self._ensure_state(slots, batch.input_ids.device, self.key_proj.weight.dtype)
+
+        idx = fla.cache_indices
+        idx64 = idx.long()
+        input_ids = batch.input_ids.to(torch.long)
+        hist = torch.cat([self._tok_hist[idx], input_ids.view(-1, 1)], dim=-1)  # [B, context_len+1]
+        emb = self._ngram_embed(hist, 1, self._ngram_embed_buf.dtype)[:, 0]  # [B, ple_embed_dim]
+        self._ngram_embed_buf.index_copy_(0, idx64, emb)
+        self._tok_hist.index_copy_(0, idx64, hist[:, 1:])
 
     # ---------- PLE core (matches the reference forward) ----------
 
@@ -344,12 +411,17 @@ class Qwen4PLELayer(BaseOP):
         slots = pool.conv_states[li].shape[0]
         self._ensure_state(slots, x4.device, x4.dtype)
 
-        input_ids = batch.input_ids.to(torch.long)
-
         if batch.is_decode:
+            # The n-gram embedding for this step was already computed and parked in
+            # _ngram_embed_buf by precompute_decode_ngram, which the engine runs
+            # eagerly before any CUDA-graph replay reaches this forward (host-mmap
+            # table gather is illegal inside a captured graph -- see that method's
+            # docstring). This index_select is a plain device-tensor gather:
+            # capture-safe, no host sync, mirrors the existing _tok_hist/_conv_tail
+            # per-slot state reads directly below.
             idx = fla.cache_indices  # [B] slot per row
-            hist = torch.cat([self._tok_hist[idx], input_ids.view(-1, 1)], dim=-1)  # [B, 3]
-            emb = self._ngram_embed(hist, 1, x4.dtype)[:, 0]  # [B, ple_embed_dim]
+            idx64 = idx.long()
+            emb = self._ngram_embed_buf.index_select(0, idx64)  # [B, ple_embed_dim]
             gated = self._ple_core(x4, emb)  # [B, hc*H]
             normed = grouped_rms_norm(gated, self.norm_conv.weight, self.hidden_size, self.eps)
             # dilated causal conv, single step: taps at t-9, t-6, t-3, t (K=4, d=3)
@@ -363,15 +435,16 @@ class Qwen4PLELayer(BaseOP):
             new_tail = torch.cat([tail[:, :, 1:], normed.unsqueeze(-1).to(tail.dtype)], dim=-1)
             # index_copy_ requires a long index (fla.cache_indices is int32, same as
             # every other CUDA-graph-safe index tensor in the engine; plain indexing
-            # above (self._tok_hist[idx], self._conv_tail[idx]) accepts int32 fine, but
-            # index_copy_'s ATen kernel is stricter). Cast locally rather than widening
-            # cache_indices itself, which other consumers may rely on staying int32.
-            idx64 = idx.long()
+            # above (self._conv_tail[idx]) accepts int32 fine, but index_copy_'s ATen
+            # kernel is stricter). Cast locally rather than widening cache_indices
+            # itself, which other consumers may rely on staying int32.
+            # (_tok_hist's own index_copy_ now happens in precompute_decode_ngram,
+            # eagerly, alongside the gather that needed the pre-update history.)
             self._conv_tail.index_copy_(0, idx64, new_tail)
-            self._tok_hist.index_copy_(0, idx64, hist[:, 1:])
             return gated + conv
 
         # ---- prefill (varlen; per-request loop, correctness over speed in P0) ----
+        input_ids = batch.input_ids.to(torch.long)
         if fla.fresh_state_indices is not None:
             self._reset_slots(fla.fresh_state_indices)
         cu = fla.cu_seqlens.tolist()
