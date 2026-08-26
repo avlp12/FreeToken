@@ -32,13 +32,25 @@ from .qwen_layout import (
     DEST_NGRAM,
     DEST_SKIP,
     classify_tensor,
+    disk_free_bytes,
     extra_safetensor_files,
+    is_mtp_expert_tensor,
+    is_mtp_tensor,
     is_qwen4_exp_config,
     is_wrapper_config,
+    iter_shard_tensor_metas,
     load_weight_map,
     looks_like_ngram_shard,
     read_safetensors_header,
+    tensor_nbytes_from_meta,
 )
+
+# Conversion guard: refuse to start if less than this much free space would remain on the
+# output volume after the estimated write. A conversion that runs out of disk mid-write
+# leaves a half-written checkpoint dir that LOOKS like a valid FTW (index.json present)
+# but is silently truncated -- catching this before any bytes are written is much cheaper
+# than discovering it after a 100+ GiB write.
+_MIN_FREE_BYTES_AFTER = 20 << 30  # ~20 GiB
 
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
@@ -94,6 +106,71 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
     return h.hexdigest()[:16]
 
 
+def _estimate_output_bytes(model_path: str, expert_gguf: str | None) -> int:
+    """Cheap (header-only + file-stat-only, no tensor data read) upper-bound estimate of
+    the FTW's on-disk payload, for the pre-flight disk-space guard.
+
+    Sums safetensors header ``nbytes`` for everything EXCEPT the target's own routed
+    experts (``DEST_EXPERT``) when ``--expert-gguf`` replaces them with a (much smaller)
+    quantized bank -- in that case the GGUF shard set's real file size is added instead
+    (a stat() per shard, not a parse). mtp.* tensors are always counted in full: this
+    converter preserves them losslessly regardless of --expert-gguf (see
+    ``_iter_mtp_from_disk``). Under-counts slightly (ignores the FTW's own per-tensor
+    4096-byte alignment padding and the GGUF's block-quant metadata overhead) but is
+    within a few percent of the real total -- fine for a coarse pre-flight guard, not
+    used for anything else.
+    """
+    weight_map = load_weight_map(model_path)
+    shards = sorted(set(weight_map.values()))
+    total = 0
+    for name, _shard, _meta, nbytes in iter_shard_tensor_metas(model_path, shards):
+        if is_mtp_tensor(name):
+            total += nbytes
+            continue
+        dest = classify_tensor(name)
+        if dest == DEST_SKIP:
+            continue
+        if dest == DEST_EXPERT and expert_gguf:
+            continue  # replaced below by the GGUF's own (smaller) shard bytes
+        total += nbytes
+    if expert_gguf:
+        from freetoken.models.gguf.reader import _split_shard_paths
+
+        for f in sorted(_split_shard_paths(expert_gguf) or [expert_gguf]):
+            total += os.path.getsize(f)
+    return total
+
+
+def _guard_output_dir(out_dir: str, model_path: str, expert_gguf: str | None) -> None:
+    """Refuse to start a conversion that would overwrite an existing dir or run the
+    output volume below ``_MIN_FREE_BYTES_AFTER``. Both checks are cheap (no tensor data
+    read) and run before any bytes are written."""
+    if os.path.exists(out_dir):
+        raise SystemExit(
+            f"{out_dir} already exists -- refusing to write over it (a half-written FTW "
+            f"dir looks valid but is silently truncated; remove it first if you intend "
+            f"to rebuild)"
+        )
+    estimated = _estimate_output_bytes(model_path, expert_gguf)
+    probe_dir = os.path.dirname(os.path.abspath(out_dir)) or os.sep
+    os.makedirs(probe_dir, exist_ok=True)
+    free = disk_free_bytes(probe_dir)
+    remaining = free - estimated
+    if remaining < _MIN_FREE_BYTES_AFTER:
+        raise SystemExit(
+            f"refusing to start: estimated FTW size {estimated / (1 << 30):.1f} GiB, "
+            f"only {free / (1 << 30):.1f} GiB free on the volume holding {out_dir!r} -- "
+            f"would leave {remaining / (1 << 30):.1f} GiB free, below the "
+            f"{_MIN_FREE_BYTES_AFTER / (1 << 30):.0f} GiB safety margin"
+        )
+    logger_msg = (
+        f"disk guard: estimated FTW size {estimated / (1 << 30):.1f} GiB, "
+        f"{free / (1 << 30):.1f} GiB free -> {remaining / (1 << 30):.1f} GiB free "
+        f"after (>= {_MIN_FREE_BYTES_AFTER / (1 << 30):.0f} GiB margin), proceeding"
+    )
+    print(logger_msg, flush=True)
+
+
 def _hf_aliases(name: str) -> set[str]:
     """Raw HF key and the language_model-stripped form ``iter_weights`` may yield."""
     aliases = {name}
@@ -146,6 +223,50 @@ def _iter_ngram_from_disk(model_path: str, *, skip_names: set[str]):
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             for name in names:
                 yield name, f.get_tensor(name)
+
+
+def _iter_mtp_from_disk(model_path: str, *, skip_names: set[str]):
+    """Stream ``mtp.*`` (MTP drafter head) tensors, preserved for a later phase.
+
+    ``load_weight``/``iter_weights`` never yield ``mtp.*`` -- ``qwen4_exp/weight.py``'s
+    ``classify_key`` routes them to the ``mtp_dense`` / ``mtp_expert_bank`` categories,
+    both of which ``iter_weights`` skips (no ``Qwen4ExpForCausalLM.mtp`` submodule exists
+    yet to receive them via ``load_state_dict`` -- wiring up the drafter's forward pass is
+    a later phase; see ``python/freetoken/models/qwen4_exp/mtp.py``). Preserve the
+    original checkpoint keys and tensor bytes verbatim (no concat/rename -- same
+    no-invented-layout contract as ``_iter_ngram_from_disk``) under two new FTW kinds so
+    the ~2.5 GiB drafter head survives conversion losslessly without being wired into the
+    runtime model:
+      * kind="mtp_dense"  -- 29 bf16 tensors (fc_embedding/fc_hidden + norms, the mixer,
+        and one MTP decoder layer: self_attn/indexer, MoE gate + shared_expert(_gate),
+        and two hyper_connections).
+      * kind="mtp_expert" -- 3072 fp8 tensors, the drafter's own 512-expert routed bank
+        (mtp.layers.0.mlp.experts.*), same block-fp8 layout as the target's routed
+        experts but a separate bank -- NOT run through ``load_expert_banks``/GGUF (that
+        pipeline sources the *target's* experts only; --expert-gguf carries no mtp.*
+        rows).
+    Neither kind is read by ``iter_ftw_weights``'s default ``kinds=("weight",)``, so this
+    is inert until a future phase reads them back by kind (same pattern ``kind="ngram"``
+    already uses for the n-gram table).
+
+    Ordering: like ``_iter_ngram_from_disk``, this runs on the convert *main thread*
+    before ``load_expert_banks`` starts its reader threads -- ``FTWWriter`` is not
+    thread-safe until the expert ``_ConvertSink`` lock takes over.
+    """
+    import safetensors
+
+    weight_map = load_weight_map(model_path)
+    by_shard: dict[str, list[tuple[str, str]]] = {}
+    for name, shard in weight_map.items():
+        if name in skip_names or not is_mtp_tensor(name):
+            continue
+        kind = "mtp_expert" if is_mtp_expert_tensor(name) else "mtp_dense"
+        by_shard.setdefault(shard, []).append((name, kind))
+    for shard, items in sorted(by_shard.items()):
+        path = os.path.join(model_path, shard)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name, kind in items:
+                yield name, kind, f.get_tensor(name)
 
 
 def _require_qwen4_exp_registered(hf_cfg) -> None:
@@ -314,6 +435,7 @@ def convert_checkpoint(
 
     if is_ftw_checkpoint(model_path):
         raise SystemExit(f"{model_path} is already an FTW checkpoint")
+    _guard_output_dir(out_dir, model_path, expert_gguf)
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
@@ -377,6 +499,7 @@ def convert_checkpoint(
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = n_ngram = 0
+    n_mtp_dense = n_mtp_expert = 0
     seen_ngram: set[str] = set()
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
@@ -424,6 +547,24 @@ def convert_checkpoint(
         n_ngram += 1
         ngram_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes + ngram_bytes, 0)
+
+    # 1c) MTP drafter pass-through: original HF keys, kind="mtp_dense" / "mtp_expert".
+    # Preserved losslessly for a later phase (no Qwen4ExpForCausalLM.mtp submodule exists
+    # yet to load_state_dict into, and the drafter's own expert bank is not part of
+    # --expert-gguf's GGUF-sourced banks) -- see _iter_mtp_from_disk's docstring. Only
+    # fires for a qwen4_exp source checkpoint that actually ships mtp.* keys; a no-op
+    # (empty generator) otherwise, so this is a pure no-risk addition for every other
+    # architecture (including DeepSeek-V4).
+    mtp_bytes = 0
+    for name, kind, tensor in count_bar(_iter_mtp_from_disk(model_path, skip_names=set()),
+                                        "Converting MTP drafter head"):
+        writer.add_tensor(name, tensor, kind=kind)
+        if kind == "mtp_expert":
+            n_mtp_expert += 1
+        else:
+            n_mtp_dense += 1
+        mtp_bytes += tensor.numel() * tensor.element_size()
+        _progress("dense", dense_bytes + ngram_bytes + mtp_bytes, 0)
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -518,10 +659,17 @@ def convert_checkpoint(
             "weight": n_weight,
             "experts_bank": n_bank + n_alpha,
             "ngram": n_ngram,
+            "mtp_dense": n_mtp_dense,
+            "mtp_expert": n_mtp_expert,
         },
         # n-gram tables are kind="ngram" (original HF names). ngram_bank.py reads
         # them via iter_ftw_ngrams / FTWReader.entries("ngram") -- not load_state_dict.
         "ngram_num_tensors": n_ngram,
+        # MTP drafter head (preserved for a later phase, not yet wired into the runtime
+        # model): kind="mtp_dense" (29 bf16, original HF names) + kind="mtp_expert" (3072
+        # fp8, the drafter's own 512-expert routed bank). Neither is read by
+        # iter_ftw_weights's default kinds=("weight",) -- see _iter_mtp_from_disk.
+        "mtp_num_tensors": n_mtp_dense + n_mtp_expert,
         "copied_metadata": copied,
     })
     return index

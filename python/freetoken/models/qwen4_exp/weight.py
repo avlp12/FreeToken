@@ -29,8 +29,37 @@ from .config import parse_config  # noqa: F401  (spec contract)
 # ---------------------------------------------------------------------------
 
 _EXPERT_RE = re.compile(r"^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\.")
-_DROP_PREFIXES = ("mtp.", "model.visual.", "visual.")
+# model.visual.* / visual.* (vision tower) stay dropped -- out of scope (text-only P0/P1).
+# mtp.* is classified below (mtp_dense / mtp_expert_bank), NOT dropped: the MTP drafter
+# head is preserved for a later phase (see MTP_DENSE_PATTERNS / MTP_EXPERT_RE).
+_DROP_PREFIXES = ("model.visual.", "visual.")
 _DROP_SUFFIXES = (".k_scale", ".v_scale", ".q_scale", ".prob_scale")
+
+# MTP drafter routed-expert bank: 512 experts x {gate,up,down}_proj x {weight,
+# weight_scale_inv} = 3072 tensors, fp8 block-scaled, same layout as the target's own
+# routed experts but under the mtp. prefix (own bank, own layer). Preserved in the FTW
+# (kind="mtp_expert", see checkpoint/convert.py) but NOT streamed here -- like the
+# target's expert_bank category, it is not a load_state_dict dense parameter.
+_MTP_EXPERT_RE = re.compile(r"^mtp\.layers\.\d+\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(weight|weight_scale_inv)$")
+
+# MTP drafter dense (bf16) tensors: fc_embedding/fc_hidden + norms, the mixer, and one
+# full decoder layer (self_attn + indexer, MoE gate/shared_expert, two hyper_connections).
+# 29 tensors total (verified against tools/qwen4_map_check.py). Preserved in the FTW
+# (kind="mtp_dense") but NOT streamed here -- no Qwen4ExpForCausalLM.mtp submodule
+# exists yet to receive them via load_state_dict; wiring them up is a later phase.
+_MTP_DENSE_PATTERNS = tuple(
+    re.compile(p)
+    for p in (
+        r"^mtp\.(fc_embedding|fc_hidden|pre_fc_norm_embedding|pre_fc_norm_hidden)\.weight$",
+        r"^mtp\.hyper_connection_mixer\.(hc_norm|input_mix_weight_down|input_mix_weight_up)\.weight$",
+        r"^mtp\.layers\.0\.self_attn\.(q_proj|k_proj|v_proj|o_proj|q_norm|k_norm)\.weight$",
+        r"^mtp\.layers\.0\.self_attn\.indexer\.(index_qk_proj|q_layernorm|k_layernorm)\.weight$",
+        r"^mtp\.layers\.0\.mlp\.(gate|shared_expert_gate)\.weight$",
+        r"^mtp\.layers\.0\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\.weight$",
+        r"^mtp\.layers\.0\.(attn_hyper_connection|mlp_hyper_connection)\."
+        r"(hc_norm|input_mix_weight_down|input_mix_weight_up|block_inject_weight)\.weight$",
+    )
+)
 
 # Gemma-style (1+weight) RMSNorms: every Qwen4ExpTextRMSNorm instance (zeros-init,
 # forward computes normed * (1 + w)); the loader bakes the +1 so runtime modules do a
@@ -98,15 +127,20 @@ _DENSE_PATTERNS = tuple(
 
 def classify_key(raw_name: str) -> tuple[str, str]:
     """-> (category, detail). detail = renamed dense key, or the reason for the rest.
-    Categories: dense / expert_bank / ngram_module / dropped / unknown."""
+    Categories: dense / expert_bank / ngram_module / mtp_dense / mtp_expert_bank /
+    dropped / unknown."""
     if raw_name.startswith(_DROP_PREFIXES):
-        return "dropped", "mtp/vision not served in P0"
+        return "dropped", "vision not served (out of scope)"
     if raw_name.endswith(_DROP_SUFFIXES):
         return "dropped", "quant sidecar scale (engine keeps native-precision KV)"
+    if _MTP_EXPERT_RE.match(raw_name):
+        return "mtp_expert_bank", "MTP drafter routed expert (fp8, preserved for a later phase)"
     if _EXPERT_RE.match(raw_name):
         return "expert_bank", "routed expert (fp8_block offload banks)"
     if ".ple.ple_embedding." in raw_name:
         return "ngram_module", "n-gram table/buffers, mmap-loaded by ngram.py"
+    if any(p.match(raw_name) for p in _MTP_DENSE_PATTERNS):
+        return "mtp_dense", "MTP drafter dense weight (preserved for a later phase)"
     if any(p.match(raw_name) for p in _DENSE_PATTERNS):
         return "dense", _rename(raw_name)
     return "unknown", raw_name

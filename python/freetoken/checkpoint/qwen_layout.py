@@ -35,6 +35,16 @@ _EXPERT_RE = re.compile(
     r"(?:gate|up|down)_proj\.(?:weight|weight_scale_inv)$"
 )
 
+# MTP drafter's own routed-expert bank: own layer (mtp.layers.0), own 512 experts, same
+# block-fp8 layout as _EXPERT_RE's target experts. Distinguished by the mtp. prefix, so
+# a name matches at most one of the two regexes. Used by convert.py's dedicated mtp
+# pass-through (the drafter head is preserved for a later phase, kind="mtp_dense" /
+# "mtp_expert" -- see SKIP_PREFIXES below, which still drops mtp.* from the ordinary
+# classify_tensor/DEST_SKIP path as defense in depth).
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.\d+\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.(?:weight|weight_scale_inv)$"
+)
+
 # N-gram / PLE embedding table. Observed on Qwen3.8-Flash-Next-FP8:
 #   model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{N}.weight
 #   (+ optional sibling weight_scale_inv). Small PLE projections stay dense.
@@ -146,6 +156,16 @@ def extra_safetensor_files(model_path: str, weight_map: dict[str, str]) -> list[
 
 def looks_like_ngram_shard(filename: str) -> bool:
     return _NGRAM_SHARD_RE.search(filename) is not None
+
+
+def is_mtp_tensor(name: str) -> bool:
+    """True for any raw checkpoint key under the MTP drafter's ``mtp.`` prefix."""
+    return name.startswith("mtp.")
+
+
+def is_mtp_expert_tensor(name: str) -> bool:
+    """True for the MTP drafter's own routed-expert bank (3072 of the 3101 mtp.* keys)."""
+    return bool(_MTP_EXPERT_RE.match(name))
 
 
 def extra_index_files(model_path: str) -> list[str]:
@@ -287,6 +307,8 @@ __all__ = [
     "extra_index_files",
     "extra_safetensor_files",
     "ftw_padded_bytes",
+    "is_mtp_expert_tensor",
+    "is_mtp_tensor",
     "is_qwen4_exp_config",
     "is_wrapper_config",
     "iter_shard_tensor_metas",
