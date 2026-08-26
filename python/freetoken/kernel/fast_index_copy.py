@@ -22,6 +22,16 @@ def _skip_fast_index_copy_enabled() -> bool:
     return os.getenv(SKIP_FAST_INDEX_COPY_ENV, "").strip().lower() in _TRUE_VALUES
 
 
+# Kill switch for the pitched (payload-only) multi-bank copy. Set it and every
+# caller reverts to transferring the full row pitch -- the behaviour that shipped
+# before per-row copy widths existed.
+UNPITCHED_COPY_ENV = "FREETOKEN_UNPITCHED_COPY"
+
+
+def _unpitched_copy_enabled() -> bool:
+    return os.getenv(UNPITCHED_COPY_ENV, "").strip().lower() in _TRUE_VALUES
+
+
 @lru_cache(maxsize=None)
 def _jit_update_flag_module() -> Module:
     return load_jit(
@@ -158,6 +168,8 @@ def fast_index_copy_multi_jit(
     src_indices: torch.Tensor,
     num_indices: torch.Tensor | None = None,
     *,
+    copy_bytes: torch.Tensor | None = None,
+    row_pitch: torch.Tensor | None = None,
     num_threads: int = 1024,
     blocks_per_bank: int = 8,
 ) -> None:
@@ -176,13 +188,34 @@ def fast_index_copy_multi_jit(
     once by the caller (the per-bank slot-cache base addr, host-source base addr, and
     per-row byte size). Every bank's per-row byte size must be a multiple of 16, and the
     base addresses 16-byte aligned (true for contiguous torch allocations of these banks).
+
+    ``copy_bytes`` + ``row_pitch`` (optional, given together, same [num_banks] int64
+    device shape) move only the PAYLOAD of each weight row. One bank row is a whole
+    expert: a stack of ``feat_bytes // row_pitch`` weight rows at a uniform byte pitch.
+    A mixed-quant bank sets that pitch from the widest ggml type it holds, and the GEMV
+    never reads past a row's own native packed width, so the tail need not cross PCIe --
+    it is simply left as it was in the destination slot, which is exactly as unread.
+    ``copy_bytes`` is the per-weight-row payload (a multiple of 16, at most
+    ``row_pitch``); ``row_pitch`` must divide ``feat_bytes``. Omit both (or set
+    ``FREETOKEN_UNPITCHED_COPY=1``) for the historical full-row copy, which is a
+    separate kernel specialization rather than a runtime branch.
     """
     if _skip_fast_index_copy_enabled():
         return
+    if copy_bytes is not None and _unpitched_copy_enabled():
+        # Escape hatch for the most load-bearing kernel in the decode loop: one env
+        # var puts every caller back on the byte-for-byte pre-existing path.
+        copy_bytes = row_pitch = None
+    assert (copy_bytes is None) == (row_pitch is None), (
+        "fast_index_copy_multi: copy_bytes and row_pitch must be given together"
+    )
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
-    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+    module.launch(
+        dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices,
+        copy_bytes, row_pitch,
+    )
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

@@ -344,6 +344,13 @@ class OffloadMoeCache:
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
+        # Per-(bank, layer) PAYLOAD width, when a format declares one (see
+        # set_layer_copy_bytes). None everywhere -> every copy moves the full pitch,
+        # which is what every format except q2_k_ud does and what shipped before.
+        self._layer_copy_bytes: dict[str, list[int]] | None = None
+        self._copy_bytes: list[torch.Tensor | None] = []
+        self._copy_bytes_host: list[list[int]] = []
+        self._copy_row_pitch: torch.Tensor | None = None
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -549,6 +556,9 @@ class OffloadMoeCache:
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._copy_bytes = []
+        self._copy_bytes_host = []
+        self._copy_row_pitch = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
@@ -559,10 +569,15 @@ class OffloadMoeCache:
             return
         from freetoken.kernel.pinned import device_ptr
 
-        dst_ptrs, feats = [], []
+        dst_ptrs, feats, sub_pitches = [], [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            # Innermost stride: one WEIGHT row of the bank. A bank row (one expert) is
+            # feat // sub_pitch of these stacked contiguously, which is the geometry the
+            # payload-only copy walks. For a bank whose expert is a flat vector this is
+            # feat itself and the two notions coincide.
+            sub_pitch = per_layer[0].shape[-1] * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
@@ -580,6 +595,7 @@ class OffloadMoeCache:
                 layer_src_ptrs[layer_id].append(src_dev)
             dst_ptrs.append(cache.data_ptr())
             feats.append(feat)
+            sub_pitches.append(sub_pitch)
         self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
         self._copy_src_ptrs = [
             torch.tensor(ptrs, dtype=torch.int64, device=self.device)
@@ -598,7 +614,94 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+        self._build_copy_widths(feats, sub_pitches)
         self._copy_fused_ok = True
+
+    def _build_copy_widths(self, feats: list[int], sub_pitches: list[int]) -> None:
+        """Resolve ``_layer_copy_bytes`` into one [num_banks] int64 device tensor per layer.
+
+        A bank ROW is one expert -- ``feats[b]`` bytes -- and is itself a stack of weight
+        rows at ``sub_pitches[b]`` bytes each. The declaration is a per-weight-row payload
+        width, so ``_copy_row_pitch`` (layer-invariant) travels with it and tells the
+        kernel how to walk from one weight row to the next.
+
+        ``None`` for a layer means "copy the whole expert", and that is what EVERY layer
+        gets when no format declared payload widths -- the descriptor arguments are then
+        absent from the launch and the kernel is specialized back to its original loop.
+        A layer whose banks all copy their full pitch also resolves to ``None`` rather
+        than to a redundant tensor, so a uniform-width format can never pay for this.
+
+        The tensors are allocated once here (and on rebuild, alongside the pointers) and
+        are read by the kernel, not by Python, so a captured decode graph holds a stable
+        device address per layer. Each layer's copy is its own launch with its own
+        descriptor pointer baked into the graph node, which is what makes a per-LAYER
+        width capturable at all.
+        """
+        from freetoken.kernel.fast_index_copy import _unpitched_copy_enabled
+
+        self._copy_bytes = [None] * self.num_layers
+        self._copy_bytes_host = [list(sub_pitches) for _ in range(self.num_layers)]
+        self._copy_row_pitch = None
+        # Honour the kill switch HERE rather than only at the launch, so everything
+        # downstream that keys off "are pitched copies active" (the hit-D2D guard,
+        # the byte accounting) sees one consistent answer.
+        if not self._layer_copy_bytes or _unpitched_copy_enabled():
+            return
+        any_narrow = False
+        for layer_id in range(self.num_layers):
+            widths = []
+            for b, name in enumerate(self.bank_schema):
+                per_layer = self._layer_copy_bytes.get(name)
+                w = sub_pitches[b] if per_layer is None else int(per_layer[layer_id])
+                # Both guards matter to correctness, not just to hygiene: a width past
+                # the pitch would read/write into the next weight row, and a
+                # non-16-multiple width would drop the row's last partial uint4 -- the
+                # kernel moves whole 16 B units.
+                if w % 16 != 0 or not 0 < w <= sub_pitches[b]:
+                    raise ValueError(
+                        f"copy width for bank {name!r} layer {layer_id} is {w} B: must be "
+                        f"a positive multiple of 16 and <= the row pitch {sub_pitches[b]} B"
+                    )
+                widths.append(w)
+            self._copy_bytes_host[layer_id] = widths
+            if widths != sub_pitches:
+                any_narrow = True
+                self._copy_bytes[layer_id] = torch.tensor(
+                    widths, dtype=torch.int64, device=self.device
+                )
+        if any_narrow:
+            self._copy_row_pitch = torch.tensor(
+                sub_pitches, dtype=torch.int64, device=self.device
+            )
+        else:
+            self._copy_bytes = [None] * self.num_layers
+
+    def set_layer_copy_bytes(self, per_bank: dict[str, list[int]] | None) -> None:
+        """Declare how many leading bytes of each WEIGHT row a bank's layer carries.
+
+        For a mixed-quant format the bank pitch is set by the WIDEST type in it, so a
+        layer stored in a narrower type has a padding tail that no kernel reads -- the
+        GEMV's inner loop runs ``blocks_per_row`` iterations of the type it was called
+        with, and the dequant-GEMM path slices the native prefix off each row. Those
+        bytes therefore need not cross PCIe on a decode miss; the slot keeps whatever
+        the previous occupant left there, which is exactly as unread.
+
+        ``per_bank`` maps bank name -> per-layer native row bytes (a missing bank keeps
+        the full pitch). ``None`` clears the declaration. Must be called after
+        ``set_bank_sources``; re-runs the copy-plan build.
+        """
+        if per_bank is not None:
+            for name, widths in per_bank.items():
+                if name not in self.bank_schema:
+                    raise ValueError(f"unknown bank {name!r} for {self.quant_format!r}")
+                if len(widths) != self.num_layers:
+                    raise ValueError(
+                        f"copy widths for bank {name!r}: got {len(widths)} entries, "
+                        f"expected one per layer ({self.num_layers})"
+                    )
+        self._layer_copy_bytes = per_bank
+        if self.banks:
+            self._build_copy_plan()
 
     def validate_rebuild(self, cache_size: int) -> None:
         """Pure geometry validation of a rebuild target (no GPU side effects).
@@ -917,6 +1020,18 @@ class OffloadMoeCache:
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
             )
+        elif any(w is not None for w in self._copy_bytes):
+            # Pitched decode copies leave the padding tail of a resident slot holding
+            # whatever the previous occupant wrote. Nothing reads it -- except this
+            # gather, which would copy those stale bytes into the prefill double
+            # buffer, where prefill_dequant_gemm._check_pad_tail requires a zero tail.
+            # Until the gather learns the same per-layer width, the two are exclusive.
+            reason = (
+                "this format declares per-layer copy widths, so a resident slot's "
+                "padding tail is stale and the hit gather would carry it into the "
+                "prefill buffer (set FREETOKEN_UNPITCHED_COPY=1 to trade the PCIe "
+                "saving back for the hit split)"
+            )
         elif not self._resolve_batch_memcpy():
             reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
         else:
@@ -1207,6 +1322,11 @@ class OffloadMoeCache:
             evict_slots,
             src_indices,
             num_indices,
+            # Per-layer payload width: this layer's rows may be narrower than the bank
+            # pitch. A capture-time constant per layer -- the pointer is baked into this
+            # launch's graph node, and each layer has its own node.
+            copy_bytes=self._copy_bytes[layer_id],
+            row_pitch=self._copy_row_pitch,
             blocks_per_bank=self.prefetch_bpb,
         )
 
@@ -1453,6 +1573,10 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                # See prefetch_copy: this layer's rows may be narrower than the bank
+                # pitch, and the padding tail is never read out of the slot.
+                copy_bytes=self._copy_bytes[layer_id],
+                row_pitch=self._copy_row_pitch,
                 blocks_per_bank=self.copy_bpb,
             )
             return

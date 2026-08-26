@@ -472,10 +472,29 @@ struct FastIndexCopyKernel {
 // block b copies bank `b = blockIdx.x / kBlocksPerBank`, grid-striding over that
 // bank's (num_indices * feat/16) 16-byte units. Pointers + feature sizes are passed
 // as small device arrays (built once by the cache), so it stays CUDA-graph capturable.
+//
+// PITCHED (payload-only) MODE. `feat_bytes` is one bank ROW -- one expert -- and for a
+// weight bank that row is itself a stack of `feat/row_pitch` weight rows laid at a
+// uniform byte pitch. A mixed-quant bank sets that pitch from the WIDEST ggml type it
+// holds, so a layer stored in a narrower type carries a padding tail on every weight
+// row that no kernel ever reads: the GEMV's inner loop runs blocks_per_row iterations
+// of the type it was CALLED with, and the prefill dequant path slices the native prefix
+// off each row. Those bytes therefore do not need to cross PCIe -- the destination slot
+// simply keeps whatever its previous occupant left in the tail, which is exactly as
+// unread. On the shipped q2_k_ud down bank that is 304 of every 1088 B.
+//
+// So `copy_bytes[b]` says how much of each WEIGHT row to move and `row_pitch[b]` is the
+// weight-row stride; the expert stride stays `feat_bytes[b]` on both sides, because the
+// two layouts are identical and only the payload shrinks. Both arrays are null in the
+// default mode and the kernel is then specialized (kPitched = false) back to the exact
+// single-division loop it has always been -- no extra loads, no extra arithmetic, not
+// a predicated branch inside the loop.
 struct MultiIndexCopyParams {
     const int64_t* __restrict__ dst_ptrs;     // [B] device, each base addr of a bank slot cache
     const int64_t* __restrict__ src_ptrs;     // [B] device, each GPU-visible base addr of a bank host source
-    const int64_t* __restrict__ feat_bytes;   // [B] device, per-row bytes (multiple of 16)
+    const int64_t* __restrict__ feat_bytes;   // [B] device, bytes per bank row = per expert (multiple of 16)
+    const int64_t* __restrict__ copy_bytes;   // [B] device or null: bytes to move per WEIGHT row
+    const int64_t* __restrict__ row_pitch;    // [B] device or null: weight-row stride, divides feat_bytes
     const void* __restrict__ dst_indices;     // [L]
     const void* __restrict__ src_indices;     // [L]
     const int64_t* __restrict__ valid_length; // [1] or null
@@ -483,7 +502,7 @@ struct MultiIndexCopyParams {
     int num_banks;
 };
 
-template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank>
+template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank, bool kPitched>
 __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
     const __grid_constant__ MultiIndexCopyParams p
 ) {
@@ -496,14 +515,39 @@ __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
     auto* dst = reinterpret_cast<uint8_t*>(p.dst_ptrs[b]);
     const int64_t feat = p.feat_bytes[b];
     const int64_t n = p.valid_length ? p.valid_length[0] : p.length;
-    const int64_t units = feat >> 4;  // 16-byte (uint4) units per row; feat % 16 == 0
-    const int64_t total = n * units;
     const auto* di = static_cast<const IdType*>(p.dst_indices);
     const auto* si = static_cast<const IdType*>(p.src_indices);
     const int64_t stride = static_cast<int64_t>(kBlocksPerBank) * kNumThreads;
+
+    // 16-byte (uint4) units moved per bank row, and -- pitched only -- per weight row.
+    int64_t units;
+    uint32_t sub_units = 0;
+    int64_t pitch = 0;
+    if constexpr (kPitched) {
+        pitch = p.row_pitch[b];
+        sub_units = static_cast<uint32_t>(p.copy_bytes[b] >> 4);
+        units = (feat / pitch) * static_cast<int64_t>(sub_units);
+    } else {
+        units = feat >> 4;
+    }
+    const int64_t total = n * units;
+
     for (int64_t u = static_cast<int64_t>(blk) * kNumThreads + threadIdx.x; u < total; u += stride) {
         const int64_t row = u / units;
-        const int64_t col = (u - row * units) << 4;  // byte offset within the row
+        const int64_t rem = u - row * units;
+        int64_t col;
+        if constexpr (kPitched) {
+            // Second divide is 32-bit on purpose: `rem < units`, and `units` is a
+            // single expert's unit count (the shipped worst case is 4096 * 1088 / 16
+            // = 278528), so it can never approach 2^32. A 64-bit divide here would
+            // cost several times as much for no reach.
+            const uint32_t r32 = static_cast<uint32_t>(rem);
+            const uint32_t sub = r32 / sub_units;              // weight row within the expert
+            col = static_cast<int64_t>(sub) * pitch
+                + (static_cast<int64_t>(r32 - sub * sub_units) << 4);
+        } else {
+            col = rem << 4;  // byte offset within the row
+        }
         const int64_t pd = static_cast<int64_t>(di[row]);
         const int64_t ps = static_cast<int64_t>(si[row]);
         const uint4 v = *reinterpret_cast<const uint4*>(src + ps * feat + col);
@@ -519,7 +563,9 @@ struct MultiIndexCopyKernel {
         tvm::ffi::TensorView feat_bytes,
         tvm::ffi::TensorView dst_indices,
         tvm::ffi::TensorView src_indices,
-        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> copy_bytes,
+        tvm::ffi::Optional<tvm::ffi::TensorView> row_pitch
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
@@ -528,6 +574,7 @@ struct MultiIndexCopyKernel {
         auto ptr_dtype = SymbolicDType{};
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
+        auto copy_bytes_dtype = SymbolicDType{};
 
         TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
@@ -541,11 +588,27 @@ struct MultiIndexCopyKernel {
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
 
+        // Per-bank payload width + weight-row stride. Same [B] int64 device shape as
+        // feat_bytes, and all-or-nothing: absent means "copy the whole bank row", the
+        // pre-existing behaviour, and selects the unpitched kernel specialization.
+        const int64_t* copy_bytes_ptr = nullptr;
+        const int64_t* row_pitch_ptr = nullptr;
+        RuntimeCheck(copy_bytes.has_value() == row_pitch.has_value(),
+            "fast_index_copy_multi: copy_bytes and row_pitch must be given together");
+        if (copy_bytes.has_value()) {
+            TensorMatcher({B}).with_dtype<int64_t>(copy_bytes_dtype).with_device<kDLCUDA>(device)
+                .verify(copy_bytes.value()).verify(row_pitch.value());
+            copy_bytes_ptr = static_cast<const int64_t*>(copy_bytes.value().data_ptr());
+            row_pitch_ptr = static_cast<const int64_t*>(row_pitch.value().data_ptr());
+        }
+
         const int num_banks = static_cast<int>(B.unwrap());
         const auto params = MultiIndexCopyParams{
             static_cast<const int64_t*>(dst_ptrs.data_ptr()),
             static_cast<const int64_t*>(src_ptrs.data_ptr()),
             static_cast<const int64_t*>(feat_bytes.data_ptr()),
+            copy_bytes_ptr,
+            row_pitch_ptr,
             dst_indices.data_ptr(),
             src_indices.data_ptr(),
             valid_length,
@@ -553,9 +616,13 @@ struct MultiIndexCopyKernel {
             num_banks,
         };
         const auto use_int32 = indices_dtype.unwrap().bits == 32;
-        const auto kernel = use_int32
-            ? fast_index_copy_multi<int32_t, kNumThreads, kBlocksPerBank>
-            : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank>;
+        const auto pitched = copy_bytes_ptr != nullptr;
+        const auto kernel =
+            pitched
+                ? (use_int32 ? fast_index_copy_multi<int32_t, kNumThreads, kBlocksPerBank, true>
+                             : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank, true>)
+                : (use_int32 ? fast_index_copy_multi<int32_t, kNumThreads, kBlocksPerBank, false>
+                             : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank, false>);
         LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
                      device.unwrap())(kernel, params);
     }
