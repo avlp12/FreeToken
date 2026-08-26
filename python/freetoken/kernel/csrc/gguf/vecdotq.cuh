@@ -2,6 +2,23 @@
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/vecdotq.cuh
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh
 // and https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+// FreeToken addition, lifted verbatim (modulo brace style) from llama.cpp master
+// ggml/src/ggml-cuda/vecdotq.cuh. Assembles a 32-bit word out of four INDIVIDUAL
+// byte loads, so it is the only get_int_* variant safe on a source with 1-byte
+// alignment. block_mxfp4 is exactly that: 17 bytes wide, so consecutive blocks
+// land on every residue mod 4 and get_int_b2/get_int_b4 would fault or silently
+// read a shifted word.
+static __device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+  const uint8_t* x8 = (const uint8_t*)x;
+
+  int x32 = x8[4 * i32 + 0] << 0;
+  x32 |= x8[4 * i32 + 1] << 8;
+  x32 |= x8[4 * i32 + 2] << 16;
+  x32 |= x8[4 * i32 + 3] << 24;
+
+  return x32;
+}
+
 static __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
   const uint16_t* x16 = (const uint16_t*)x;  // assume at least 2 byte alignment
 
@@ -2010,6 +2027,54 @@ vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
   }
   const float d = __half2float(bq->d) * __low2float(bq8_1->ds);
   return d * (sumi1 + sumi2);
+#endif
+}
+
+// FreeToken addition: MXFP4 (ggml type 39).
+//
+// Adapted from llama.cpp master ggml/src/ggml-cuda/vecdotq.cuh
+// ``vec_dot_mxfp4_q8_1``. Two adaptations against upstream:
+//   * upstream's signature is (vbq, bq8_1, kbx, iqs); this file predates the kbx
+//     split, and every caller here already advances the block pointer itself
+//     (``&x[i]``), so kbx is dropped rather than passed as a constant 0.
+//   * upstream's ``get_int_from_table_16`` returns an int2; ours is the older
+//     out-parameter form taking a uint8_t table. Same bytes, same order (val1 =
+//     even nibbles, val2 = odd nibbles), so the dp4a pairing below is unchanged.
+// The kvalues table, the 0.5f scale compensation and the get_int_b1 loads are
+// upstream's, unmodified.
+//
+// vdr = VDR_MXFP4_Q8_1_MMVQ = 2 and qi = QI_MXFP4 = 4, so the caller's
+// iqs = vdr * (threadIdx.x % (qi/vdr)) is 0 or 2: the two lanes covering one
+// block read qs int-words {0,1} and {2,3}, i.e. all 16 nibble bytes exactly
+// once, against q8 words {0,1,4,5} and {2,3,6,7} -- all 32 activation bytes
+// exactly once. QK_MXFP4 == QK8_1 == 32, so one q8_1 block lines up with one
+// mxfp4 block.
+#define VDR_MXFP4_Q8_1_MMVQ 2
+
+static __device__ __forceinline__ float
+vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  const block_mxfp4* bq4 = (const block_mxfp4*)vbq;
+
+  const int* q8 = (const int*)bq8_1->qs + iqs;
+
+  const uint8_t* values = (const uint8_t*)kvalues_mxfp4;
+
+  int v1, v2;
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+    // Byte-granular: bq4->qs sits at an odd offset from a 16 B-aligned row base.
+    const uint32_t aux_q4 = (uint32_t)get_int_b1(bq4->qs, iqs + l);
+    get_int_from_table_16(aux_q4, values, v1, v2);
+
+    sumi = __dp4a(v1, q8[l + 0], sumi);
+    sumi = __dp4a(v2, q8[l + 4], sumi);
+  }
+
+  // * 0.5f undoes the doubling baked into kvalues_mxfp4 (see ggml-common.h).
+  const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+  return d * sumi;
 #endif
 }
 

@@ -263,9 +263,24 @@ MOE_VEC_BATCHED_LAUNCHER(
     moe_vec_batched_iq2_xs_q8_1_cuda, QK_K, QI2_XS, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1)
 MOE_VEC_BATCHED_LAUNCHER(
     moe_vec_batched_iq3_xxs_q8_1_cuda, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1)
+// MXFP4 joined the bank set when layers 26/42's down tensors stopped being
+// re-encoded to Q2_K. It is the first batched type with qk != QK_K, so the
+// template's per-type assumptions are worth restating: the only places qk enters
+// are ``blocks_per_row = ncols / qk`` and ``iby = i * (qk / QK8_1)``. With
+// qk = 32 == QK8_1 that is iby = i over ncols/32 blocks, which walks the SAME
+// 64-block q8_1 activation row a QK_K type walks as 8 blocks of stride 8. Nothing
+// else in moe_vec_q_batched depends on the block width, and the weight pointer is
+// still ``&x[i]`` shared across the N lanes, so the reuse argument is unchanged.
+MOE_VEC_BATCHED_LAUNCHER(
+    moe_vec_batched_mxfp4_q8_1_cuda,
+    QK_MXFP4,
+    QI_MXFP4,
+    block_mxfp4,
+    VDR_MXFP4_Q8_1_MMVQ,
+    vec_dot_mxfp4_q8_1)
 
 // ggml type ids the batched path has kernels for. Q2_K = 10, IQ2_XS = 17,
-// IQ3_XXS = 18.
+// IQ3_XXS = 18, MXFP4 = 39.
 static inline bool moe_vec_batched_has_type(int64_t type) {
-  return type == 10 || type == 17 || type == 18;
+  return type == 10 || type == 17 || type == 18 || type == 39;
 }

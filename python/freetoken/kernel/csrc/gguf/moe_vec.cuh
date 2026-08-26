@@ -202,3 +202,10 @@ MOE_VEC_LAUNCHER(moe_vec_iq1_m_q8_1_cuda, QK_K, QI1_M, block_iq1_m, 1, vec_dot_i
 MOE_VEC_LAUNCHER(moe_vec_iq4_nl_q8_1_cuda, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
 MOE_VEC_LAUNCHER(moe_vec_iq4_xs_q8_1_cuda, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1)
 MOE_VEC_LAUNCHER(moe_vec_iq3_s_q8_1_cuda, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1)
+// FreeToken addition: MXFP4 (ggml type 39). qk = 32 rather than QK_K, so
+// blocks_per_row is ncols/32 and iby = i (QK_MXFP4 == QK8_1), exactly as for the
+// other 32-element types above (q4_0, iq4_nl). The byte-granular pitch path
+// composes unchanged: the pitch only positions the row base and blocks tile from
+// there, and the native down row (2048/32*17 = 1088 B) already satisfies both
+// pitch guards -- 1088 % 16 == 0 and pitch >= native.
+MOE_VEC_LAUNCHER(moe_vec_mxfp4_q8_1_cuda, QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1)

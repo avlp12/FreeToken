@@ -427,6 +427,33 @@ static __global__ void dequantize_block_iq4_nl(const void* __restrict__ vx, dst_
   }
 }
 
+// FreeToken addition: MXFP4 (ggml type 39). Adapted from llama.cpp master
+// ggml/src/ggml-cuda/dequantize.cuh ``dequantize_mxfp4`` + convert.cu
+// ``dequantize_block_mxfp4``, refolded into the single-kernel shape this file
+// uses for iq4_nl (upstream splits the per-thread body into a separate device
+// function so its generic dequantize_block_cuda can call it; nothing here does).
+//
+// One CUDA block covers QK_K = 256 elements = 8 mxfp4 blocks, 32 threads, each
+// thread emitting 8 values -- identical indexing to dequantize_block_iq4_nl
+// above, which is legitimate because QK4_NL == QK_MXFP4 == 32.
+template <typename dst_t>
+static __global__ void dequantize_block_mxfp4(const void* __restrict__ vx, dst_t* __restrict__ yy) {
+  const auto i = blockIdx.x;
+  const block_mxfp4* x = (const block_mxfp4*)vx + i * (QK_K / QK_MXFP4);
+
+  const auto tid = threadIdx.x;
+  const int il = tid / 8;  // 0...3
+  const int ib = tid % 8;  // 0...7
+  dst_t* y = yy + i * QK_K + 32 * ib + 4 * il;
+  const uint8_t* q4 = x[ib].qs + 4 * il;
+  const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+  for (int j = 0; j < 4; ++j) {
+    // * 0.5f undoes the doubling baked into kvalues_mxfp4 (see ggml-common.h).
+    y[j + 0] = d * kvalues_mxfp4[q4[j] & 0xf] * 0.5f;
+    y[j + 16] = d * kvalues_mxfp4[q4[j] >> 4] * 0.5f;
+  }
+}
+
 template <typename dst_t>
 static __global__ void dequantize_block_iq4_xs(const void* __restrict__ vx, dst_t* __restrict__ yy) {
   const auto i = blockIdx.x;
@@ -530,6 +557,14 @@ static void dequantize_row_iq4_nl_cuda(const void* vx, dst_t* y, const int k, cu
   dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// FreeToken addition: MXFP4. Mirrors dequantize_row_iq4_nl_cuda -- 8 blocks of
+// 32 elements per CUDA block, 32 threads.
+template <typename dst_t>
+static void dequantize_row_mxfp4_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
+  const int nb = (k + QK_K - 1) / QK_K;
+  dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
+}
+
 template <typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
   const int nb = (k + QK_K - 1) / QK_K;
@@ -577,6 +612,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
       return dequantize_row_iq4_xs_cuda;
     case 29:
       return dequantize_row_iq1_m_cuda;
+    case 39:
+      return dequantize_row_mxfp4_cuda;
     default:
       return nullptr;
   }

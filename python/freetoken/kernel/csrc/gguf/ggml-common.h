@@ -31,6 +31,24 @@ typedef struct {
   uint8_t qs[QK4_1 / 2];  // nibbles / quants
 } block_q4_1;
 
+// FreeToken addition: MXFP4 (ggml type 39). Lifted from llama.cpp master
+// ggml/src/ggml-common.h (block_mxfp4 / QK_MXFP4 / QR_MXFP4 / QI_MXFP4), which
+// our vendored b2899 snapshot predates.
+//
+// One block is 32 elements: a single E8M0 (power-of-two) scale byte followed by
+// 16 bytes of packed E2M1 nibbles. sizeof == 17 and alignof == 1, which is the
+// one property that makes this type different from every other block in this
+// header: a block pointer is NOT 4 B-aligned, so the vec_dot must read the
+// nibbles with byte-granular loads (get_int_b1), never get_int_b2/get_int_b4.
+#define QK_MXFP4 32
+#define QR_MXFP4 2
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+typedef struct {
+  uint8_t e;                 // E8M0 shared exponent
+  uint8_t qs[QK_MXFP4 / 2];  // nibbles / quants (E2M1)
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4 / 2, "wrong mxfp4 block size/padding");
+
 #define QK5_0 32
 #define QR5_0 2
 #define QI5_0 (QK5_0 / (4 * QR5_0))
@@ -926,6 +944,30 @@ static const __device__ uint64_t ksigns64[128] = {
 static const __device__ uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 static const __device__ int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// FreeToken addition: E2M1 code -> value table for MXFP4, lifted from llama.cpp
+// master ggml/src/ggml-common.h (``kvalues_fp4``, aliased there as
+// ``kvalues_mxfp4``). The entries are the e2m1 values {0, .5, 1, 1.5, 2, 3, 4, 6}
+// DOUBLED so they fit int8 and can feed __dp4a; every consumer therefore carries
+// a compensating * 0.5f in the scale.
+// ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+static const __device__ int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// FreeToken addition: E8M0 scale byte -> fp32, lifted from llama.cpp master
+// ggml/src/ggml-cuda/common.cuh (``ggml_cuda_e8m0_to_fp32``), fallback branch.
+//
+// Upstream prefers __nv_cvt_e8m0_to_bf16raw on CUDART >= 12.8; we keep only the
+// integer path deliberately. It is not an approximation of that intrinsic, it is
+// exactly equal on all 256 codes: e8m0 code x != 0 denotes 2^(x-127), which is
+// the fp32 whose bit pattern is (x << 23) with a zero mantissa; code 0 denotes
+// 2^-127, the fp32 denormal 0x00400000. Both are exactly representable in bf16
+// too, so the intrinsic and this code agree bit-for-bit -- and this version
+// needs no bf16 header inside a translation unit that is also compiled for
+// half-only builds.
+static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
+  const uint32_t bits = x == 0 ? (uint32_t)0x00400000 : ((uint32_t)x << 23);
+  return __uint_as_float(bits);
+}
 
 typedef half dfloat;  // dequantize float
 typedef half2 dfloat2;

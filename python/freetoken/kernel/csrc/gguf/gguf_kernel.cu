@@ -846,6 +846,22 @@ torch::Tensor ggml_moe_a8_vec(
             row_pitch_bytes,
             stream);
         break;
+      // FreeToken: MXFP4, carried natively for the layers unsloth quantised at
+      // 4.25 bpw instead of re-encoding them into the bank's narrower type.
+      case 39:
+        moe_vec_mxfp4_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            row_pitch_bytes,
+            stream);
+        break;
     }
   });
   return Y;
@@ -890,7 +906,7 @@ torch::Tensor ggml_moe_a8_vec_batched(
       moe_vec_batched_has_type(type),
       "ggml_moe_a8_vec_batched: no batched kernel for ggml type ",
       type,
-      " (covered: 10 Q2_K, 17 IQ2_XS, 18 IQ3_XXS). Use ggml_moe_a8_vec.");
+      " (covered: 10 Q2_K, 17 IQ2_XS, 18 IQ3_XXS, 39 MXFP4). Use ggml_moe_a8_vec.");
   TORCH_CHECK(batch_n >= 2, "ggml_moe_a8_vec_batched: batch_n must be >= 2 (got ", batch_n, ")");
   TORCH_CHECK(
       perm.is_cuda() && perm.is_contiguous() && perm.scalar_type() == torch::kInt,
@@ -959,6 +975,22 @@ torch::Tensor ggml_moe_a8_vec_batched(
         break;
       case 18:
         moe_vec_batched_iq3_xxs_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            (const int*)perm.data_ptr(),
+            top_k,
+            padded_total,
+            col,
+            row,
+            quant_X.stride(0),
+            row_pitch_bytes,
+            batch_n,
+            stream);
+        break;
+      case 39:
+        moe_vec_batched_mxfp4_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(),
             (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(),
@@ -1062,6 +1094,8 @@ int64_t ggml_type_block_bytes(int64_t type) {
       return (int64_t)sizeof(block_iq4_xs);
     case 29:
       return (int64_t)sizeof(block_iq1_m);
+    case 39:
+      return (int64_t)sizeof(block_mxfp4);  // 17
   }
   return 0;
 }
@@ -1084,6 +1118,8 @@ int64_t ggml_type_block_elems(int64_t type) {
       return QK8_0;
     case 20:
       return QK4_NL;
+    case 39:
+      return QK_MXFP4;
     case 10:
     case 11:
     case 12:
