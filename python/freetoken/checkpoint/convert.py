@@ -5,9 +5,12 @@ no per-model conversion code is needed.
 
 * dense weights = exactly what ``load_weight(include_moe_experts=...)`` yields (post
   fusion/TP-shard) -> ``kind="weight"``; at load they feed ``model.load_state_dict``.
-* offload experts = exactly what ``load_expert_banks(parallel=True)`` produces (post
+  ``mtp.*`` / ``model.visual.*`` are dropped even if a loader leaks them.
+* offload experts = exactly what ``load_expert_banks(..., layer_sink=)`` produces (post
   backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
   told apart at load by their reserved names, so they need no separate kind).
+* n-gram tables (Qwen) = original HF tensors -> ``kind="ngram"`` (not concat; banked at
+  serve time by ``moe/ngram_bank.py`` via ``iter_ftw_ngrams``).
 
 The output directory is a self-contained checkpoint (config + tokenizer copied), so you can
 point ``--model`` straight at it; the load path auto-detects the FTW and reads it (FTW).
@@ -24,6 +27,18 @@ import threading
 import torch
 
 from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter, layer_bank_entry_name
+from .qwen_layout import (
+    DEST_EXPERT,
+    DEST_NGRAM,
+    DEST_SKIP,
+    classify_tensor,
+    extra_safetensor_files,
+    is_qwen4_exp_config,
+    is_wrapper_config,
+    load_weight_map,
+    looks_like_ngram_shard,
+    read_safetensors_header,
+)
 
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
@@ -69,6 +84,88 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
             st = os.stat(f)
             h.update(f"expert_gguf:{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
     return h.hexdigest()[:16]
+
+
+def _hf_aliases(name: str) -> set[str]:
+    """Raw HF key and the language_model-stripped form ``iter_weights`` may yield."""
+    aliases = {name}
+    if name.startswith("model.language_model."):
+        aliases.add("model." + name[len("model.language_model."):])
+    elif name.startswith("language_model."):
+        aliases.add("model." + name[len("language_model."):])
+    elif name.startswith("model.") and not name.startswith("model.language_model."):
+        aliases.add("model.language_model." + name[len("model."):])
+    return aliases
+
+
+def _iter_ngram_from_disk(model_path: str, *, skip_names: set[str]):
+    """Stream n-gram tables that ``iter_weights`` is contracted to skip.
+
+    Preserve original HF keys and tensor bytes (no concat): ``moe/ngram_bank.py``
+    owns bank-ification / mmap. Concat would invent an FTW-only layout that
+    package cannot see in the source snapshot.
+
+    Ordering: this generator is consumed on the convert *main thread* before
+    ``load_expert_banks`` starts its reader threads. ``FTWWriter`` is not
+    thread-safe; writing n-gram here (not from a sink callback) keeps the
+    writer exclusive until the expert ``_ConvertSink`` lock takes over.
+    """
+    import safetensors
+
+    weight_map = load_weight_map(model_path)
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in weight_map.items():
+        if skip_names.intersection(_hf_aliases(name)):
+            continue
+        if classify_tensor(name) == DEST_NGRAM:
+            by_shard.setdefault(shard, []).append(name)
+    for fname in extra_safetensor_files(model_path, weight_map):
+        path = os.path.join(model_path, fname)
+        try:
+            hdr = read_safetensors_header(path)
+        except (OSError, ValueError):
+            continue
+        force = looks_like_ngram_shard(fname)
+        for name, meta in hdr.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            if skip_names.intersection(_hf_aliases(name)):
+                continue
+            if force or classify_tensor(name) == DEST_NGRAM:
+                by_shard.setdefault(fname, []).append(name)
+    for shard, names in sorted(by_shard.items()):
+        path = os.path.join(model_path, shard)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name in names:
+                yield name, f.get_tensor(name)
+
+
+def _require_qwen4_exp_registered(hf_cfg) -> None:
+    """Fail loud if this is qwen4_exp but ``models/qwen4_exp`` is not on the registry.
+
+    The converter stays model-agnostic and will not invent a loader; the other
+    worker owns ``parse_config`` / ``iter_weights`` / ``setup_offload_expert_banks``.
+    """
+    from freetoken.models.register import get_model_spec
+
+    archs = getattr(hf_cfg, "architectures", None) or []
+    if not archs:
+        raise SystemExit(f"{getattr(hf_cfg, 'model_type', '?')}: config has no architectures")
+    try:
+        get_model_spec(archs[0])
+    except ValueError:
+        cfg_dict = {
+            "architectures": list(archs),
+            "model_type": getattr(hf_cfg, "model_type", None),
+            "text_config": getattr(hf_cfg, "text_config", None),
+        }
+        if is_qwen4_exp_config(cfg_dict) or is_wrapper_config(cfg_dict):
+            raise SystemExit(
+                f"architecture {archs[0]!r} is not registered. qwen4_exp must export "
+                f"parse_config/iter_weights/setup_offload_expert_banks and be listed in "
+                f"models/register.py -- see /root/ftw_qwen_plan.md"
+            ) from None
+        raise
 
 # Checkpoint metadata to carry over so the FTW dir is a usable checkpoint on its own.
 # (Weight shards + the safetensors index are intentionally NOT copied.)
@@ -217,28 +314,65 @@ def convert_checkpoint(
             f"FTW conversion runs single-process and the format records no TP layout, "
             f"but TP is already set to size={tp.size}"
         )
-    dev = torch.device(device or "cuda:0")
-    torch.cuda.set_device(dev)
-    torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
+
+    # Recognize wrapper configs (text_config) before EngineConfig so a missing
+    # qwen4_exp registry entry fails with the contract, not a raw KeyError.
+    from freetoken.utils import cached_load_hf_config
+
+    hf_cfg = cached_load_hf_config(model_path)
+    _require_qwen4_exp_registered(hf_cfg)
+    wrapper = getattr(hf_cfg, "text_config", None) is not None
+    if wrapper:
+        text = getattr(hf_cfg, "text_config", hf_cfg)
+        print(
+            f"FTW convert: wrapper config model_type={getattr(hf_cfg, 'model_type', None)!r} "
+            f"text_config.model_type={getattr(text, 'model_type', None)!r} "
+            f"arch={getattr(hf_cfg, 'architectures', None)}",
+            flush=True,
+        )
+
+    # fp8_block (Qwen) conversion is CPU-capable: no NVFP4 dequant / marlin repack.
+    # DSV4/NVFP4 still need a CUDA context. Do not force cuda:0 when CUDA is absent
+    # -- that used to crash qwen4_exp convert on a CPU-only dry host.
+    if device:
+        dev = torch.device(device)
+    elif torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+    else:
+        dev = torch.device("cpu")
+    if dev.type == "cuda":
+        torch.cuda.set_device(dev)
+        torch.zeros(1, device=dev)  # init CUDA context (nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
                        dtype=dtype, moe_backend=moe_backend, expert_gguf=expert_gguf)
+    mc = cfg.model_config
     if expert_gguf:
+        # DSV4-only. Passing a GGUF against qwen4_exp would rewrite expert_quant to
+        # q2_k_ud and then look for dsv4_args / gguf expert rows that do not exist.
+        if getattr(mc, "dsv4_args", None) is None:
+            raise SystemExit(
+                "--expert-gguf is DeepSeek-V4 only; qwen4_exp / fp8 safetensors convert "
+                "natively (omit the flag)"
+            )
         # Must precede any expert_quant read below -- same ordering requirement as the
         # server's _adjust_config (see its comment): this rewrites model_config.expert_quant
         # to "q2_k_ud" and stashes the GGUF path on dsv4_args, in place, on the cached
         # ModelConfig instance cfg.model_config below will return.
         from freetoken.engine.engine import _apply_expert_gguf
 
-        _apply_expert_gguf(cfg, getattr(cfg.model_config, "dsv4_args", None) is not None)
-    mc = cfg.model_config
+        _apply_expert_gguf(cfg, True)
+        mc = cfg.model_config
+    # qwen4_exp model_type is "qwen4_exp" (no "moe" substring). is_moe is True only
+    # when parse_config sets moe_enabled=True -- see /root/ftw_qwen_plan.md.
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
 
     from freetoken.utils.progress import byte_bar, count_bar
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
-    n_weight = n_bank = n_alpha = 0
+    n_weight = n_bank = n_alpha = n_ngram = 0
+    seen_ngram: set[str] = set()
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -248,14 +382,43 @@ def convert_checkpoint(
     # was built under -- otherwise a serve-time switch (FREETOKEN_WO_A_FP8) gets baked in
     # at conversion and the checkpoint only serves the setting it was converted with. The
     # per-model adapt_weights hook re-applies at load (models/weight.py::load_weight).
+    #
+    # qwen4_exp / DSV4 pitfall: a model's adapt_weights (e.g. DSV4 wo_a FP8->bf16) must
+    # NOT run here. qwen4_exp must not put env-dependent folds in iter_weights.
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
                                               include_moe_experts=include_moe_experts,
                                               adapt=False),
                                   "Converting dense weights"):
+        dest = classify_tensor(name)
+        if dest == DEST_SKIP:
+            # Defense in depth: even if iter_weights leaks mtp.* / model.visual.*, drop.
+            continue
+        if dest == DEST_EXPERT and offload:
+            # Routed experts belong in layer_sink banks, not kind="weight".
+            continue
+        if dest == DEST_NGRAM:
+            writer.add_tensor(name, tensor, kind="ngram")
+            seen_ngram.add(name)
+            n_ngram += 1
+            dense_bytes += tensor.numel() * tensor.element_size()
+            _progress("dense", dense_bytes, 0)
+            continue
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
+
+    # 1b) n-gram pass-through: original HF keys, kind="ngram". iter_weights is
+    # contracted to skip these (they are not state-dict params). Write them here
+    # on the main thread before expert reader threads start (FTWWriter exclusivity).
+    ngram_bytes = 0
+    for name, tensor in count_bar(_iter_ngram_from_disk(model_path, skip_names=seen_ngram),
+                                  "Converting n-gram tables"):
+        writer.add_tensor(name, tensor, kind="ngram")
+        seen_ngram.add(name)
+        n_ngram += 1
+        ngram_bytes += tensor.numel() * tensor.element_size()
+        _progress("dense", dense_bytes + ngram_bytes, 0)
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -346,7 +509,14 @@ def convert_checkpoint(
         # needs each layer's own decode type (see ExpertBanks.quant_types's docstring).
         # None for every format whose banks are one uniform type (the common case).
         "expert_bank_quant_types": quant_types,
-        "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
+        "counts": {
+            "weight": n_weight,
+            "experts_bank": n_bank + n_alpha,
+            "ngram": n_ngram,
+        },
+        # n-gram tables are kind="ngram" (original HF names). ngram_bank.py reads
+        # them via iter_ftw_ngrams / FTWReader.entries("ngram") -- not load_state_dict.
+        "ngram_num_tensors": n_ngram,
         "copied_metadata": copied,
     })
     return index

@@ -47,8 +47,10 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     dt = time.perf_counter() - t
     c = index["counts"]
     gib = index["total_bytes"] / (1 << 30)
+    ngram = c.get("ngram", 0)
     print(f"\nwrote FTW checkpoint -> {ns.out}")
-    print(f"  tensors: {c['weight']} weight + {c['experts_bank']} experts_bank")
+    extra = f" + {ngram} ngram" if ngram else ""
+    print(f"  tensors: {c['weight']} weight + {c['experts_bank']} experts_bank{extra}")
     print(f"  FTW: {gib:.2f} GiB across {len(index['shards'])} shard(s) "
           f"(<= {ns.shard_gib} GiB each)")
     print(f"  quant_format: {index['quant_format']}  fingerprint={index['fingerprint']}")

@@ -16,11 +16,12 @@ FTW fixes both:
   exactly what O_DIRECT requires. A tensor larger than a shard simply spans shards; because
   both its start and the shard boundary are aligned, each piece stays aligned.
 * **Unified.** It holds dense weights as ``kind="weight"`` (exactly what a model's
-  ``iter_weights`` yields -- post fusion/TP-shard, fed straight to ``load_state_dict``) and
+  ``iter_weights`` yields -- post fusion/TP-shard, fed straight to ``load_state_dict``),
   the offload expert state as ``kind="experts_bank"`` (post backend-repack -- the per-expert
-  weight banks plus, distinguished only by their reserved names, the alpha scale vectors;
-  the FTW content). The converter runs the per-model loaders once; this reader is
-  model-agnostic.
+  weight banks plus, distinguished only by their reserved names, the alpha scale vectors),
+  and optional aux tables as ``kind="ngram"`` (Qwen n-gram embedding shards, original
+  names, not fed to ``load_state_dict``; ``moe/ngram_bank.py`` banks them at serve time).
+  The converter runs the per-model loaders once; this reader is model-agnostic.
 
 Layout on disk::
 
@@ -412,6 +413,17 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
         raise err[0]
 
 
+def iter_ftw_ngrams(path: str, **kwargs):
+    """Yield ``(name, host_tensor)`` for ``kind="ngram"`` entries.
+
+    Contract for ``moe/ngram_bank.py``: n-gram tables are stored under their *original
+    HF keys* (one FTW tensor per source tensor -- not concatenated). Default
+    ``iter_ftw_weights`` only replays ``kind="weight"``, so these never reach
+    ``load_state_dict``. Bank-ification (51 GiB mmap) is the ngram bank's job.
+    """
+    yield from iter_ftw_weights(path, kinds=("ngram",), **kwargs)
+
+
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
@@ -640,5 +652,5 @@ def load_ftw_banks(
 __all__ = [
     "INDEX_NAME", "FORMAT_TAG", "FORMAT_VERSION", "ALIGN", "DEFAULT_SHARD_LIMIT",
     "is_ftw_checkpoint", "FTWWriter", "FTWReader",
-    "iter_ftw_weights", "load_ftw_banks", "layer_bank_entry_name",
+    "iter_ftw_weights", "iter_ftw_ngrams", "load_ftw_banks", "layer_bank_entry_name",
 ]

@@ -291,6 +291,10 @@ class ModelConfig:
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
     # code; None for every other model.
     m3_args: Any | None = None
+    # Qwen3.8-Flash-Next (qwen4_exp) payload (Qwen4ExpArgs): hyper-connection widths, QSA
+    # indexer geometry (dormant in P0), n-gram/PLE table config and checkpoint path, GDN
+    # output-gate activation. Opaque to model-agnostic engine code; None otherwise.
+    qwen4_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

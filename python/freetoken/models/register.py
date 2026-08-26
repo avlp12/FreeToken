@@ -58,6 +58,21 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
+    # text_config, weights under model.language_model.); served text-only. Hyper-connected
+    # 4-stream residual (low-rank mHC), GDN 3:1 hybrid with sigmoid output gate, gated GQA
+    # full layers whose QSA indexer is loaded but dormant in P0 (dense == QSA for seqs
+    # <= indexer_budget), 512 top-10 block-fp8 routed experts from the offload cache,
+    # bf16 everything else, hashed n-gram PLE on layer 1 (table mmap-resident on host).
+    "Qwen4ExpForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
+    # Text-only sibling (the text_config's own architectures entry).
+    "Qwen4ExpForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.
