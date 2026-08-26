@@ -13,6 +13,7 @@ dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialize
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import pathlib
 import shutil
@@ -47,11 +48,41 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
+def _sources_digest() -> str:
+    """Content hash of every source file in ``csrc/gguf/``.
+
+    ``torch.utils.cpp_extension.load`` decides whether to rebuild by hashing the
+    files named in ``sources`` plus the build flags -- and ``sources`` here is just
+    ``gguf_kernel.cu``. Edit any of the ``.cuh`` headers it pulls in and that hash
+    is unchanged, so ``load`` short-circuits and silently hands back the STALE
+    ``.so``: the kernel you are editing is not the kernel that runs, and nothing
+    says so. (ninja tracks the header deps correctly via ``-MD``; it just never
+    gets asked.)
+
+    Folding a digest of the directory into an otherwise-dead ``-D`` puts the
+    headers back inside the rebuild key, so a header edit rebuilds exactly once
+    and an untouched tree still skips the build.
+    """
+    h = hashlib.sha256()
+    for f in sorted(_CSRC.iterdir()):
+        if f.suffix in (".cu", ".cuh", ".h"):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    extra_cuda_cflags = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        # Unused by the code; present only to pull the .cuh headers into
+        # load()'s rebuild key. See _sources_digest.
+        f"-DFREETOKEN_GGUF_SRC_DIGEST=g{_sources_digest()}",
+    ]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
