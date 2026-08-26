@@ -169,7 +169,15 @@ _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + ((2 * I // 128) * (H // 128) + (H // 128) * (I // 128)) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
-    "q2_k_ud": lambda H, I: 2 * I * (H // 256 * 98) + H * (I // 256 * 98),
+    # gate_up rows at the IQ3_XXS pitch (98 B / 256-element super-block), down rows at
+    # the MXFP4 pitch (17 B / 32-element block) -- each bank is sized by the widest ggml
+    # type its layers hold. At H=4096, I=2048 that is 6,422,528 + 4,456,448 = 10,878,976 B
+    # per (expert, layer), up 12.9% from the 9,633,792 of the pre-MXFP4 down pitch.
+    # Storage only. What a decode miss actually pulls over PCIe goes DOWN, to 9,342,690 B
+    # (8.91 MiB) on average from 9,633,792 (9.19 MiB): 42 of the 43 gate_up layers are
+    # copied at their 1184 B IQ2_XS width rather than at the 1568 B pitch, which more than
+    # pays for the wider down rows (see gguf_experts.q2k_ud_layer_copy_bytes).
+    "q2_k_ud": lambda H, I: 2 * I * (H // 256 * 98) + H * (I // 32 * 17),
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),

@@ -8,16 +8,25 @@ routed experts are stored in *several* ggml types at once -- IQ2_XS on most
 
 One bank cannot mix row strides, so the ``q2_k_ud`` schema
 (:data:`freetoken.moe.offload_cache._BANK_SCHEMAS`) stores BOTH banks at a uniform
-IQ3_XXS-width pitch -- ``row_bytes(H, IQ3_XXS)`` for gate_up, ``row_bytes(I,
-IQ3_XXS)`` for down -- and every narrower native row is copied into the row prefix
-with the tail left zero. ``ggml_moe_a8_vec``'s ``row_pitch_bytes`` then addresses
-those padded rows while decoding each row at its own (per-layer) ggml type, so a
-per-layer quant-type side table travels with the banks (see
-:func:`load_q2k_ud_expert_sources`'s return value).
+pitch wide enough for the widest type that bank holds -- ``row_bytes(H, IQ3_XXS)``
+for gate_up, ``row_bytes(I, MXFP4)`` for down -- and every narrower native row is
+copied into the row prefix with the tail left zero. ``ggml_moe_a8_vec``'s
+``row_pitch_bytes`` then addresses those padded rows while decoding each row at its
+own (per-layer) ggml type, so a per-layer quant-type side table travels with the
+banks (see :func:`load_q2k_ud_expert_sources`'s return value).
 
-MXFP4 is the one native type that does NOT fit the down pitch (1088 B > 784 B), so
-those rows are dequantized and re-encoded to Q2_K (672 B) at load. That is the only
-place this loader changes the numbers; everything else is a byte copy.
+Nothing here changes the numbers any more: every row is a byte copy of the GGUF's
+own bytes. Until the CUDA kernels learned MXFP4 (ggml type 39) the two down layers
+unsloth stored at 4.25 bpw did not fit the 784 B IQ3_XXS pitch, and they were
+dequantized and re-encoded to Q2_K RTN (672 B, ~0.28 relative RMS) to squeeze in --
+discarding the precision on precisely the layers it had been spent on. The down
+pitch is now 1088 B and those rows pass through untouched. :func:`quantize_q2_k`
+survives because the round-trip is still worth testing, not because anything calls
+it on the load path.
+
+The wider down pitch costs storage on every layer, not just the two: a q2_k_ud slot
+is 10,878,976 B instead of 9,633,792 (+12.9%). It costs far less than that in decode
+PCIe -- see :func:`q2k_ud_layer_copy_bytes`.
 """
 
 from __future__ import annotations
@@ -46,12 +55,17 @@ GGML_Q2_K = 10
 _QK_K = 256  # k-quant super-block
 _Q2_K_BYTES = 84  # 16 packed scale/min nibbles + 64 qs bytes + fp16 d + fp16 dmin
 
-# Bump whenever quantize_q2_k / _mxfp4_rows_to_q2_k's numerics change (the ALS fit, the
-# scale/min quantization, the qs bit layout, ...). checkpoint/convert.py folds this into an
-# FTW checkpoint's source fingerprint, so a re-encoder change is distinguishable from "same
-# GGUF, nothing changed" even though it produces different Q2_K bytes for the same input --
-# a stale FTW built with an older encoder is otherwise byte-identical-looking on disk.
-Q2K_REENCODE_VERSION = 1
+# Bump whenever the BYTES this loader writes into a bank change for an unchanged GGUF:
+# a re-encoder numerics change (the ALS fit, the scale/min quantization, the qs bit
+# layout), a pitch change, a type-table change. checkpoint/convert.py folds this into an
+# FTW checkpoint's source fingerprint, so an FTW built by an older loader refuses to load
+# with a rebuild message instead of being silently mis-decoded -- it is otherwise
+# byte-identical-looking on disk.
+#
+# 2: the down bank went from a 784 B IQ3_XXS pitch with layers 26/42 re-encoded to Q2_K,
+#    to a 1088 B MXFP4 pitch with those layers carried natively. Both the row stride and
+#    those layers' declared ggml type changed, so a v1 FTW is unreadable by this code.
+Q2K_REENCODE_VERSION = 2
 
 # One expert's worth of down rows per MXFP4 -> Q2_K chunk (H=4096 rows -> ~33 MB fp32).
 _REENCODE_EXPERTS_PER_RMS_SAMPLE = 64
@@ -65,7 +79,13 @@ _DOWN = "ffn_down_exps.weight"
 # --------------------------------------------------------------------------------------
 # Q2_K re-encode (RTN). gguf-py ships a Q2_K *dequantizer* but no quantizer
 # (``gguf.quants.quantize(..., Q2_K)`` raises NotImplementedError), so this is the
-# minimal round-trip-validated encoder for the MXFP4 down rows.
+# minimal round-trip-validated encoder that was written for the MXFP4 down rows.
+#
+# NOTHING ON THE LOAD PATH CALLS IT ANY MORE. The kernels gained native MXFP4 and the
+# down bank widened to fit it, so those rows are a byte copy like every other row. It
+# stays because it is the only Q2_K encoder in the tree and its round trip is worth
+# keeping tested -- and because it is the measurement of what the old path cost
+# (~0.28 relative RMS on layers 26 and 42) that a regression here would silently undo.
 # --------------------------------------------------------------------------------------
 
 
@@ -179,12 +199,87 @@ def _rel_rms(ref: np.ndarray, got: np.ndarray) -> float:
 
 
 def q2k_ud_expert_specs(args: DeepseekV4Args) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    """The two ``q2_k_ud`` bank specs: uniform IQ3_XXS-width row pitch on both."""
+    """The two ``q2_k_ud`` bank specs.
+
+    Each bank's row pitch is the widest native row any of its layers holds: IQ3_XXS
+    for gate_up (1568 B at H=4096), MXFP4 for down (1088 B at I=2048). Narrower layers
+    occupy a prefix of the row; see the module docstring.
+    """
     E, H, I = args.n_routed_experts, args.dim, args.moe_inter_dim
     return {
         "gate_up": ((E, 2 * I, row_bytes(H, GGML_IQ3_XXS)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_IQ3_XXS)), torch.uint8),
+        "down": ((E, H, row_bytes(I, GGML_MXFP4)), torch.uint8),
     }
+
+
+# Which banks are worth copying at their native width rather than at the full pitch on
+# a decode miss (see OffloadMoeCache.set_layer_copy_bytes). Not a correctness knob --
+# both settings copy the same payload -- but fewer PCIe bytes is not automatically less
+# PCIe time. Skipping the padding tail breaks each expert's read into one run per weight
+# row, and whether the shorter runs pay for the bytes they save depends on the geometry.
+# Measured on this box (PCIe 5.0 under WSL2 GPU-PV, 128 experts x 1024 rows, reproducible
+# across trials; tests/kernels/test_pitched_index_copy.py asserts both):
+#
+#   gate_up  1568 B pitch -> 1184 B IQ2_XS payload:   76% of the bytes,  78% of the time
+#   down     1088 B pitch ->  784 B IQ3_XXS payload:  72% of the bytes, 149% of the time
+#
+# So gate_up narrows and down does not. The follow-up that would win the down bank too is
+# to store a narrow layer's rows COMPACTED inside its expert slice and give the GEMV an
+# expert stride separate from its row pitch -- the copy is contiguous on both sides then
+# and the efficiency question disappears -- but that also moves the prefill GEMM's
+# slicing, so it is not folded in here.
+_COPY_NARROW_BANKS = ("gate_up",)
+
+
+def q2k_ud_layer_copy_bytes(
+    bank_sources: dict[str, list[torch.Tensor]],
+    quant_types: dict[str, list[int]],
+) -> dict[str, list[int]] | None:
+    """Per-(bank, layer) native row width for :meth:`OffloadMoeCache.set_layer_copy_bytes`.
+
+    Derived from the bank SHAPES rather than from ``DeepseekV4Args``, so it works
+    identically for a cold GGUF load and for an FTW checkpoint replay -- both hand the
+    cache the same ``[E, rows, pitch]`` tensors plus the per-layer type table, and
+    ``ncols`` is recoverable from the shape (the down bank has one row per hidden unit,
+    gate_up has two per intermediate unit).
+
+    Returns ``None`` if any layer's type is not one the kernels can size, which puts
+    every bank back on full-pitch copies -- the pre-existing behaviour. Only the banks
+    in :data:`_COPY_NARROW_BANKS` are narrowed; the rest are reported at their pitch,
+    which the cache treats as "nothing to do".
+    """
+    from freetoken.kernel.gguf import ggml_type_row_bytes
+
+    ncols = {
+        "gate_up": bank_sources["down"][0].shape[1],       # H
+        "down": bank_sources["gate_up"][0].shape[1] // 2,  # I
+    }
+    out: dict[str, list[int]] = {}
+    for name, types in quant_types.items():
+        pitch = int(bank_sources[name][0].shape[-1])
+        widths = []
+        for layer, qtype in enumerate(types):
+            if name not in _COPY_NARROW_BANKS:
+                widths.append(pitch)
+                continue
+            try:
+                native = int(ggml_type_row_bytes(int(qtype), int(ncols[name])))
+            except (ValueError, RuntimeError, ImportError):
+                native = 0
+            if not 0 < native <= pitch or native % 16 != 0:
+                # Unknown type, a row wider than the bank (impossible -- the loader
+                # rejects it), or a width the 16 B copy unit cannot express. Any of
+                # those and the whole declaration is dropped rather than silently
+                # applied to some layers: a partial table is harder to reason about
+                # than none.
+                logger.warning_rank0(
+                    f"q2_k_ud copy widths disabled: bank {name!r} layer {layer} has "
+                    f"ggml type {qtype} with native row {native} B against pitch {pitch} B"
+                )
+                return None
+            widths.append(native)
+        out[name] = widths
+    return out
 
 
 def _metadata_source(gguf_path: str) -> str:
@@ -321,26 +416,10 @@ def load_q2k_ud_expert_sources(
         banks["gate_up"][layer][:, lo:lo + I, :t.row_bytes] = src
 
     def _place_down(layer: int, t) -> None:
-        if t.ggml_type == GGML_MXFP4:
-            qtypes["down"][layer] = GGML_Q2_K
-            src = t.packed()  # [E*H, 1088]
-            dst = banks["down"][layer]
-            errs = []
-            for e in range(E):
-                q, ref = _mxfp4_rows_to_q2_k(src[e * H:(e + 1) * H].numpy())
-                dst[e, :, :q.shape[1]] = torch.from_numpy(q)
-                if e % _REENCODE_EXPERTS_PER_RMS_SAMPLE == 0:
-                    errs.append(_rel_rms(ref, _dequantize(q, GGML_Q2_K)))
-            logger.info_rank0(
-                f"blk.{layer}.ffn_down_exps: MXFP4 -> Q2_K re-encode, relative RMS "
-                f"{float(np.mean(errs)):.4f} (sampled {len(errs)}/{E} experts)"
-            )
-            return
         if t.row_bytes > dn_pitch:
             raise ValueError(
                 f"blk.{layer}: {GGML_NAME.get(t.ggml_type, t.ggml_type)} down row is "
-                f"{t.row_bytes} B, wider than the q2_k_ud down pitch {dn_pitch} B, and no "
-                "re-encoder is registered for it (only MXFP4 -> Q2_K)"
+                f"{t.row_bytes} B, wider than the q2_k_ud down pitch {dn_pitch} B"
             )
         qtypes["down"][layer] = t.ggml_type
         banks["down"][layer][:, :, :t.row_bytes] = t.packed().reshape(E, H, t.row_bytes)
@@ -381,6 +460,16 @@ def load_q2k_ud_expert_sources(
     missing = {k: sorted(want - v) for k, v in seen.items() if want - v}
     if missing:
         raise ValueError(f"--expert-gguf {gguf_path}: missing routed-expert tensors {missing}")
+    for name in ("gate_up", "down"):
+        tally: dict[int, list[int]] = {}
+        for layer in sorted(want):
+            tally.setdefault(qtypes[name][layer], []).append(layer)
+        parts = ", ".join(
+            f"{GGML_NAME.get(t, t)} x{len(ls)}"
+            + (f" (layers {ls})" if len(ls) <= 4 else "")
+            for t, ls in sorted(tally.items())
+        )
+        logger.info_rank0(f"q2_k_ud {name} bank: {parts}")
     return banks, qtypes
 
 
@@ -410,6 +499,7 @@ __all__ = [
     "Q2K_REENCODE_VERSION",
     "quantize_q2_k",
     "q2k_ud_expert_specs",
+    "q2k_ud_layer_copy_bytes",
     "load_q2k_ud_expert_sources",
     "dummy_q2k_ud_expert_sources",
 ]
