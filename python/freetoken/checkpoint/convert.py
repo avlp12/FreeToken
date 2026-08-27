@@ -651,6 +651,22 @@ def convert_checkpoint(
             n_ngram += 1
             ngram_bytes += tensor.numel() * tensor.element_size()
             _progress("dense", dense_bytes + ngram_bytes, 0)
+        # The GGUF's per_layer_token_embd.weight carries only the embedding table
+        # itself. The small checkpoint-authoritative sidecar buffers -- layer_multipliers,
+        # ngram_heads_offsets, ngram_heads_vocab_sizes (read unconditionally by
+        # Qwen4PLELayer.__init__ / _NGramTable.buffer(), regardless of table source,
+        # <= 128 B each) -- do not exist in the GGUF and must still come from --model.
+        # skip_names=seen_ngram excludes the shard_*.weight names already sourced from
+        # the GGUF above, so this pass only picks up those buffers (plus the fp8
+        # source's own ngram_embedding.weight_scale sidecar, harmless dead weight here:
+        # ngram.py sets weight_scale=1.0 for the IQ4_NL path without reading it back).
+        for name, tensor in count_bar(_iter_ngram_from_disk(model_path, skip_names=seen_ngram),
+                                      "Converting n-gram sidecar buffers"):
+            writer.add_tensor(name, tensor, kind="ngram")
+            seen_ngram.add(name)
+            n_ngram += 1
+            ngram_bytes += tensor.numel() * tensor.element_size()
+            _progress("dense", dense_bytes + ngram_bytes, 0)
     else:
         for name, tensor in count_bar(_iter_ngram_from_disk(model_path, skip_names=seen_ngram),
                                       "Converting n-gram tables"):
