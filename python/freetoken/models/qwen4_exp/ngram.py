@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import threading
+import time as _time
 import warnings
 
 import safetensors
@@ -10,8 +12,28 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP
+from freetoken.utils import init_logger
 
 from .hyperconnect import grouped_rms_norm
+
+logger = init_logger(__name__)
+
+# ---------- n-gram gather cost probe (temporary instrumentation) ----------
+# FREETOKEN_NGRAM_TIMING=N     -> after FREETOKEN_NGRAM_TIMING_SKIP warmup decode
+#   steps, wall-clock (time.perf_counter -- this path is host-side CPU, no CUDA
+#   involved) the next N decode-step n-gram gathers (both the gather() call alone
+#   and precompute_decode_ngram()'s total, which also includes the hash compute
+#   and the state bookkeeping) and log mean/median/min/max. Every prefill-path
+#   gather is logged individually (one call per request per chunk, so volume is
+#   bounded by the benchmark, not by decode-step count).
+# FREETOKEN_NGRAM_STUB=1       -> replace the real mmap gather with a constant
+#   zeros() return of the correct shape. Output is WRONG when this is set -- this
+#   is a COST PROBE ONLY, never a correctness path. The wall-time delta between a
+#   stub run and a real run at the same step count is the gather's true cost
+#   including page-fault effects.
+_NGRAM_TIMING = int(os.environ.get("FREETOKEN_NGRAM_TIMING", "0") or 0)
+_NGRAM_TIMING_SKIP = int(os.environ.get("FREETOKEN_NGRAM_TIMING_SKIP", "8") or 0)
+_NGRAM_STUB = int(os.environ.get("FREETOKEN_NGRAM_STUB", "0") or 0)
 
 # Reference: transformers modeling_qwen4_exp (Qwen4ExpTextNGramEmbedding /
 # Qwen4ExpTextPLELayer), read 2026-08-26. Faithful naive port:
@@ -100,6 +122,21 @@ class _NGramTable:
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         self._handles: dict[str, object] = {}
         self._shards: list[torch.Tensor | None] = [None] * split_parts
+        # Guards the lazy first-touch population of _handles / _shards above. No
+        # caller on this branch actually contends on it today (gather() is only ever
+        # invoked from the single engine thread here) -- it is included defensively
+        # so any future concurrent consumer of this table (e.g. a background
+        # prefetch thread) gets an already-correct primitive instead of re-deriving
+        # it. RLock, not Lock: _shard() holds it while calling _tensor(), which (on
+        # the non-FTW / safetensors path) acquires it again on the SAME thread -- a
+        # plain Lock self-deadlocks there the first time anything calls in through
+        # this lock reentrantly (caught during development of a since-shelved
+        # concurrent-prefetch experiment, by test_qwen4_ple_ngram_hoist.py, which
+        # runs against the real FP8/safetensors checkpoint and hung indefinitely
+        # until this was RLock -- landed here on its own merits since the failure
+        # mode is easy to reintroduce and easy to miss without a test that happens
+        # to exercise reentry).
+        self._lock = threading.RLock()
         self._ftw_locs: dict[str, tuple] | None = None
         self._iq4nl = False
         if os.path.isfile(index_path):
@@ -191,23 +228,27 @@ class _NGramTable:
         cached = self._handles.get(filename)
         if cached is not None:
             return cached[-1]
-        path = os.path.join(self.model_path, filename)
-        fh = open(path, "rb")
-        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", message="The given buffer is not writable"
-                )
-                u8 = torch.frombuffer(mm, dtype=torch.uint8)
-            self._handles[filename] = (fh, mm, u8)
-        except (ValueError, RuntimeError, TypeError):
-            import numpy as np
+        with self._lock:  # double-checked: another thread may have won the race
+            cached = self._handles.get(filename)
+            if cached is not None:
+                return cached[-1]
+            path = os.path.join(self.model_path, filename)
+            fh = open(path, "rb")
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="The given buffer is not writable"
+                    )
+                    u8 = torch.frombuffer(mm, dtype=torch.uint8)
+                self._handles[filename] = (fh, mm, u8)
+            except (ValueError, RuntimeError, TypeError):
+                import numpy as np
 
-            arr = np.memmap(path, dtype=np.uint8, mode="r")
-            u8 = torch.from_numpy(arr)
-            self._handles[filename] = (fh, mm, arr, u8)
-        return u8
+                arr = np.memmap(path, dtype=np.uint8, mode="r")
+                u8 = torch.from_numpy(arr)
+                self._handles[filename] = (fh, mm, arr, u8)
+            return u8
 
     def _tensor(self, key: str) -> torch.Tensor:
         if self._ftw_locs is not None:
@@ -218,17 +259,23 @@ class _NGramTable:
         shard_file = self._weight_map[key]
         h = self._handles.get(shard_file)
         if h is None:
-            h = safetensors.safe_open(
-                os.path.join(self.model_path, shard_file), framework="pt", device="cpu"
-            )
-            self._handles[shard_file] = h
+            with self._lock:
+                h = self._handles.get(shard_file)
+                if h is None:
+                    h = safetensors.safe_open(
+                        os.path.join(self.model_path, shard_file), framework="pt", device="cpu"
+                    )
+                    self._handles[shard_file] = h
         return h.get_tensor(key)
 
     def _shard(self, i: int) -> torch.Tensor:
         t = self._shards[i]
         if t is None:
-            t = self._tensor(f"{self.key_base}.shard_{i}.weight")
-            self._shards[i] = t
+            with self._lock:
+                t = self._shards[i]
+                if t is None:
+                    t = self._tensor(f"{self.key_base}.shard_{i}.weight")
+                    self._shards[i] = t
         return t
 
     def buffer(self, name: str) -> torch.Tensor:
@@ -264,6 +311,11 @@ class _NGramTable:
         """ids [*] int64 global rows -> [*, head_dim] dequantized embeddings (CPU gather,
         returned on ids' original device)."""
         device = ids.device
+        if _NGRAM_STUB:
+            # COST PROBE ONLY -- see module docstring. Skips the real mmap gather
+            # (host sync, data-dependent shard loop, unpinned H2D) entirely and
+            # returns zeros of the correct shape. Output is WRONG under this flag.
+            return torch.zeros(*ids.shape, self.head_dim, dtype=out_dtype, device=device)
         flat = ids.reshape(-1).cpu()
         shard_idx = torch.div(flat, self.rows_per_shard, rounding_mode="floor")
         local = flat - shard_idx * self.rows_per_shard
@@ -350,6 +402,11 @@ class Qwen4PLELayer(BaseOP):
         # pre-graph) and read by the (possibly captured) decode forward. Stable
         # address across replays -- see precompute_decode_ngram's docstring.
         self._ngram_embed_buf: torch.Tensor | None = None
+        # Cost-probe instrumentation state (env-gated, see module docstring).
+        self._ngram_timing_left = _NGRAM_TIMING
+        self._ngram_timing_skip = _NGRAM_TIMING_SKIP
+        self._decode_gather_ms: list[float] = []
+        self._decode_total_ms: list[float] = []
 
     # ---------- state pool ----------
 
@@ -377,8 +434,16 @@ class Qwen4PLELayer(BaseOP):
 
     # ---------- n-gram hashing ----------
 
-    def _ngram_embed(self, history: torch.Tensor, out_len: int, dtype) -> torch.Tensor:
-        """history [B, context_len + T] -> [B, out_len(=T), ple_embed_dim]."""
+    def _ngram_embed(
+        self, history: torch.Tensor, out_len: int, dtype, *, timing_tag: str | None = None
+    ) -> torch.Tensor:
+        """history [B, context_len + T] -> [B, out_len(=T), ple_embed_dim].
+
+        ``timing_tag`` ("decode" / "prefill") is a cost-probe hook only (see module
+        docstring): when set and ``FREETOKEN_NGRAM_TIMING`` is on, wall-clocks the
+        ``_table.gather`` call alone (excludes the hash compute above it) and
+        records/logs it. No effect on the returned value in any case.
+        """
         shifted = [
             _shift_right_ignore_eos(history, s, self.eos) for s in range(self.ngram_size)
         ]
@@ -394,7 +459,31 @@ class Qwen4PLELayer(BaseOP):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes.view(1, 1, -1))
             blocks.append(ids + offs.view(1, 1, -1))
         ids = torch.cat(blocks, dim=-1)[:, -out_len:]  # [B, T, ngram_heads]
-        emb = self._table.gather(ids, dtype)  # [B, T, heads, head_dim]
+        do_time = (
+            _NGRAM_TIMING > 0
+            and timing_tag is not None
+            and (timing_tag != "decode" or (self._ngram_timing_skip == 0 and self._ngram_timing_left > 0))
+        )
+        if do_time:
+            _g0 = _time.perf_counter()
+            emb = self._table.gather(ids, dtype)  # [B, T, heads, head_dim]
+            _gms = (_time.perf_counter() - _g0) * 1000.0
+            n_rows = ids.shape[0] * ids.shape[1]  # batch * out_len (tokens gathered)
+            if timing_tag == "decode":
+                self._decode_gather_ms.append(_gms)
+                logger.info_rank0(
+                    "[ngram-timing] decode step=%d layer=%d gather_ms=%.4f",
+                    len(self._decode_gather_ms), self.layer_idx, _gms,
+                )
+            elif timing_tag == "prefill":
+                logger.info_rank0(
+                    "[ngram-timing] prefill layer=%d tokens=%d rows=%d gather_ms=%.4f "
+                    "us_per_row=%.4f",
+                    self.layer_idx, out_len, n_rows, _gms,
+                    (_gms * 1000.0) / max(n_rows, 1),
+                )
+        else:
+            emb = self._table.gather(ids, dtype)  # [B, T, heads, head_dim]
         return emb.flatten(-2)
 
     # ---------- CUDA-graph hoist: eager pre-replay n-gram gather ----------
@@ -436,6 +525,10 @@ class Qwen4PLELayer(BaseOP):
         slot from the last step; this reads it (old state) before overwriting it
         with the new tail, same order as the pre-hoist decode forward used.
         """
+        _timing = (
+            _NGRAM_TIMING > 0 and self._ngram_timing_skip == 0 and self._ngram_timing_left > 0
+        )
+        _t0 = _time.perf_counter() if _timing else 0.0
         ctx = get_global_ctx()
         pool = ctx.linear_state_pool
         fla = batch.fla_metadata
@@ -452,9 +545,37 @@ class Qwen4PLELayer(BaseOP):
         idx64 = idx.long()
         input_ids = batch.input_ids.to(torch.long)
         hist = torch.cat([self._tok_hist[idx], input_ids.view(-1, 1)], dim=-1)  # [B, context_len+1]
-        emb = self._ngram_embed(hist, 1, self._ngram_embed_buf.dtype)[:, 0]  # [B, ple_embed_dim]
+        emb = self._ngram_embed(
+            hist, 1, self._ngram_embed_buf.dtype, timing_tag="decode"
+        )[:, 0]  # [B, ple_embed_dim]
         self._ngram_embed_buf.index_copy_(0, idx64, emb)
         self._tok_hist.index_copy_(0, idx64, hist[:, 1:])
+
+        # Cost-probe bookkeeping (see module docstring) -- runs AFTER the skip-warmup
+        # steps, times the whole eager hoist (hash + gather + state bookkeeping) for
+        # FREETOKEN_NGRAM_TIMING steps, then logs a summary once and stops.
+        if _NGRAM_TIMING > 0 and self._ngram_timing_skip > 0:
+            self._ngram_timing_skip -= 1
+        elif _timing:
+            self._decode_total_ms.append((_time.perf_counter() - _t0) * 1000.0)
+            self._ngram_timing_left -= 1
+            if self._ngram_timing_left == 0:
+                self._flush_ngram_timing()
+
+    def _flush_ngram_timing(self) -> None:
+        def _stats(vals: list[float], label: str) -> None:
+            if not vals:
+                return
+            v = sorted(vals)
+            n = len(v)
+            logger.info_rank0(
+                "[ngram-timing] decode %s over %d steps (layer=%d): mean=%.4fms "
+                "median=%.4fms min=%.4fms max=%.4fms",
+                label, n, self.layer_idx, sum(v) / n, v[n // 2], v[0], v[-1],
+            )
+
+        _stats(self._decode_gather_ms, "gather-only")
+        _stats(self._decode_total_ms, "precompute-total")
 
     # ---------- PLE core (matches the reference forward) ----------
 
@@ -535,7 +656,7 @@ class Qwen4PLELayer(BaseOP):
             slot = int(fla.cache_indices[r])
             ids_r = input_ids[s:e].view(1, -1)  # [1, T]
             hist = torch.cat([self._tok_hist[slot].view(1, -1), ids_r], dim=-1)
-            emb = self._ngram_embed(hist, e - s, x4.dtype)[0]  # [T, D]
+            emb = self._ngram_embed(hist, e - s, x4.dtype, timing_tag="prefill")[0]  # [T, D]
             gated = self._ple_core(x4[s:e], emb)  # [T, C]
             normed = grouped_rms_norm(gated, self.norm_conv.weight, self.hidden_size, self.eps)
             tail = self._conv_tail[slot]  # [C, 9]
