@@ -30,15 +30,64 @@ from .hyperconnect import grouped_rms_norm
 
 _PLE_PREFIX = "ple.ple_embedding."
 
+# GGUF IQ4_NL support (Task: source the n-gram/PLE table from the UD-Q4_K_XL GGUF's
+# `per_layer_token_embd.weight` instead of the fp8 safetensors release, to shrink the
+# FTW's resident working set: 47.68 GiB (fp8) -> 26.82 GiB (IQ4_NL). Verified against
+# the real GGUF via freetoken.models.gguf.reader.iter_gguf_tensors: torch_shape=
+# (320001536, 160), ggml_type=20 (IQ4_NL), row_bytes=90 -- i.e. the SAME 320,001,536-row
+# table as the fp8 source (128 shards x 2,500,012 rows/shard = 320,001,536, confirmed
+# against the real fp8 checkpoint's shard_0.weight shape), just packed 5 blocks/row
+# (head_dim=160, QK4_NL=32) instead of 1 fp8 byte/element.
+#
+# Block spec (llama.cpp / ggml GGUF format, this repo's own copy in
+# freetoken/kernel/csrc/gguf/ggml-common.h + dequantize.cuh):
+#   struct block_iq4_nl { half d; uint8_t qs[16]; };  // 18 bytes / 32 elements
+#   y[k]    = d * kvalues_iq4nl[qs[k] & 0xf]   for k in [0, 16)
+#   y[k+16] = d * kvalues_iq4nl[qs[k] >> 4]    for k in [0, 16)
+# A row of head_dim=160 is 5 independent blocks (5*18=90 bytes), matching the GGUF
+# reader's measured row_bytes=90 exactly.
+_KVALUES_IQ4NL = torch.tensor(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=torch.float32,
+)
+_IQ4NL_BLOCK_ELEMS = 32
+_IQ4NL_BLOCK_BYTES = 18
+
+
+def _dequantize_iq4nl_rows(
+    raw: torch.Tensor, head_dim: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """``[N, row_bytes]`` packed GGML IQ4_NL rows (uint8) -> ``[N, head_dim]`` dequantized.
+
+    Pure function, no state -- see the module-level comment above for the block spec
+    this mirrors (this repo's own dequantize.cuh, same LUT and bit layout).
+    """
+    assert head_dim % _IQ4NL_BLOCK_ELEMS == 0, head_dim
+    n_blocks = head_dim // _IQ4NL_BLOCK_ELEMS
+    n = raw.shape[0]
+    assert raw.shape[1] == n_blocks * _IQ4NL_BLOCK_BYTES, (raw.shape, head_dim)
+    blocks = raw.reshape(n, n_blocks, _IQ4NL_BLOCK_BYTES)
+    d = blocks[:, :, 0:2].contiguous().view(torch.float16).to(torch.float32).squeeze(-1)
+    qs = blocks[:, :, 2:2 + _IQ4NL_BLOCK_ELEMS // 2]  # [n, n_blocks, 16] uint8
+    lut = _KVALUES_IQ4NL.to(raw.device)
+    lo = lut[(qs & 0x0F).long()]  # [n, n_blocks, 16]
+    hi = lut[(qs >> 4).long()]  # [n, n_blocks, 16]
+    out = torch.empty(n, n_blocks, _IQ4NL_BLOCK_ELEMS, dtype=torch.float32, device=raw.device)
+    out[:, :, : _IQ4NL_BLOCK_ELEMS // 2] = lo * d.unsqueeze(-1)
+    out[:, :, _IQ4NL_BLOCK_ELEMS // 2 :] = hi * d.unsqueeze(-1)
+    return out.reshape(n, head_dim).to(out_dtype)
+
 
 class _NGramTable:
-    """Lazy, mmap-backed reader of the sharded fp8 n-gram embedding table.
+    """Lazy, mmap-backed reader of the sharded n-gram embedding table.
 
     Dual path: if ``model.safetensors.index.json`` is present, keep the original
-    safetensors ``safe_open`` / ``get_tensor`` mmap. Otherwise parse the FTW
-    index (``freetoken_weight.json``) and mmap ``kind="ngram"`` tensors in
-    place. ``iter_ftw_ngrams`` materializes every n-gram tensor (~47 GiB) so
-    it is not used: this path only records ``(file, offset, shape, dtype)``
+    safetensors ``safe_open`` / ``get_tensor`` mmap (always fp8 -- the fp8 release
+    is the only safetensors source). Otherwise parse the FTW index
+    (``freetoken_weight.json``) and mmap ``kind="ngram"`` (fp8 passthrough) or
+    ``kind="ngram_iq4nl"`` (GGUF-sourced, packed IQ4_NL) tensors in place.
+    ``iter_ftw_ngrams`` materializes every n-gram tensor (~27-48 GiB depending on
+    source) so it is not used: this path only records ``(file, offset, shape, dtype)``
     and gathers the requested rows.
     """
 
@@ -52,24 +101,42 @@ class _NGramTable:
         self._handles: dict[str, object] = {}
         self._shards: list[torch.Tensor | None] = [None] * split_parts
         self._ftw_locs: dict[str, tuple] | None = None
+        self._iq4nl = False
         if os.path.isfile(index_path):
             with open(index_path) as fh:
                 self._weight_map = json.load(fh)["weight_map"]
         else:
             self._weight_map = {}
             self._ftw_locs = self._load_ftw_ngram_locs()
-        self.weight_scale = self._tensor(f"{self.key_base}.weight_scale").float().item()
+        if self._iq4nl:
+            # Scale is per-block (block_iq4_nl.d), already applied by
+            # _dequantize_iq4nl_rows -- no separate global scale tensor exists for
+            # this source, unlike the fp8 release's single weight_scale.
+            self.weight_scale = 1.0
+        else:
+            self.weight_scale = self._tensor(f"{self.key_base}.weight_scale").float().item()
         if self._ftw_locs is not None:
             _file, _off, shape, _dt, _nb = self._ftw_locs[f"{self.key_base}.shard_0.weight"]
             self.rows_per_shard = int(shape[0])
-            self.head_dim = int(shape[1])
+            if self._iq4nl:
+                # shape is the PACKED byte layout [rows, row_bytes] (dtype=uint8);
+                # head_dim is derived algebraically from row_bytes, not read directly
+                # (row_bytes=90 -> 5 IQ4_NL blocks -> head_dim=160).
+                row_bytes = int(shape[1])
+                assert row_bytes % _IQ4NL_BLOCK_BYTES == 0, row_bytes
+                self.head_dim = (row_bytes // _IQ4NL_BLOCK_BYTES) * _IQ4NL_BLOCK_ELEMS
+            else:
+                self.head_dim = int(shape[1])
         else:
             shard0 = self._shard(0)
             self.rows_per_shard = shard0.shape[0]
             self.head_dim = shard0.shape[1]
 
     def _load_ftw_ngram_locs(self) -> dict[str, tuple]:
-        """Index FTW ``kind=ngram`` tensors without reading their payloads."""
+        """Index FTW ``kind=ngram``/``kind=ngram_iq4nl`` tensors without reading
+        their payloads. Sets ``self._iq4nl`` as a side effect, from whichever kind
+        the checkpoint's own shard_0 entry actually has (a single FTW carries only
+        one ngram source -- convert.py never mixes the two)."""
         from freetoken.checkpoint.ftw import INDEX_NAME
 
         index_path = os.path.join(self.model_path, INDEX_NAME)
@@ -82,9 +149,12 @@ class _NGramTable:
             index = json.load(fh)
         shards = sorted(index["shards"], key=lambda s: s["global_off"])
         locs: dict[str, tuple] = {}
+        kinds: dict[str, str] = {}
         for t in index["tensors"]:
-            if t.get("kind") != "ngram":
+            kind = t.get("kind")
+            if kind not in ("ngram", "ngram_iq4nl"):
                 continue
+            kinds[t["name"]] = kind
             pieces: list[tuple[str, int, int]] = []
             remaining = int(t["nbytes"])
             pos = int(t["global_off"])
@@ -112,6 +182,8 @@ class _NGramTable:
             key = f"{self.key_base}.shard_{i}.weight"
             if key not in locs:
                 raise KeyError(f"FTW ngram missing {key}")
+        shard0_kind = kinds.get(f"{self.key_base}.shard_0.weight")
+        self._iq4nl = shard0_kind == "ngram_iq4nl"
         return locs
 
     def _ftw_u8(self, filename: str) -> torch.Tensor:
@@ -166,18 +238,26 @@ class _NGramTable:
         return self._tensor(key).clone()
 
     def _rows(self, shard_i: int, local: torch.Tensor) -> torch.Tensor:
-        """fp8 rows ``[N, head_dim]``. Source path uses the cached mmap shard;
-        FTW indexes the uint8 file view so only the selected row bytes are copied."""
+        """Rows ``[N, head_dim]``, real values (fp8 already-scaled-by-gather()'s
+        caller, or IQ4_NL already fully dequantized here). Source path uses the
+        cached mmap shard; FTW indexes the uint8 file view so only the selected row
+        bytes are copied."""
         if self._ftw_locs is None:
             return self._shard(shard_i).index_select(0, local)
         file, file_off, shape, dtype, nbytes = self._ftw_locs[
             f"{self.key_base}.shard_{shard_i}.weight"
         ]
+        # row_nbytes is correct for BOTH sources: fp8 shape[1]=head_dim,
+        # dtype.itemsize=1 -> head_dim bytes/row; IQ4_NL shape[1]=row_bytes (packed),
+        # dtype=uint8, itemsize=1 -> row_bytes bytes/row (shape[1] IS already the
+        # packed byte width in that case, not an element count).
         row_nbytes = int(shape[1]) * dtype.itemsize
         table = self._ftw_u8(file)[file_off:file_off + nbytes].view(
             int(shape[0]), row_nbytes
         )
         gathered = table.index_select(0, local)
+        if self._iq4nl:
+            return _dequantize_iq4nl_rows(gathered, self.head_dim, torch.float32)
         return gathered.view(dtype).view(local.numel(), int(shape[1]))
 
     def gather(self, ids: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:

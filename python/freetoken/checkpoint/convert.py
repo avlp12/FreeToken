@@ -64,7 +64,9 @@ def _progress(phase: str, done: int = 0, total: int = 0) -> None:
         print(f"FTCONVERT {phase} {done} {total}", flush=True)
 
 
-def _source_fingerprint(model_path: str, model_config, *, device) -> str:
+def _source_fingerprint(
+    model_path: str, model_config, *, device, ngram_gguf: str | None = None
+) -> str:
     """Identity of (checkpoint + quant + GPU capability), stored in the FTW index so
     it's clear what an FTW was built from. Cheap (stat only)."""
     h = hashlib.sha256()
@@ -103,22 +105,43 @@ def _source_fingerprint(model_path: str, model_config, *, device) -> str:
         for f in sorted(_split_shard_paths(gguf_path) or [gguf_path]):
             st = os.stat(f)
             h.update(f"expert_gguf:{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
+    # --ngram-gguf: n-gram/PLE table sourced from a GGUF (IQ4_NL) instead of model_path's
+    # own fp8 release -- fold in its file identity so a swapped ngram source invalidates
+    # a stale FTW even when neither model_path nor expert_gguf changed.
+    if ngram_gguf:
+        from freetoken.models.gguf.reader import _split_shard_paths
+
+        for f in sorted(_split_shard_paths(ngram_gguf) or [ngram_gguf]):
+            st = os.stat(f)
+            h.update(f"ngram_gguf:{os.path.basename(f)}:{st.st_size}:{int(st.st_mtime)}|".encode())
     return h.hexdigest()[:16]
 
 
-def _estimate_output_bytes(model_path: str, expert_gguf: str | None) -> int:
+def _estimate_output_bytes(
+    model_path: str, expert_gguf: str | None, ngram_gguf: str | None = None
+) -> int:
     """Cheap (header-only + file-stat-only, no tensor data read) upper-bound estimate of
     the FTW's on-disk payload, for the pre-flight disk-space guard.
 
     Sums safetensors header ``nbytes`` for everything EXCEPT the target's own routed
     experts (``DEST_EXPERT``) when ``--expert-gguf`` replaces them with a (much smaller)
     quantized bank -- in that case the GGUF shard set's real file size is added instead
-    (a stat() per shard, not a parse). mtp.* tensors are always counted in full: this
-    converter preserves them losslessly regardless of --expert-gguf (see
-    ``_iter_mtp_from_disk``). Under-counts slightly (ignores the FTW's own per-tensor
-    4096-byte alignment padding and the GGUF's block-quant metadata overhead) but is
-    within a few percent of the real total -- fine for a coarse pre-flight guard, not
-    used for anything else.
+    (a stat() per shard, not a parse). Same exclusion for the n-gram table
+    (``DEST_NGRAM``) when ``--ngram-gguf`` replaces it: excluded from the fp8-source sum,
+    replaced by the GGUF tensor's own precise packed byte count (``iter_gguf_tensors``
+    header parse, not a full-file stat -- unlike ``--expert-gguf``'s file-size
+    approximation, the ngram table's real payload is a small, known fraction of a GGUF
+    that may also carry unrelated expert-bank tensors, so a whole-file stat would badly
+    overcount here). mtp.* tensors are always counted in full: this converter preserves
+    them losslessly regardless of --expert-gguf (see ``_iter_mtp_from_disk``).
+    Under-counts slightly (ignores the FTW's own per-tensor 4096-byte alignment padding
+    and the GGUF's block-quant metadata overhead) but is within a few percent of the
+    real total -- fine for a coarse pre-flight guard, not used for anything else.
+
+    NOTE: if ``ngram_gguf`` and ``expert_gguf`` are the SAME file, the ``expert_gguf``
+    branch's whole-file-size approximation already includes those bytes once; adding the
+    ngram tensor's bytes again is a small known over-count (conservative direction --
+    the guard is more likely to refuse a marginal conversion, never less).
     """
     weight_map = load_weight_map(model_path)
     shards = sorted(set(weight_map.values()))
@@ -132,16 +155,27 @@ def _estimate_output_bytes(model_path: str, expert_gguf: str | None) -> int:
             continue
         if dest == DEST_EXPERT and expert_gguf:
             continue  # replaced below by the GGUF's own (smaller) shard bytes
+        if dest == DEST_NGRAM and ngram_gguf:
+            continue  # replaced below by the GGUF tensor's own (smaller, IQ4_NL) bytes
         total += nbytes
     if expert_gguf:
         from freetoken.models.gguf.reader import _split_shard_paths
 
         for f in sorted(_split_shard_paths(expert_gguf) or [expert_gguf]):
             total += os.path.getsize(f)
+    if ngram_gguf:
+        from freetoken.models.gguf.reader import iter_gguf_tensors
+
+        for t in iter_gguf_tensors(ngram_gguf):
+            if t.name == "per_layer_token_embd.weight":
+                total += t.rows * t.row_bytes
+                break
     return total
 
 
-def _guard_output_dir(out_dir: str, model_path: str, expert_gguf: str | None) -> None:
+def _guard_output_dir(
+    out_dir: str, model_path: str, expert_gguf: str | None, ngram_gguf: str | None = None
+) -> None:
     """Refuse to start a conversion that would overwrite an existing dir or run the
     output volume below ``_MIN_FREE_BYTES_AFTER``. Both checks are cheap (no tensor data
     read) and run before any bytes are written."""
@@ -151,7 +185,7 @@ def _guard_output_dir(out_dir: str, model_path: str, expert_gguf: str | None) ->
             f"dir looks valid but is silently truncated; remove it first if you intend "
             f"to rebuild)"
         )
-    estimated = _estimate_output_bytes(model_path, expert_gguf)
+    estimated = _estimate_output_bytes(model_path, expert_gguf, ngram_gguf)
     probe_dir = os.path.dirname(os.path.abspath(out_dir)) or os.sep
     os.makedirs(probe_dir, exist_ok=True)
     free = disk_free_bytes(probe_dir)
@@ -223,6 +257,52 @@ def _iter_ngram_from_disk(model_path: str, *, skip_names: set[str]):
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             for name in names:
                 yield name, f.get_tensor(name)
+
+
+def _iter_ngram_from_gguf(gguf_path: str, *, layer_idx: int, split_parts: int):
+    """Stream the n-gram/PLE table from a GGUF's ``per_layer_token_embd.weight``
+    tensor (IQ4_NL-quantized) instead of the fp8 safetensors release, split into
+    ``split_parts`` equal row-chunks matching the fp8 release's own shard layout
+    (128 shards x 2,500,012 rows/shard for the released checkpoint) so
+    ``models/qwen4_exp/ngram.py``'s ``_NGramTable`` needs no special case for a
+    different split-part count -- only the per-row byte layout changes (packed IQ4_NL
+    blocks instead of one fp8 byte/element), which ``_NGramTable`` tells apart by FTW
+    tensor ``kind`` ("ngram_iq4nl" here vs "ngram" for the fp8 passthrough).
+
+    Shrinks this table 47.68 GiB (fp8) -> 26.82 GiB (IQ4_NL) in the resulting FTW.
+    Verified against the real UD-Q4_K_XL GGUF: torch_shape=(320001536, 160),
+    ggml_type=20 (IQ4_NL), row_bytes=90 -- the SAME 320,001,536-row table as the fp8
+    source (confirmed by reading the real fp8 checkpoint's own shard_0.weight shape:
+    128 * 2,500,012 = 320,001,536).
+
+    Yields ``(name, kind, tensor)`` -- same 3-tuple shape as ``_iter_mtp_from_disk``,
+    so ``convert_checkpoint`` can loop over it the same way.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    key_base = f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding"
+    target = None
+    for t in iter_gguf_tensors(gguf_path):
+        if t.name == "per_layer_token_embd.weight":
+            target = t
+            break
+    if target is None:
+        raise SystemExit(
+            f"{gguf_path}: no per_layer_token_embd.weight tensor found -- cannot "
+            f"source the n-gram/PLE table from this GGUF (--ngram-gguf requires a "
+            f"GGUF that carries the IQ4_NL PLE table, e.g. unsloth's UD-Q4_K_XL)"
+        )
+    total_rows = target.rows
+    if total_rows % split_parts != 0:
+        raise SystemExit(
+            f"{gguf_path}: per_layer_token_embd.weight has {total_rows} rows, not "
+            f"evenly divisible by split_ngram_parts={split_parts}"
+        )
+    rows_per_shard = total_rows // split_parts
+    packed = target.packed()  # [rows, row_bytes] uint8, zero-copy mmap view
+    for i in range(split_parts):
+        chunk = packed[i * rows_per_shard:(i + 1) * rows_per_shard].clone()
+        yield f"{key_base}.shard_{i}.weight", "ngram_iq4nl", chunk
 
 
 def _iter_mtp_from_disk(model_path: str, *, skip_names: set[str]):
@@ -410,6 +490,7 @@ def convert_checkpoint(
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
     expert_gguf: str | None = None,
+    ngram_gguf: str | None = None,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -426,6 +507,16 @@ def convert_checkpoint(
     re-parse of the (multi-GB, split-shard) GGUF -- but ``--expert-gguf`` must still be
     passed at boot (cheap: a path check, not a parse) so ``ModelConfig.expert_quant``
     resolves the same way it would on a cold boot; see ``engine.engine._apply_expert_gguf``.
+
+    ``ngram_gguf``: qwen4_exp only. Source the n-gram/PLE embedding table from this
+    GGUF's ``per_layer_token_embd.weight`` (IQ4_NL, ~26.82 GiB) instead of the fp8
+    safetensors release's own table (~47.68 GiB) -- a precision change, not just a
+    size change (see ``models/qwen4_exp/ngram.py``'s ``_dequantize_iq4nl_rows`` for
+    the exact block spec and its cross-validation against this repo's own CUDA IQ4_NL
+    dequant kernel). Independent of ``expert_gguf`` -- may be the same GGUF path or a
+    different one, and either may be set without the other. Off by default: this
+    trades table precision for host RAM working-set size, so it is opt-in, not
+    inferred from ``expert_gguf`` being present.
     """
     from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
     from freetoken.engine.config import EngineConfig
@@ -435,7 +526,7 @@ def convert_checkpoint(
 
     if is_ftw_checkpoint(model_path):
         raise SystemExit(f"{model_path} is already an FTW checkpoint")
-    _guard_output_dir(out_dir, model_path, expert_gguf)
+    _guard_output_dir(out_dir, model_path, expert_gguf, ngram_gguf)
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
@@ -536,17 +627,38 @@ def convert_checkpoint(
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
-    # 1b) n-gram pass-through: original HF keys, kind="ngram". iter_weights is
-    # contracted to skip these (they are not state-dict params). Write them here
-    # on the main thread before expert reader threads start (FTWWriter exclusivity).
+    # 1b) n-gram pass-through: original HF keys, kind="ngram" (fp8, from --model) or
+    # kind="ngram_iq4nl" (packed IQ4_NL, from --ngram-gguf). iter_weights is contracted
+    # to skip these (they are not state-dict params). Write them here on the main
+    # thread before expert reader threads start (FTWWriter exclusivity).
     ngram_bytes = 0
-    for name, tensor in count_bar(_iter_ngram_from_disk(model_path, skip_names=seen_ngram),
-                                  "Converting n-gram tables"):
-        writer.add_tensor(name, tensor, kind="ngram")
-        seen_ngram.add(name)
-        n_ngram += 1
-        ngram_bytes += tensor.numel() * tensor.element_size()
-        _progress("dense", dense_bytes + ngram_bytes, 0)
+    if ngram_gguf:
+        qwen4_args = getattr(mc, "qwen4_args", None)
+        if qwen4_args is None:
+            raise SystemExit("--ngram-gguf requires a qwen4_exp model (no qwen4_args on model_config)")
+        ple_layers = qwen4_args.ple_layer_indices
+        if len(ple_layers) != 1:
+            raise SystemExit(
+                f"--ngram-gguf assumes exactly one PLE layer (the released checkpoint's "
+                f"layout); got ple_layer_indices={ple_layers}"
+            )
+        ngram_source = _iter_ngram_from_gguf(
+            ngram_gguf, layer_idx=ple_layers[0], split_parts=qwen4_args.split_ngram_parts,
+        )
+        for name, kind, tensor in count_bar(ngram_source, "Converting n-gram table (GGUF/IQ4_NL)"):
+            writer.add_tensor(name, tensor, kind=kind)
+            seen_ngram.add(name)
+            n_ngram += 1
+            ngram_bytes += tensor.numel() * tensor.element_size()
+            _progress("dense", dense_bytes + ngram_bytes, 0)
+    else:
+        for name, tensor in count_bar(_iter_ngram_from_disk(model_path, skip_names=seen_ngram),
+                                      "Converting n-gram tables"):
+            writer.add_tensor(name, tensor, kind="ngram")
+            seen_ngram.add(name)
+            n_ngram += 1
+            ngram_bytes += tensor.numel() * tensor.element_size()
+            _progress("dense", dense_bytes + ngram_bytes, 0)
 
     # 1c) MTP drafter pass-through: original HF keys, kind="mtp_dense" / "mtp_expert".
     # Preserved losslessly for a later phase (no Qwen4ExpForCausalLM.mtp submodule exists
@@ -633,7 +745,7 @@ def convert_checkpoint(
     copied = _copy_metadata(model_path, out_dir)
 
     try:
-        fingerprint = _source_fingerprint(model_path, mc, device=dev)
+        fingerprint = _source_fingerprint(model_path, mc, device=dev, ngram_gguf=ngram_gguf)
     except Exception:
         fingerprint = None
 

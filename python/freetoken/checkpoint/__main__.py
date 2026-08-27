@@ -35,6 +35,15 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                         "from --model; pass the same --expert-gguf again when serving the "
                         "converted FTW dir (cheap path check -- the fast FTW load skips the "
                         "actual GGUF re-parse).")
+    p.add_argument("--ngram-gguf", default=None,
+                   help="qwen4_exp only: source the n-gram/PLE embedding table from this "
+                        "GGUF's per_layer_token_embd.weight (IQ4_NL, ~26.82 GiB) instead of "
+                        "--model's own fp8 release (~47.68 GiB). Independent of "
+                        "--expert-gguf -- may be the same GGUF file or a different one, or "
+                        "omitted while --expert-gguf is set (and vice versa). Off by "
+                        "default: this is a precision change to a table that feeds every "
+                        "token, not just a size change -- verify output quality before "
+                        "shipping an FTW built with this flag.")
     ns = p.parse_args(argv)
 
     shard_limit = int(ns.shard_gib * (1 << 30))
@@ -43,7 +52,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, shard_limit=shard_limit, device=ns.device,
-        expert_gguf=ns.expert_gguf,
+        expert_gguf=ns.expert_gguf, ngram_gguf=ns.ngram_gguf,
     )
     dt = time.perf_counter() - t
     c = index["counts"]
