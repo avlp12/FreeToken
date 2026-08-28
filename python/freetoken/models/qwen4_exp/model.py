@@ -87,6 +87,7 @@ class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig):
         args = config.qwen4_args
         self._hc_count = args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -99,8 +100,38 @@ class Qwen4ExpModel(BaseOP):
             use_combine=False,
         )
 
+    def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Scatter precomputed image soft-token embeddings at image-token positions.
+
+        Same contract as Gemma4's ``_merge_multimodal`` (``models/gemma4/model.py:68-86``):
+        ``mm_embeds`` (set by the scheduler from each request's vision features, see
+        ``scheduler/scheduler.py``'s ``_gather_multimodal``) is a
+        ``[num_image_tokens, hidden]`` tensor whose rows replace the placeholder embeddings
+        produced for ``image_token_id``. Only runs during prefill batches that carry images;
+        text-only batches (``mm_embeds is None``, the production default) return ``x``
+        unchanged.
+
+        Must be called on ``x`` BEFORE the hyper-connection replication
+        (``x4 = x.repeat(1, self._hc_count)`` in ``forward`` below) -- splicing after the
+        repeat would scatter each image embedding into only one of the ``hc_count``
+        replicated copies instead of all of them, corrupting every hyper-connection stream
+        but the first.
+        """
+        batch = get_global_ctx().batch
+        mm_embeds = getattr(batch, "mm_embeds", None)
+        if mm_embeds is None or self._image_token_id is None:
+            return x
+        mask = input_ids == self._image_token_id
+        n_slots = int(mask.sum().item())
+        assert n_slots == mm_embeds.shape[0], (
+            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
+            "image tokens must not be split across prefill chunks"
+        )
+        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        x = self._merge_multimodal(input_ids, x)
         x4 = x.repeat(1, self._hc_count)
         for layer in self.layers.op_list:
             x4 = layer.forward(x4)
