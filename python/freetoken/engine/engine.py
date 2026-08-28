@@ -430,6 +430,26 @@ def _share_cpu_threads_across_ranks(tp_size: int) -> None:
         )
 
 
+def _highwater_prefill_len(
+    max_seq_len: int,
+    max_forward_len: int,
+    max_extend_tokens: int | None,
+    page_table_width: int,
+) -> int | None:
+    """Largest prefill the scheduler will submit, or None if warmup is a no-op.
+
+    ``SchedulerConfig.max_forward_len`` is ``--max-prefill-length``. Plain
+    ``EngineConfig.max_forward_len`` is ``max_seq_len``, which would try to
+    allocate a full-context FLA scratch and OOM -- cap that path at 8192.
+    """
+    max_chunk = int(max_extend_tokens or 0)
+    if max_chunk <= 0:
+        max_chunk = min(int(max_forward_len), 8192)
+    length = min(int(max_seq_len), max_chunk, int(page_table_width))
+    return length if length >= 2 else None
+
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -561,6 +581,7 @@ class Engine:
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
         post_free_memory = self._sync_get_memory()[0]
+        self._post_init_free_memory = post_free_memory
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
@@ -591,9 +612,10 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
         self._init_dspark_adaptive_verification()
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        # Always: the previous triton-only gate left this dead for fa/fi/auto,
+        # and the 80/128-token lengths never touched the 8192-token dequant-GEMM
+        # high-water that WSL2 dxgk refuses to make resident mid-request.
+        self._warmup_prefill()
 
     def log_distribution_summary(self) -> None:
         """Gather final TP placement and print it immediately before readiness."""
@@ -1800,35 +1822,64 @@ class Engine:
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
-        """Compile the Triton prefill path before the first real request.
+        """Raise the CUDA caching allocator to the worst-case prefill high-water.
 
-        Decode CUDA graph capture warms the decode path, but the first prefill
-        can still pay Triton/cublas setup costs. Use the dummy request row and
-        restore it afterwards so padded decode graph replay keeps using the
-        dedicated dummy KV slot.
+        WSL2 dxgk can refuse a NEW make_resident when free VRAM is thin
+        (``CUDA driver error: device not ready`` / ``dxgkio_make_resident -12``),
+        surfacing asynchronously two kernels later. Per-callsite persistent
+        scratch (``fla-persistent-scratch``) only moved the crash to the next
+        ``torch.empty_like`` on the hot path. Running the scheduler's largest
+        legal prefill once at boot forces those byte-blocks resident; later
+        requests reuse them instead of asking the driver for more -- the
+        ``ggml_backend_sched_reserve()`` idea. Fail loudly here if it does not
+        fit, with the two knobs that actually buy headroom.
+
+        The dummy request row is borrowed and restored so padded decode-graph
+        replay keeps using the dedicated dummy KV slot.
         """
-        if self.max_seq_len < 2:
+        if getattr(self.config, "use_dummy_weight", False):
+            logger.info_rank0("Prefill high-water warmup skipped for --dummy-weight")
             return
-
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
-        if not warmup_lens:
+        if AttnType.DSV4 in _required_attn_types(self.config.model_config):
+            # DSV4 prefill reads pool.full_loc_map, filled only by the scheduler.
+            logger.info_rank0("Prefill high-water warmup skipped for DSV4.")
             return
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
+        length = _highwater_prefill_len(
+            max_seq_len=self.max_seq_len,
+            max_forward_len=int(self.config.max_forward_len),
+            max_extend_tokens=getattr(self.config, "max_extend_tokens", None),
+            page_table_width=int(dummy_row.numel()),
+        )
+        if length is None:
+            return
+
         dummy_slot = int(dummy_row[0].item())
+        reserved_before = torch.cuda.memory_reserved(self.device)
+        allocated_before = torch.cuda.memory_allocated(self.device)
+        free_before = get_free_memory(self.device)
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
+        warm_req = None
+        batch = None
+        # Two passes: pass 1 is a cold-cache 8192-chunk (first user prefill);
+        # pass 2 is the same chunk with the MoE cache already populated, which
+        # is the cell that crashed at --moe-cache-size 3500 after a single-pass
+        # warmup had already succeeded at boot with free=0.00 GiB. All-zero
+        # token ids collapse the router; randint spreads dequant-GEMM tiles.
+        n_passes = 2 if self.moe_offload_cache is not None else 1
+        vocab = max(2, int(self.config.model_config.vocab_size))
+        pass_i = 0
         try:
-            for length in warmup_lens:
-                dummy_row[:length] = torch.arange(
-                    length, dtype=torch.int32, device=self.device
-                )
+            dummy_row[:length] = torch.arange(
+                length, dtype=torch.int32, device=self.device
+            )
+            for pass_i in range(n_passes):
+                ids = torch.randint(0, vocab, (length,), dtype=torch.int32)
                 warm_req = Req(
-                    input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
+                    input_ids=ids.cpu(),
                     table_idx=self.dummy_req.table_idx,
                     cached_len=0,
                     output_len=1,
@@ -1836,23 +1887,63 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
+                if self.linear_state_pool is not None:
+                    # GDN writes must land in the padding sink, not a real slot.
+                    warm_req.linear_slot_idx = self.linear_state_pool.padding_slot
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
+                batch.input_ids = ids.to(device=self.device, non_blocking=True)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
                     self.model.forward()
+                # Surface async dxgk faults at the warmup, not on a later request.
+                torch.cuda.synchronize(self.device)
+                logger.info_rank0(
+                    f"Allocator high-water warmup pass {pass_i + 1}/{n_passes} "
+                    f"length {length}: reserved "
+                    f"{mem_GB(torch.cuda.memory_reserved(self.device))}, "
+                    f"free {mem_GB(get_free_memory(self.device))}"
+                )
+                batch = None
+                warm_req = None
+        except Exception as exc:
+            init_free = getattr(self, "_post_init_free_memory", 0)
+            raise RuntimeError(
+                "Allocator high-water warmup failed at prefill length "
+                f"{length} pass {pass_i + 1}/{n_passes} "
+                f"({type(exc).__name__}: {exc}). "
+                f"Free after init: {mem_GB(init_free)}; "
+                f"now free {mem_GB(get_free_memory(self.device))}, "
+                f"allocated {mem_GB(torch.cuda.memory_allocated(self.device))}, "
+                f"reserved {mem_GB(torch.cuda.memory_reserved(self.device))}. "
+                "WSL2 dxgk refused a new residency request (often "
+                "'CUDA driver error: device not ready' / "
+                "dxgkio_make_resident -12). The server will not start: a later "
+                "live request at this chunk size would crash the same way. "
+                "Remediation: (1) lower --moe-cache-size to buy VRAM headroom; "
+                "(2) lower --max-prefill-length so the high-water fits."
+            ) from exc
         finally:
             dummy_row.fill_(dummy_slot)
+            batch = None
+            warm_req = None
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
+        reserved_after = torch.cuda.memory_reserved(self.device)
+        allocated_after = torch.cuda.memory_allocated(self.device)
+        free_after = get_free_memory(self.device)
         logger.info_rank0(
-            f"Prefill warmup complete for lengths {warmup_lens} "
-            f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
+            f"Allocator high-water warmup complete for prefill length {length} "
+            f"in {started.elapsed_time(ended) / 1000.0:.3f} s "
+            f"(allocated {mem_GB(allocated_before)} -> {mem_GB(allocated_after)}, "
+            f"reserved {mem_GB(reserved_before)} -> {mem_GB(reserved_after)}, "
+            f"free {mem_GB(free_before)} -> {mem_GB(free_after)}; "
+            "do not torch.cuda.empty_cache() -- that would return the high-water "
+            "to the driver and re-open the dxgk make_resident crash)"
         )
 
     def shutdown(self) -> None:
