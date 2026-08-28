@@ -39,6 +39,11 @@ class ServerArgs(SchedulerConfig):
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
+    # OpenAI image_url content parts: data: URIs and local filesystem paths are always
+    # accepted; http(s):// URLs are fetched by this server only when this is set. Off by
+    # default -- the server fetching an arbitrary client-supplied URL on the client's
+    # behalf is a request-forgery hazard.
+    allow_remote_images: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -508,6 +513,18 @@ def parse_args(
             "usage.cache_read_input_tokens, Responses usage.input_tokens_details.cached_tokens). "
             "On /v1/messages this also makes input_tokens EXCLUDE the cached prefix, matching "
             "Anthropic billing semantics."
+        ),
+    )
+
+    parser.add_argument(
+        "--allow-remote-images",
+        action="store_true",
+        default=ServerArgs.allow_remote_images,
+        help=(
+            "Fetch http(s):// image_url content parts on the client's behalf. Off by "
+            "default (data: URIs and local filesystem paths are always accepted "
+            "regardless of this flag) -- the server fetching an arbitrary "
+            "client-supplied URL is a request-forgery hazard."
         ),
     )
 

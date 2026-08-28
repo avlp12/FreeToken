@@ -659,6 +659,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.images:
+                error = self._fill_mm_embeds(msg)
+                if error is not None:
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -989,6 +994,53 @@ class Scheduler(SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _fill_mm_embeds(self, msg: UserMsg) -> str | None:
+        """Preprocess ``msg.images`` and run the model's vision encoder, setting
+        ``msg.mm_embeds`` in place before the request reaches ``add_one_req`` (from
+        there ``PendingReq``/``Req`` carry it unchanged into ``_gather_multimodal`` /
+        ``_merge_multimodal``). This is the one place in the online path where the
+        request actually has a live model + device to hand the pixel tensor to, so
+        preprocessing happens here rather than in the tokenizer (which only sizes
+        placeholders from image headers) or the API layer (which only has raw bytes).
+
+        Returns an error string (never raises) when the model has no vision tower
+        loaded, or when the number of expanded ``<|image_pad|>`` slots the tokenizer
+        produced does not match the embedding row count ``encode_images`` returns --
+        both checked here, before ``Qwen4ExpModel._merge_multimodal`` would otherwise
+        hit its own assertion at merge time with no request context. None means success."""
+        model = self.engine.model
+        if not (hasattr(model, "encode_images") and hasattr(model, "vision_tower")):
+            return (
+                f"request {msg.uid}: this request carries images, but the loaded model "
+                "does not support image input (vision is disabled -- start the server "
+                "against a multimodal checkpoint with FREETOKEN_LOAD_VISION=1)"
+            )
+        image_token_id = self.config.model_config.image_token_id
+        n_slots = (
+            int((msg.input_ids == image_token_id).sum().item())
+            if image_token_id is not None
+            else 0
+        )
+        try:
+            from freetoken.models.qwen4_exp.image import preprocess_images
+
+            pixel_values, image_position_ids = preprocess_images(
+                self.config.model_path, msg.images
+            )
+            mm_embeds = model.encode_images(
+                pixel_values.to(self.device), image_position_ids.to(self.device)
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-request error, not a worker crash
+            return f"request {msg.uid}: could not encode image input: {exc}"
+        if mm_embeds.shape[0] != n_slots:
+            return (
+                f"request {msg.uid}: image embedding row count ({mm_embeds.shape[0]}) does "
+                f"not match the prompt's <|image_pad|> slot count ({n_slots}); this is a "
+                "server-side placeholder/embedding mismatch, not a client error"
+            )
+        msg.mm_embeds = mm_embeds
+        return None
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill

@@ -78,6 +78,13 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Raw encoded image bytes (any mix of formats PIL can open), one entry per
+    # <|image_pad|> the rendered prompt will contain, in message order. None (the
+    # default) is the text-only path -- unchanged behavior. Bytes serialize natively
+    # over msgpack (unlike a 2D pixel tensor, which cannot cross this boundary), so
+    # preprocessing happens downstream, in the core process, where the tensor is
+    # actually needed.
+    images: List[bytes] | None = None
 
 
 @dataclass

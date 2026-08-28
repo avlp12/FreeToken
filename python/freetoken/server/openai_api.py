@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import time
+import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -16,6 +19,7 @@ from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 from .api_models import (
     ChatCompletionRequest,
     CompletionRequest,
+    Message,
     ModelCard,
     ModelList,
     ToolChoiceObject,
@@ -56,9 +60,86 @@ def _thinking_type(req: Any) -> str | None:
 
 
 
+def _decode_data_uri(url: str) -> bytes:
+    header, sep, payload = url.partition(",")
+    if not sep:
+        raise ValueError("malformed data URI for image_url: missing ','")
+    if ";base64" not in header:
+        raise ValueError(
+            "malformed data URI for image_url: only base64-encoded data URIs are supported"
+        )
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"malformed base64 in data URI for image_url: {exc}") from exc
+
+
+def _fetch_remote_image(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 -- gated by allow_remote_images
+        return resp.read()
+
+
+def _decode_image_url(value: Any, *, allow_remote_images: bool) -> bytes:
+    """Resolve one OpenAI ``image_url`` content-part value (a bare URL string, or an
+    object with a ``url`` key, per the wire spec) to raw encoded image bytes.
+    ``data:`` URIs and local filesystem paths are always accepted; ``http(s)://`` is
+    fetched only when ``allow_remote_images`` is set -- the server fetching a
+    client-supplied URL on the client's behalf is a request-forgery hazard, so it is
+    off by default and rejected with a clear error otherwise."""
+    url = value.get("url") if isinstance(value, dict) else value
+    if not isinstance(url, str) or not url:
+        raise ValueError(
+            "image_url content part must be a URL string or an object with a 'url' string"
+        )
+    if url.startswith("data:"):
+        return _decode_data_uri(url)
+    if url.startswith("http://") or url.startswith("https://"):
+        if not allow_remote_images:
+            raise ValueError(
+                "remote image URLs are disabled on this server (only data: URIs and local "
+                "filesystem paths are accepted); the server operator must opt in with "
+                "--allow-remote-images"
+            )
+        return _fetch_remote_image(url)
+    path = url[len("file://"):] if url.startswith("file://") else url
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as exc:
+        raise ValueError(f"could not read local image path {path!r}: {exc}") from exc
+
+
+def _messages_and_images(
+    messages: list[Message], *, allow_remote_images: bool
+) -> tuple[list[dict[str, Any]], list[bytes]]:
+    """Dump ``messages`` to the plain-dict shape ``render_messages`` expects, decoding
+    each ``image_url`` content part to raw bytes (collected in message order) and
+    replacing its payload with a lightweight marker. The chat template only checks for
+    the ``image_url`` key's presence (chat_template.jinja), never its value, so the
+    actual bytes travel out-of-band via GenSpec.images / TokenizeMsg.images instead of
+    through the (msgpack'd) prompt text -- a 2D pixel tensor cannot cross that boundary
+    at all, and a raw data URI would be ~100x its decoded size for no benefit."""
+    images: list[bytes] = []
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        dumped = m.model_dump(exclude_none=True)
+        content = dumped.get("content")
+        if isinstance(content, list) and isinstance(m.content, list):
+            for part, typed_part in zip(content, m.content, strict=True):
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    images.append(
+                        _decode_image_url(typed_part.image_url, allow_remote_images=allow_remote_images)
+                    )
+                    part["image_url"] = True
+        out.append(dumped)
+    return out, images
+
+
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    *,
+    allow_remote_images: bool = False,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -67,8 +148,11 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    dumped_messages, images = _messages_and_images(
+        req.messages, allow_remote_images=allow_remote_images
+    )
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=render_messages(dumped_messages),
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -81,6 +165,7 @@ def chat_request_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        images=images or None,
     )
 
 
@@ -180,7 +265,11 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            allow_remote_images=getattr(state.config, "allow_remote_images", False),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 

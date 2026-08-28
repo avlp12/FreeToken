@@ -71,8 +71,71 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            if msg.images:
+                input_ids = self._expand_image_pads(input_ids, msg.images)
+            results.append(input_ids)
         return results
+
+    def _model_path(self) -> str:
+        return (
+            getattr(self.tokenizer, "name_or_path", None)
+            or getattr(self.tokenizer, "_name_or_path", "")
+        )
+
+    def _image_pad_token_id(self, model_path: str) -> int:
+        """The checkpoint's ``image_token_id`` (``config.json``), the same field
+        ``Qwen4ExpModel._merge_multimodal`` reads to find placeholder slots -- sourcing
+        it from the same place keeps the tokenizer's pad count and the model's merge
+        mask from ever disagreeing about which token id means "image"."""
+        from freetoken.utils import cached_load_hf_config
+
+        token_id = getattr(cached_load_hf_config(model_path), "image_token_id", None)
+        if token_id is None:
+            raise ValueError(
+                f"checkpoint at {model_path!r} has no image_token_id configured; it does "
+                "not support image inputs"
+            )
+        return int(token_id)
+
+    def _expand_image_pads(self, input_ids: torch.Tensor, images: List[bytes]) -> torch.Tensor:
+        """Expand each ``<|image_pad|>`` the chat template emitted (one per image, no
+        variable content -- see chat_template.jinja) into
+        ``num_image_tokens(image_grid(...))`` copies, sized from each image's header
+        (no pixel decode), in the order the images appeared. This is the text-side half
+        of the placeholder-count contract ``Qwen4ExpModel._merge_multimodal`` (model.py)
+        asserts at merge time; a mismatch here (wrong number of placeholders for the
+        number of images) is raised as a clear per-request error instead of reaching
+        that assertion as a worker crash."""
+        import io
+
+        from PIL import Image
+
+        from freetoken.models.qwen4_exp.image import image_grid, num_image_tokens
+
+        model_path = self._model_path()
+        image_token_id = self._image_pad_token_id(model_path)
+        ids = input_ids.tolist()
+        positions = [i for i, t in enumerate(ids) if t == image_token_id]
+        if len(positions) != len(images):
+            raise ValueError(
+                f"request carries {len(images)} image(s) but the rendered prompt contains "
+                f"{len(positions)} <|image_pad|> placeholder(s); these must match 1:1"
+            )
+        out: List[int] = []
+        prev = 0
+        for pos, img_bytes in zip(positions, images):
+            out.extend(ids[prev:pos])
+            try:
+                with Image.open(io.BytesIO(img_bytes)) as im:
+                    width, height = im.size
+            except Exception as exc:  # noqa: BLE001 -- per-request error, not a worker crash
+                raise ValueError(f"could not read image size: {exc}") from exc
+            grid = image_grid(model_path, width, height)
+            out.extend([image_token_id] * num_image_tokens(grid))
+            prev = pos + 1
+        out.extend(ids[prev:])
+        return torch.tensor(out, dtype=input_ids.dtype)
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can
