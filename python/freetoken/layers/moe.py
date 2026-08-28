@@ -40,6 +40,34 @@ from freetoken.utils import init_logger  # noqa: E402
 
 logger = init_logger(__name__)
 
+# ---------- routed-expert ablation switch (temporary instrumentation) ----------
+# FREETOKEN_MOE_STUB=1 -> bypass the routed-expert work itself: the offload-cache
+# expert-weight fetch (``ensure_experts``/``copy_missing`` on decode -- including the
+# cpu-layer and hybrid decode_target branches; ``materialize_layer``/the
+# prefetch_prefill_layer-overlap choreography on prefill) and the expert GEMM/GEMV
+# (``_expert_gemm``, whichever quant-format kernel that dispatches to), for BOTH
+# decode and prefill. Everything a routed-expert path would NOT itself do -- the
+# router/gate logits, the shared expert, the norms, out_proj -- keeps running for
+# real, at the real shapes, so the step stays timeable. ``self.offload_cache`` /
+# ``self.prefetcher`` are never touched while this is set: ``_decode_routed`` and
+# ``_prefill_routed`` return a placeholder before either method's body reaches a
+# single cache or prefetcher call -- no fetches, no evictions, no prefetch
+# enqueues. Output is WRONG under this flag -- COST PROBE ONLY, never a correctness
+# path.
+#
+# Exists to size the routed-expert prize under WSL2: torch.profiler/CUPTI can't
+# attribute device-side op cost here (CUPTI fails to initialize under WSL2), so the
+# only way to learn what fraction of a decode step the expert weight traffic +
+# expert matmul cost is to ablate it and diff FREETOKEN_DECODE_TIMING wall-clock
+# step time against an unablated run.
+_MOE_STUB = int(os.environ.get("FREETOKEN_MOE_STUB", "0") or 0)
+if _MOE_STUB:
+    logger.warning_rank0(
+        "FREETOKEN_MOE_STUB=1: routed-expert path (offload-cache fetch + expert "
+        "GEMM/GEMV) is BYPASSED with placeholder output -- this run measures "
+        "decode-step cost only, generated text will be garbage"
+    )
+
 
 class MoELayer(BaseOP):
     def __init__(
@@ -324,6 +352,15 @@ class OffloadMoELayer(MoELayer):
         pinned host memory, run the GEMV on the worker pool via host nodes, ship the
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
         ids), so no ``ensure_experts``/``copy_missing`` here."""
+        if _MOE_STUB:
+            # ABLATION: bypass every decode_target branch below (gpu on-demand,
+            # cpu-layer, hybrid) -- the offload-cache fetch, the prefetcher's
+            # before_ensure/schedule/before_gemm calls, and the expert GEMM/GEMV --
+            # entirely. See module-level comment. self.offload_cache and
+            # self.prefetcher are never referenced past this point: no fetches, no
+            # evictions, no prefetch enqueues. A correctly-shaped zero tensor stands
+            # in for the routed-expert contribution.
+            return torch.zeros_like(hidden_states)
         cache = self.offload_cache
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
@@ -423,6 +460,13 @@ class OffloadMoELayer(MoELayer):
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
         ``materialize_layer``. In both, position == expert id, so the routing ids
         pass through unmapped."""
+        if _MOE_STUB:
+            # ABLATION: bypass both the overlap (prefetch_prefill_layer/
+            # wait_prefill_layer/release_prefill_layer) and non-overlap
+            # (materialize_layer/copy_missing) movement paths, and the expert
+            # GEMM/GEMV, entirely -- see module-level comment. self.offload_cache is
+            # never referenced past this point: no fetches, no evictions.
+            return torch.zeros_like(hidden_states)
         cache = self.offload_cache
         assert cache is not None
         if cache.prefill_overlap:
