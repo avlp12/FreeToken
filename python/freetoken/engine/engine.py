@@ -505,6 +505,100 @@ def _allocate_dummy_vram(device: torch.device) -> torch.Tensor | None:
     return tensor
 
 
+def _dummy_vram_chunks_from_env() -> int:
+    """Parse ``FREETOKEN_DUMMY_VRAM_CHUNKS`` into a chunk count.
+
+    Unset or empty defaults to ``1`` -- a single tensor, i.e. exactly the
+    pre-chunking behaviour of ``_allocate_dummy_vram``. This is a companion to
+    ``FREETOKEN_DUMMY_VRAM_MIB`` (see ``_dummy_vram_bytes_from_env``): it exists
+    to separate the vision tower's *granularity* (333 separate parameter
+    tensors) from its byte occupancy, after a single-block dummy allocation of
+    the same size measured no prefill cost at all. A malformed or non-positive
+    value raises rather than silently falling back to 1 -- for the same reason
+    the MIB parser raises instead of disabling: a measurement instrument that
+    goes quiet on a typo corrupts the experiment it exists to run.
+
+    Deliberately NOT routed through ``freetoken.env.ENV``: ``EnvVar._init``
+    swallows every parse exception and silently keeps the default, which is
+    exactly the silent-failure mode this switch must not have.
+    """
+    raw = os.environ.get("FREETOKEN_DUMMY_VRAM_CHUNKS")
+    if raw is None:
+        return 1
+    raw = raw.strip()
+    if raw == "":
+        return 1
+    try:
+        n_chunks = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"FREETOKEN_DUMMY_VRAM_CHUNKS={raw!r} is not an integer"
+        ) from None
+    if n_chunks < 1:
+        raise ValueError(f"FREETOKEN_DUMMY_VRAM_CHUNKS={raw!r} must be >= 1")
+    return n_chunks
+
+
+def _dummy_vram_chunk_sizes(total_bytes: int, n_chunks: int) -> list[int]:
+    """Split ``total_bytes`` into ``n_chunks`` per-tensor byte counts that sum
+    exactly to ``total_bytes``.
+
+    Pure arithmetic, no allocation -- testable without a GPU. Remainder
+    handling: ``total_bytes // n_chunks`` is the base size for every chunk;
+    the first ``total_bytes % n_chunks`` chunks get one extra byte each so the
+    sizes differ by at most 1 byte and every requested byte is accounted for
+    (856 MiB over 333 chunks does not divide evenly, and must neither lose nor
+    invent bytes versus a single-block allocation of the same total).
+    """
+    if n_chunks < 1:
+        raise ValueError(f"n_chunks must be >= 1, got {n_chunks}")
+    base, remainder = divmod(total_bytes, n_chunks)
+    return [base + 1 if i < remainder else base for i in range(n_chunks)]
+
+
+def _allocate_dummy_vram_chunks(device: torch.device) -> list[torch.Tensor]:
+    """Burn ``FREETOKEN_DUMMY_VRAM_MIB`` of device memory, split across
+    ``FREETOKEN_DUMMY_VRAM_CHUNKS`` device tensors, and return them all.
+
+    Generalises ``_allocate_dummy_vram`` to test granularity (chunk count) as
+    a variable independent of total bytes -- see ``_dummy_vram_chunks_from_env``.
+    ``FREETOKEN_DUMMY_VRAM_MIB`` unset or "0" is an exact no-op: no CUDA call is
+    made and ``FREETOKEN_DUMMY_VRAM_CHUNKS`` is not even read, so a malformed
+    chunk count never trips when the dummy allocation itself is off. Chunk
+    count of 1 (the default) delegates straight to ``_allocate_dummy_vram``, so
+    that path -- including its log line -- is byte-for-byte the pre-chunking
+    behaviour. The caller MUST keep every returned tensor alive for the
+    process lifetime (e.g. as a list attribute on the engine); locals that go
+    out of scope let the allocator reclaim them immediately and defeat the
+    whole point.
+    """
+    n_bytes = _dummy_vram_bytes_from_env()
+    if n_bytes == 0:
+        return []
+    n_chunks = _dummy_vram_chunks_from_env()
+    if n_chunks == 1:
+        tensor = _allocate_dummy_vram(device)
+        return [tensor] if tensor is not None else []
+    sizes = _dummy_vram_chunk_sizes(n_bytes, n_chunks)
+    tensors = [torch.empty(size, dtype=torch.uint8, device=device) for size in sizes]
+    actual_bytes = sum(t.numel() * t.element_size() for t in tensors)
+    base, remainder = divmod(n_bytes, n_chunks)
+    if remainder:
+        size_desc = (
+            f"{remainder} chunks of {base + 1} bytes + "
+            f"{n_chunks - remainder} chunks of {base} bytes"
+        )
+    else:
+        size_desc = f"{n_chunks} chunks of {base} bytes"
+    logger.info_rank0(
+        f"Dummy VRAM allocation (FREETOKEN_DUMMY_VRAM_MIB): requested "
+        f"{n_bytes // (1024 * 1024)} MiB in {n_chunks} chunks "
+        f"(FREETOKEN_DUMMY_VRAM_CHUNKS) -- {size_desc}, holding "
+        f"{mem_GB(actual_bytes)} on {device} for the process lifetime"
+    )
+    return tensors
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -541,14 +635,17 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        # Measurement instrument (FREETOKEN_DUMMY_VRAM_MIB): lands at the same boot-
-        # sequence point as the vision tower's own resident weights -- right after the
-        # rest of the model's weights are loaded, before this same load is measured
-        # below (so it is counted the same way vision weights would be) and before KV
-        # cache sizing / the allocator high-water warmup see free VRAM. Held on the
-        # engine so it survives for the process lifetime; unset/0 makes both lines below
+        # Measurement instrument (FREETOKEN_DUMMY_VRAM_MIB, FREETOKEN_DUMMY_VRAM_CHUNKS):
+        # lands at the same boot-sequence point as the vision tower's own resident
+        # weights -- right after the rest of the model's weights are loaded, before
+        # this same load is measured below (so it is counted the same way vision
+        # weights would be) and before KV cache sizing / the allocator high-water
+        # warmup see free VRAM. CHUNKS lets the single block be split into many
+        # tensors, to test whether the vision tower's cost is granularity (333
+        # separate parameter tensors) rather than occupancy. Held on the engine so
+        # they survive for the process lifetime; unset/0 MIB makes both lines below
         # exact no-ops (no CUDA call).
-        self._dummy_vram = _allocate_dummy_vram(self.device)
+        self._dummy_vram_chunks = _allocate_dummy_vram_chunks(self.device)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # What the parameters declare vs what the load actually cost. Every byte of the gap
