@@ -8,6 +8,7 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    vision_load_enabled,
 )
 
 
@@ -64,6 +65,69 @@ class Qwen4ExpArgs:
         checkpoint stores the PLE weights under ``layers.1.ple.*`` with ple_layer_ids=[2].
         """
         return tuple(i - 1 for i in self.ple_layer_ids)
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """Qwen4-Exp's vision tower config (`python/freetoken/models/qwen4_exp/vision.py`).
+
+    Field names follow the checkpoint's `vision_config` (== HF's `Qwen3VLVisionConfig`
+    schema -- this vision tower's weights are tensor-for-tensor identical to Qwen3-VL's,
+    see vision.py's module docstring), not Gemma4's `VisionConfig` shape: no `num_kv_heads`
+    (plain MHA, no GQA), `temporal_patch_size` instead of a single spatial-only patch,
+    `num_position_embeddings`/`out_hidden_size` instead of
+    `position_embedding_size`/relying on `text_hidden_size` for the projector.
+    """
+
+    hidden_size: int
+    num_layers: int  # HF's "depth"
+    num_heads: int
+    head_dim: int
+    intermediate_size: int
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    num_position_embeddings: int
+    out_hidden_size: int
+    hidden_act: str
+    rope_theta: float
+    text_hidden_size: int
+    deepstack_visual_indexes: tuple[int, ...] = ()
+
+
+def _parse_vision_config(hf_config: Any, text_hidden_size: int) -> VisionConfig | None:
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    # Vision is opt-in (default OFF), same switch Gemma4 uses (`FREETOKEN_LOAD_VISION=1`):
+    # is_multimodal flows through parse_config into both model build and weight loading, so
+    # returning None here keeps default `ft serve` boot byte-for-byte unchanged. Note the
+    # production FTW checkpoint has no `model.visual.*` tensors at all yet (dropped by
+    # checkpoint/qwen_layout.py's SKIP_PREFIXES) -- opting in today will fail to load until
+    # the converter is extended separately; this wiring only makes the *module* reachable.
+    if not vision_load_enabled():
+        return None
+    num_heads = int(vc.num_heads)
+    return VisionConfig(
+        hidden_size=int(vc.hidden_size),
+        num_layers=int(vc.depth),
+        num_heads=num_heads,
+        head_dim=int(vc.hidden_size) // num_heads,
+        intermediate_size=int(vc.intermediate_size),
+        in_channels=int(getattr(vc, "in_channels", 3)),
+        patch_size=int(vc.patch_size),
+        temporal_patch_size=int(vc.temporal_patch_size),
+        spatial_merge_size=int(vc.spatial_merge_size),
+        num_position_embeddings=int(vc.num_position_embeddings),
+        out_hidden_size=int(vc.out_hidden_size),
+        hidden_act=str(getattr(vc, "hidden_act", "gelu_pytorch_tanh")),
+        # Qwen3VLVisionConfig carries no rope_theta field; the HF rotary module hardcodes
+        # this default (Qwen3VLVisionRotaryEmbedding.__init__'s theta=10000.0).
+        rope_theta=10000.0,
+        text_hidden_size=text_hidden_size,
+        deepstack_visual_indexes=tuple(getattr(vc, "deepstack_visual_indexes", None) or ()),
+    )
 
 
 def _layer_types(text: Any) -> list[str]:
@@ -214,7 +278,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # text-only milestone; model.visual.* dropped at load
+        vision_config=_parse_vision_config(hf_config, text.hidden_size),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
@@ -228,4 +292,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config", "Qwen4ExpArgs"]
+__all__ = ["parse_config", "Qwen4ExpArgs", "VisionConfig"]
