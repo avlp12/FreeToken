@@ -449,6 +449,61 @@ def _highwater_prefill_len(
     return length if length >= 2 else None
 
 
+def _dummy_vram_bytes_from_env() -> int:
+    """Parse ``FREETOKEN_DUMMY_VRAM_MIB`` into a byte count.
+
+    Returns 0 (no allocation) when the variable is unset or ``"0"``. This is a
+    measurement instrument (see ``_allocate_dummy_vram``): it exists to prove or
+    disprove that VRAM *occupancy* alone, independent of the vision tower actually
+    being built, explains a prefill regression. A malformed value therefore raises
+    instead of silently disabling -- falling back to "no allocation" on a typo would
+    corrupt the experiment the switch exists to run.
+
+    Deliberately NOT routed through ``freetoken.env.ENV``: ``EnvVar._init`` swallows
+    every parse exception and silently keeps the default, which is exactly the
+    silent-failure mode this switch must not have.
+    """
+    raw = os.environ.get("FREETOKEN_DUMMY_VRAM_MIB")
+    if raw is None:
+        return 0
+    raw = raw.strip()
+    if raw == "" or raw == "0":
+        return 0
+    try:
+        mib = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"FREETOKEN_DUMMY_VRAM_MIB={raw!r} is not an integer number of MiB"
+        ) from None
+    if mib < 0:
+        raise ValueError(f"FREETOKEN_DUMMY_VRAM_MIB={raw!r} must not be negative")
+    return mib * 1024 * 1024
+
+
+def _allocate_dummy_vram(device: torch.device) -> torch.Tensor | None:
+    """Burn ``FREETOKEN_DUMMY_VRAM_MIB`` of device memory and return the tensor
+    holding it.
+
+    Pure measurement instrument: reproduces the vision tower's resident-byte
+    footprint on the device -- without building the tower -- so "memory taken"
+    and "vision tower built" can be tested as separate variables. Unset or "0" is
+    an exact no-op: ``_dummy_vram_bytes_from_env`` returns 0 and no CUDA call is
+    made. The caller MUST keep the returned tensor alive for the process lifetime
+    (e.g. as an attribute on the engine); a local that goes out of scope lets the
+    allocator reclaim it immediately and defeats the whole point.
+    """
+    n_bytes = _dummy_vram_bytes_from_env()
+    if n_bytes == 0:
+        return None
+    tensor = torch.empty(n_bytes, dtype=torch.uint8, device=device)
+    actual_bytes = tensor.numel() * tensor.element_size()
+    logger.info_rank0(
+        f"Dummy VRAM allocation (FREETOKEN_DUMMY_VRAM_MIB): requested "
+        f"{n_bytes // (1024 * 1024)} MiB, holding {mem_GB(actual_bytes)} on {device} "
+        "for the process lifetime"
+    )
+    return tensor
+
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -486,6 +541,14 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # Measurement instrument (FREETOKEN_DUMMY_VRAM_MIB): lands at the same boot-
+        # sequence point as the vision tower's own resident weights -- right after the
+        # rest of the model's weights are loaded, before this same load is measured
+        # below (so it is counted the same way vision weights would be) and before KV
+        # cache sizing / the allocator high-water warmup see free VRAM. Held on the
+        # engine so it survives for the process lifetime; unset/0 makes both lines below
+        # exact no-ops (no CUDA call).
+        self._dummy_vram = _allocate_dummy_vram(self.device)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # What the parameters declare vs what the load actually cost. Every byte of the gap
