@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import msgpack
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -18,9 +20,20 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
+
+
+def _wire_round_trip(base_cls, msg):
+    """The actual wire path a message takes (ZmqPushQueue.put / ZmqPullQueue.get, see
+    freetoken/utils/mp.py): encoder -> msgpack.packb(..., use_bin_type=True) ->
+    msgpack.unpackb(..., raw=False) -> decoder. Exercises the real bytes-over-the-wire
+    behavior, not just the dict-level encoder/decoder step the other tests above use."""
+    packed = msgpack.packb(base_cls.encoder(msg), use_bin_type=True)
+    unpacked = msgpack.unpackb(packed, raw=False)
+    return base_cls.decoder(unpacked)
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -100,6 +113,66 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+
+
+def test_tokenize_msg_images_round_trip_through_msgpack():
+    """Raw image bytes must cross api -> tokenizer unmodified: bytes serialize natively
+    (unlike a 2D pixel tensor, which `serialize_type` refuses -- see message/utils.py),
+    so this exercises the real msgpack wire, not just serialize_type/deserialize_type."""
+    raw0 = bytes(range(256)) * 4  # exercise every byte value, including NUL and 0xff
+    raw1 = b""  # a zero-length image part must not be conflated with "no image"
+    msg = TokenizeMsg(
+        uid=5,
+        text=[{"role": "user", "content": [{"type": "image_url", "image_url": True}]}],
+        sampling_params=SamplingParams(max_tokens=16),
+        images=[raw0, raw1],
+    )
+    out = _wire_round_trip(BaseTokenizerMsg, msg)
+    assert isinstance(out, TokenizeMsg)
+    assert out.images == [raw0, raw1]
+    assert isinstance(out.images[0], bytes) and isinstance(out.images[1], bytes)
+    assert out.text == msg.text
+
+
+def test_tokenize_msg_text_only_images_field_round_trips_as_none():
+    """The text-only path (images unset) must stay exactly None across the wire --
+    pinning that a request with no images takes the pre-existing code path unchanged."""
+    msg = TokenizeMsg(uid=6, text="hello", sampling_params=SamplingParams())
+    out = _wire_round_trip(BaseTokenizerMsg, msg)
+    assert isinstance(out, TokenizeMsg)
+    assert out.images is None
+
+
+def test_user_msg_images_round_trip_through_msgpack():
+    """images carried on UserMsg (tokenizer -> scheduler) must also survive the real
+    wire byte-identical, in order, so the core process preprocesses the right bytes for
+    the right placeholder run."""
+    import torch
+
+    raw0 = b"\x00\x01\xffPNG-ish-bytes"
+    raw1 = b"second-image-entirely-different-bytes"
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+        images=[raw0, raw1],
+    )
+    out = _wire_round_trip(BaseBackendMsg, msg)
+    assert isinstance(out, UserMsg)
+    assert out.images == [raw0, raw1]
+    assert out.input_ids.tolist() == [1, 2, 3]
+    assert out.mm_embeds is None
+
+
+def test_user_msg_text_only_images_field_round_trips_as_none():
+    import torch
+
+    msg = UserMsg(
+        uid=10, input_ids=torch.tensor([1, 2], dtype=torch.int32), sampling_params=SamplingParams()
+    )
+    out = _wire_round_trip(BaseBackendMsg, msg)
+    assert isinstance(out, UserMsg)
+    assert out.images is None
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

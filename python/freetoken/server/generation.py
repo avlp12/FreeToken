@@ -139,6 +139,9 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    # Raw encoded image bytes, in message order (TokenizeMsg.images). None (the
+    # default) is the text-only path every non-OpenAI adapter still takes.
+    images: list[bytes] | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -188,9 +191,14 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize OpenAI-shaped message dicts for the chat template: flatten text-only
+    content parts to a string (unchanged pinned behavior) and decode tool-call
+    arguments from JSON. A content list carrying an ``image_url`` part is left
+    structured (not flattened) so the chat template's own per-item rendering emits its
+    markers -- the caller (openai_api.chat_request_to_genspec) has already collected the
+    image bytes and scrubbed the part's payload down to a lightweight placeholder before
+    this runs. Raises ValueError on any other non-text content part (text-only server
+    for anything but images). Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -230,15 +238,25 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
+def _flatten_text_parts(parts: list[Any]) -> str | list[Any]:
+    """Flatten an all-text content list to a string (the original, pinned behavior).
+    A list carrying at least one ``image_url`` part is returned unchanged instead --
+    the chat template iterates the list itself, rendering ``<|vision_start|><|image_pad|>
+    <|vision_end|>`` for each image part and each text part's ``.text`` in place, so
+    mixed text/image ordering is preserved without this function needing to understand
+    image content at all. Any other non-text part type still raises (text-only server
+    for everything but images)."""
     texts: list[str] = []
+    all_text = True
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
             texts.append((part.get("text") if isinstance(part, dict) else None) or "")
+        elif ptype == "image_url":
+            all_text = False
         else:
             raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-    return "".join(texts)
+    return "".join(texts) if all_text else parts
 
 
 def split_tool_lists(
@@ -269,6 +287,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=spec.images,
         )
     )
     return uid
