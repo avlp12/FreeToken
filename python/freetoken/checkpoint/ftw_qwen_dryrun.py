@@ -317,7 +317,9 @@ def _print_plan(p: dict) -> None:
 def _selfcheck() -> None:
     cases = [
         ("mtp.layers.0.mlp.experts.0.gate_proj.weight", DEST_SKIP),
-        ("model.visual.blocks.0.attn.qkv.weight", DEST_SKIP),
+        # Vision is carried now (convert.py's dedicated pass-through renames it to
+        # vision_tower.*), not dropped -- see qwen_layout.classify_tensor's docstring.
+        ("model.visual.blocks.0.attn.qkv.weight", DEST_DENSE),
         ("model.language_model.layers.0.mlp.experts.3.gate_proj.weight", DEST_EXPERT),
         ("model.layers.0.mlp.experts.3.down_proj.weight_scale_inv", DEST_EXPERT),
         ("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", DEST_NGRAM),

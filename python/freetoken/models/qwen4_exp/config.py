@@ -102,10 +102,11 @@ def _parse_vision_config(hf_config: Any, text_hidden_size: int) -> VisionConfig 
         return None
     # Vision is opt-in (default OFF), same switch Gemma4 uses (`FREETOKEN_LOAD_VISION=1`):
     # is_multimodal flows through parse_config into both model build and weight loading, so
-    # returning None here keeps default `ft serve` boot byte-for-byte unchanged. Note the
-    # production FTW checkpoint has no `model.visual.*` tensors at all yet (dropped by
-    # checkpoint/qwen_layout.py's SKIP_PREFIXES) -- opting in today will fail to load until
-    # the converter is extended separately; this wiring only makes the *module* reachable.
+    # returning None here keeps default `ft serve` boot byte-for-byte unchanged.
+    # checkpoint/convert.py now carries `model.visual.*` (renamed `vision_tower.*`) into
+    # every newly-converted FTW unconditionally (see its dedicated vision pass-through);
+    # an FTW converted BEFORE that change still has none and opting in against it will
+    # fail to load (missing keys) until it is reconverted.
     if not vision_load_enabled():
         return None
     num_heads = int(vc.num_heads)

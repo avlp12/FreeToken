@@ -5,12 +5,19 @@ no per-model conversion code is needed.
 
 * dense weights = exactly what ``load_weight(include_moe_experts=...)`` yields (post
   fusion/TP-shard) -> ``kind="weight"``; at load they feed ``model.load_state_dict``.
-  ``mtp.*`` / ``model.visual.*`` are dropped even if a loader leaks them.
+  ``mtp.*`` is dropped here even if a loader leaks it (own dedicated pass-through below).
+* vision tower (Qwen4-Exp) = the checkpoint's ``model.visual.*`` tensors, renamed
+  ``vision_tower.*`` and reshaped -> also ``kind="weight"`` (own dedicated pass-through,
+  unconditional; whether it reaches ``load_state_dict`` is a *load*-time decision, gated
+  by ``FREETOKEN_LOAD_VISION`` -- see ``_iter_vision_from_disk``).
 * offload experts = exactly what ``load_expert_banks(..., layer_sink=)`` produces (post
   backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
   told apart at load by their reserved names, so they need no separate kind).
 * n-gram tables (Qwen) = original HF tensors -> ``kind="ngram"`` (not concat; banked at
   serve time by ``moe/ngram_bank.py`` via ``iter_ftw_ngrams``).
+* MTP drafter head (Qwen4-Exp) = original HF ``mtp.*`` tensors, preserved losslessly but
+  under their own kinds (``kind="mtp_dense"`` / ``"mtp_expert"``, not ``"weight"``) since no
+  runtime submodule exists yet to receive them -- see ``_iter_mtp_from_disk``.
 
 The output directory is a self-contained checkpoint (config + tokenizer copied), so you can
 point ``--model`` straight at it; the load path auto-detects the FTW and reads it (FTW).
@@ -37,6 +44,7 @@ from .qwen_layout import (
     is_mtp_expert_tensor,
     is_mtp_tensor,
     is_qwen4_exp_config,
+    is_vision_tensor,
     is_wrapper_config,
     iter_shard_tensor_metas,
     load_weight_map,
@@ -349,6 +357,40 @@ def _iter_mtp_from_disk(model_path: str, *, skip_names: set[str]):
                 yield name, kind, f.get_tensor(name)
 
 
+def _iter_vision_from_disk(model_path: str, *, dtype: torch.dtype):
+    """Stream the vision tower's ``model.visual.*`` tensors, renamed ``vision_tower.*``
+    and reshaped (``patch_embed.proj.weight``: Conv3d -> Linear), UNCONDITIONALLY --
+    independent of ``FREETOKEN_LOAD_VISION``. That flag only gates whether the FTW's
+    *load* path feeds these tensors to the model (``models/weight.py::load_weight``'s
+    ``skip_vision`` filter); it must not gate whether the FTW *carries* them, or the
+    checkpoint's vision support would depend on an accident of the env the converter
+    happened to run under -- the same "one checkpoint, every setting" contract the wo_a
+    adapt hook and the ngram/MTP pass-throughs below already keep.
+
+    Reuses ``qwen4_exp.vision.load_visual_state_dict``'s naming/reshape rule rather than
+    duplicating it (imported lazily -- qwen4_exp is a heavier, model-owning package this
+    stdlib-only module's sibling ``qwen_layout.py`` deliberately does not depend on).
+
+    A no-op for any checkpoint that ships no ``model.visual.*`` keys (every non-qwen4_exp
+    architecture, and any qwen4_exp release without a vision stack) -- checked against the
+    raw index keys before importing qwen4_exp.vision, so this is a pure no-risk addition
+    for every other architecture, the same guarantee ``_iter_mtp_from_disk`` documents.
+
+    Ordering: like ``_iter_ngram_from_disk`` / ``_iter_mtp_from_disk``, this runs on the
+    convert *main thread* before ``load_expert_banks`` starts its reader threads.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return
+    weight_map = load_weight_map(model_path)
+    if not any(is_vision_tensor(name) for name in weight_map):
+        return
+    from freetoken.models.qwen4_exp.vision import load_visual_state_dict
+
+    for short_name, tensor in load_visual_state_dict(model_path, dtype).items():
+        yield "vision_tower." + short_name, tensor
+
+
 def _require_qwen4_exp_registered(hf_cfg) -> None:
     """Fail loud if this is qwen4_exp but ``models/qwen4_exp`` is not on the registry.
 
@@ -588,9 +630,12 @@ def convert_checkpoint(
 
     from freetoken.utils.progress import byte_bar, count_bar
 
+    from freetoken.models.config import VISION_KEY_PREFIXES
+
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = n_ngram = 0
     n_mtp_dense = n_mtp_expert = 0
+    n_vision = 0
     seen_ngram: set[str] = set()
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
@@ -608,9 +653,17 @@ def convert_checkpoint(
                                               include_moe_experts=include_moe_experts,
                                               adapt=False),
                                   "Converting dense weights"):
+        if name.startswith(VISION_KEY_PREFIXES):
+            # Already carried, unconditionally, by the dedicated vision pass-through below
+            # (1d). qwen4_exp's raw-HF iter_weights only yields these (already renamed
+            # vision_tower.*) when FREETOKEN_LOAD_VISION=1 is set -- which can happen to be
+            # true during a conversion run too, since this dense pass replays the same
+            # iter_weights the raw-HF serve path uses. Skip here so that doesn't write the
+            # vision tower twice into the same FTW.
+            continue
         dest = classify_tensor(name)
         if dest == DEST_SKIP:
-            # Defense in depth: even if iter_weights leaks mtp.* / model.visual.*, drop.
+            # Defense in depth: even if iter_weights leaks mtp.*, drop.
             continue
         if dest == DEST_EXPERT and offload:
             # Routed experts belong in layer_sink banks, not kind="weight".
@@ -693,6 +746,25 @@ def convert_checkpoint(
             n_mtp_dense += 1
         mtp_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes + ngram_bytes + mtp_bytes, 0)
+
+    # 1d) vision tower pass-through: original HF `model.visual.*` tensors, renamed
+    # `vision_tower.*` (patch_embed.proj.weight reshaped Conv3d -> Linear), kind="weight".
+    # UNLIKE MTP, this uses the model's ordinary dense-weight kind on purpose: a
+    # `Qwen4ExpForCausalLM.vision_tower` submodule already exists to receive it via
+    # `model.load_state_dict` (when built -- see qwen4_exp/model.py), so
+    # `iter_ftw_weights`'s default `kinds=("weight",)` DOES yield these entries. Whether
+    # they actually reach `load_state_dict` is decided at LOAD time by
+    # FREETOKEN_LOAD_VISION (models/weight.py::load_weight's `skip_vision` filter), not
+    # here -- this pass runs unconditionally so one converted FTW serves both settings; see
+    # `_iter_vision_from_disk`'s docstring. A no-op for every non-qwen4_exp checkpoint and
+    # any qwen4_exp release with no vision stack.
+    vision_bytes = 0
+    for name, tensor in count_bar(_iter_vision_from_disk(model_path, dtype=dtype),
+                                  "Converting vision tower"):
+        writer.add_tensor(name, tensor, kind="weight")
+        n_vision += 1
+        vision_bytes += tensor.numel() * tensor.element_size()
+        _progress("dense", dense_bytes + ngram_bytes + mtp_bytes + vision_bytes, 0)
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -784,7 +856,10 @@ def convert_checkpoint(
         # None for every format whose banks are one uniform type (the common case).
         "expert_bank_quant_types": quant_types,
         "counts": {
-            "weight": n_weight,
+            # n_vision is folded in here (both are kind="weight" in the FTW's tensor
+            # list) but also reported on its own below (vision_num_tensors), same
+            # pattern ngram_num_tensors/mtp_num_tensors already use.
+            "weight": n_weight + n_vision,
             "experts_bank": n_bank + n_alpha,
             "ngram": n_ngram,
             "mtp_dense": n_mtp_dense,
@@ -798,6 +873,11 @@ def convert_checkpoint(
         # fp8, the drafter's own 512-expert routed bank). Neither is read by
         # iter_ftw_weights's default kinds=("weight",) -- see _iter_mtp_from_disk.
         "mtp_num_tensors": n_mtp_dense + n_mtp_expert,
+        # Vision tower (renamed vision_tower.*, kind="weight" -- see the 1d pass-through
+        # above and _iter_vision_from_disk's docstring for why this one, unlike ngram/mtp,
+        # IS read by iter_ftw_weights's default kinds=("weight",)). 0 for every checkpoint
+        # with no model.visual.* keys (non-qwen4_exp, or a text-only qwen4_exp release).
+        "vision_num_tensors": n_vision,
         "copied_metadata": copied,
     })
     return index

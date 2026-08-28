@@ -54,7 +54,7 @@ def main() -> int:
 
     print(f"total keys      : {len(weight_map)}")
     for cat in (
-        "dense", "expert_bank", "ngram_module", "mtp_dense", "mtp_expert_bank",
+        "dense", "vision", "expert_bank", "ngram_module", "mtp_dense", "mtp_expert_bank",
         "dropped", "unknown",
     ):
         print(f"  {cat:14s}: {counts.get(cat, 0)}")
