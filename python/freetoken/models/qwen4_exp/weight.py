@@ -6,9 +6,12 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.models.config import vision_load_enabled
 from freetoken.models.loader import iter_weight_files
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
+
+from .vision import adapt_vision_tensor
 
 # The routed-expert bank machinery is IDENTICAL to qwen3_5-FP8 (same block-fp8 layout,
 # same ``model.language_model.layers.N.mlp.experts.E.{gate|up|down}_proj`` keys, verified
@@ -23,16 +26,24 @@ from .config import parse_config  # noqa: F401  (spec contract)
 # Key classification -- the single source of truth shared by iter_weights and
 # tools/qwen4_map_check.py. Categories:
 #   dense        -> streamed through iter_weights (renamed, maybe fused / +1-baked)
+#   vision       -> model.visual.* (renamed vision_tower.*), streamed through iter_weights
+#                   IFF vision_load_enabled() (opt-in; the model only builds a
+#                   vision_tower submodule under the same flag, see qwen4_exp/model.py).
+#                   checkpoint/convert.py's FTW pass-through carries these tensors
+#                   unconditionally regardless of this flag -- see its docstring for why
+#                   conversion-time and load-time gating are deliberately different.
 #   expert_bank  -> routed experts (fp8 + scales), loaded by setup_offload_expert_banks
 #   ngram_module -> ple.ple_embedding.* subtree, mmap-loaded directly by ngram.py
-#   dropped      -> mtp.* / vision / quant sidecar scales we intentionally do not serve
+#   mtp_dense / mtp_expert_bank -> MTP drafter head, preserved for a later phase
+#   dropped      -> quant sidecar scales we intentionally do not serve
 # ---------------------------------------------------------------------------
 
 _EXPERT_RE = re.compile(r"^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\.")
-# model.visual.* / visual.* (vision tower) stay dropped -- out of scope (text-only P0/P1).
+# model.visual.* / visual.* (vision tower) -- classified below as its own "vision"
+# category (NOT dropped: see the class comment above and adapt_vision_tensor's docstring).
+_VISION_PREFIXES = ("model.visual.", "visual.")
 # mtp.* is classified below (mtp_dense / mtp_expert_bank), NOT dropped: the MTP drafter
 # head is preserved for a later phase (see MTP_DENSE_PATTERNS / MTP_EXPERT_RE).
-_DROP_PREFIXES = ("model.visual.", "visual.")
 _DROP_SUFFIXES = (".k_scale", ".v_scale", ".q_scale", ".prob_scale")
 
 # MTP drafter routed-expert bank: 512 experts x {gate,up,down}_proj x {weight,
@@ -100,6 +111,17 @@ def _rename(raw_name: str) -> str:
     return name
 
 
+def _rename_vision(raw_name: str) -> str:
+    """``model.visual.<rest>`` / ``visual.<rest>`` -> ``vision_tower.<rest>`` -- the prefix
+    ``Qwen4ExpForCausalLM``'s ``vision_tower`` submodule puts on its own state-dict keys.
+    Same rule as ``checkpoint/qwen_layout.py``'s ``ftw_vision_name`` (kept as an independent
+    implementation there since that module is deliberately stdlib-only / models-free)."""
+    for prefix in _VISION_PREFIXES:
+        if raw_name.startswith(prefix):
+            return "vision_tower." + raw_name[len(prefix):]
+    raise ValueError(f"not a vision tensor name: {raw_name!r}")
+
+
 # Exhaustive whitelist of expected DENSE keys (raw checkpoint form). Anything that
 # matches no category below is UNKNOWN -- the map-check tool fails and iter_weights
 # raises, instead of silently feeding load_state_dict a surprise.
@@ -126,11 +148,11 @@ _DENSE_PATTERNS = tuple(
 
 
 def classify_key(raw_name: str) -> tuple[str, str]:
-    """-> (category, detail). detail = renamed dense key, or the reason for the rest.
-    Categories: dense / expert_bank / ngram_module / mtp_dense / mtp_expert_bank /
+    """-> (category, detail). detail = renamed dense/vision key, or the reason for the rest.
+    Categories: dense / vision / expert_bank / ngram_module / mtp_dense / mtp_expert_bank /
     dropped / unknown."""
-    if raw_name.startswith(_DROP_PREFIXES):
-        return "dropped", "vision not served (out of scope)"
+    if raw_name.startswith(_VISION_PREFIXES):
+        return "vision", _rename_vision(raw_name)
     if raw_name.endswith(_DROP_SUFFIXES):
         return "dropped", "quant sidecar scale (engine keeps native-precision KV)"
     if _MTP_EXPERT_RE.match(raw_name):
@@ -192,6 +214,20 @@ def iter_weights(
                 category, detail = classify_key(raw_name)
                 if category == "unknown":
                     raise ValueError(f"unexpected checkpoint key: {raw_name}")
+                if category == "vision":
+                    # Opt-in, matching qwen4_exp/model.py only building a vision_tower
+                    # submodule under the same flag -- yielding these unconditionally
+                    # would make load_state_dict see unexpected keys when vision is off.
+                    # checkpoint/convert.py's FTW pass-through carries vision tensors
+                    # unconditionally regardless of this flag (see its docstring); this
+                    # gate only applies to this raw-HF-checkpoint streaming path.
+                    if not vision_load_enabled():
+                        continue
+                    name = detail  # "vision_tower.<short>"
+                    short = name[len("vision_tower."):]
+                    tensor = adapt_vision_tensor(short, f.get_tensor(raw_name))
+                    yield name, tensor
+                    continue
                 if category != "dense":
                     continue
                 name = detail

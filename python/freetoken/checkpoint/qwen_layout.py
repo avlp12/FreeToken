@@ -19,10 +19,23 @@ DEST_EXPERT = "expert"
 DEST_NGRAM = "ngram"
 DEST_DENSE = "dense"
 
-# Explicit skip: MTP draft head + vision tower. Text-only FTW must not carry these;
-# ``iter_ftw_weights`` only drops VISION_KEY_PREFIXES (vision_tower./embed_vision.),
-# which do NOT match Qwen's ``model.visual.*``.
-SKIP_PREFIXES = ("mtp.", "model.visual.", "visual.")
+# Explicit skip: MTP draft head only. ``mtp.*`` is kept out of the ordinary dense/weight
+# stream as defense in depth -- it has its own dedicated pass-through in convert.py
+# (kind="mtp_dense" / "mtp_expert", never fed to ``model.load_state_dict``; see
+# ``_iter_mtp_from_disk``'s docstring). The vision tower used to be skipped here too, but
+# it is NOT out of scope any more: ``model.visual.*`` now classifies as DEST_DENSE (see
+# ``is_vision_tensor`` / ``ftw_vision_name`` below) and is carried into the FTW under its
+# renamed ``vision_tower.*`` key by convert.py's own dedicated vision pass-through
+# (mirroring the ngram/MTP passes) -- kind="weight", so ``iter_ftw_weights``'s default
+# ``kinds=("weight",)`` DOES yield it. That renamed key is exactly what
+# ``models.config.VISION_KEY_PREFIXES`` catches at *load* time: whether the tensors reach
+# ``model.load_state_dict`` is decided then (by ``FREETOKEN_LOAD_VISION``), not here.
+SKIP_PREFIXES = ("mtp.",)
+
+# Vision tower raw checkpoint key prefixes (Qwen's ``model.visual.*``; bare ``visual.*``
+# kept as a defensive alias -- not observed in the real checkpoint, whose 333 vision
+# tensors are all ``model.visual.*``).
+_VISION_SRC_PREFIXES = ("model.visual.", "visual.")
 
 # Unused ModelOpt KV-cache static scales (same drop as qwen3_5_moe._rename).
 _SKIP_SUFFIXES = (".k_scale", ".v_scale", ".q_scale", ".prob_scale")
@@ -114,7 +127,17 @@ def is_qwen4_exp_config(cfg: dict) -> bool:
 
 
 def classify_tensor(name: str) -> str:
-    """Map a raw HF weight-map key to an FTW destination."""
+    """Map a raw HF weight-map key to an FTW destination.
+
+    ``model.visual.*`` (vision tower) falls through every check below to DEST_DENSE --
+    verified against the real checkpoint's 333 vision keys to collide with none of
+    ``_EXPERT_RE`` / ``_NGRAM_RE`` / ``_PLE_SMALL_RE`` (see
+    ``tests/checkpoint/test_qwen_vision_layout.py``). convert.py's dense pass never
+    actually feeds it raw ``model.visual.*`` names in practice (its own dedicated vision
+    pass-through sources and renames them directly, see ``_iter_vision_from_disk``); this
+    classification exists so ``ftw_qwen_dryrun`` and this module's own selfcheck report
+    vision as carried, not dropped.
+    """
     if name.startswith(SKIP_PREFIXES) or name.endswith(_SKIP_SUFFIXES):
         return DEST_SKIP
     if _EXPERT_RE.search(name):
@@ -124,6 +147,25 @@ def classify_tensor(name: str) -> str:
     if _NGRAM_RE.search(name):
         return DEST_NGRAM
     return DEST_DENSE
+
+
+def is_vision_tensor(name: str) -> bool:
+    """True for the vision tower's raw HF checkpoint keys (``model.visual.*``)."""
+    return name.startswith(_VISION_SRC_PREFIXES)
+
+
+def ftw_vision_name(name: str) -> str:
+    """Raw vision checkpoint key -> the runtime/FTW key.
+
+    ``model.visual.<rest>`` -> ``vision_tower.<rest>`` -- the prefix
+    ``Qwen4ExpForCausalLM.vision_tower`` (a ``Qwen4VisionModel`` submodule) puts on its own
+    state-dict keys, and exactly what ``models.config.VISION_KEY_PREFIXES`` matches at FTW
+    load time. Raises on a name ``is_vision_tensor`` would reject.
+    """
+    for prefix in _VISION_SRC_PREFIXES:
+        if name.startswith(prefix):
+            return "vision_tower." + name[len(prefix):]
+    raise ValueError(f"not a vision tensor name: {name!r}")
 
 
 def load_weight_map(model_path: str) -> dict[str, str]:
@@ -307,9 +349,11 @@ __all__ = [
     "extra_index_files",
     "extra_safetensor_files",
     "ftw_padded_bytes",
+    "ftw_vision_name",
     "is_mtp_expert_tensor",
     "is_mtp_tensor",
     "is_qwen4_exp_config",
+    "is_vision_tensor",
     "is_wrapper_config",
     "iter_shard_tensor_metas",
     "load_hf_config_dict",

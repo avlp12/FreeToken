@@ -355,15 +355,36 @@ class Qwen4VisionModel(BaseOP):
         return merged[out_mask.reshape(-1)]
 
 
+_VISUAL_HF_PREFIX = "model.visual."
+
+
+def adapt_vision_tensor(short_name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Applies the one checkpoint -> module shape change the vision tower needs:
+    ``patch_embed.proj.weight``'s Conv3d ``[C_out, C_in, T, P, P]`` -> this module's
+    Linear-equivalent ``[C_out, C_in*T*P*P]`` (see ``Qwen4VisionPatchEmbedder``). Every
+    other vision tensor passes through unchanged. ``short_name`` is the checkpoint key
+    with the ``model.visual.`` prefix already stripped (i.e. a key of
+    ``Qwen4VisionModel.state_dict()``).
+
+    Single source of truth for this reshape, shared by ``load_visual_state_dict`` below
+    and ``models/qwen4_exp/weight.py``'s ``iter_weights`` (the raw-HF-checkpoint dense
+    stream, gated on ``vision_load_enabled()``) so the two loading paths cannot drift.
+    """
+    if short_name == "patch_embed.proj.weight":
+        return tensor.reshape(tensor.shape[0], -1)
+    return tensor
+
+
 def load_visual_state_dict(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.Tensor]:
     """Loads the ``model.visual.*`` tensors directly from an HF safetensors checkpoint's
-    ``model.safetensors.index.json`` -- NOT the FreeToken FTW checkpoint format, which
-    drops them (``checkpoint/qwen_layout.py`` still lists ``model.visual.*`` in
-    ``SKIP_PREFIXES``; extending the converter to carry them is a separate, later step).
+    ``model.safetensors.index.json``. Used both by ``encode_images``-adjacent tooling that
+    wants to load straight from an HF release, and by ``checkpoint/convert.py``'s dedicated
+    vision pass-through (see ``_iter_vision_from_disk``), which carries these tensors into
+    the FTW under the renamed ``vision_tower.*`` key (``checkpoint/qwen_layout.py``'s
+    ``ftw_vision_name`` implements the same rename for the stdlib-only classification path).
     Returns a state dict keyed to match ``Qwen4VisionModel.state_dict()`` (the
-    ``model.visual.`` prefix stripped; ``patch_embed.proj.weight`` reshaped from the
-    checkpoint's Conv3d ``[C_out, C_in, T, P, P]`` layout to this module's Linear-equivalent
-    ``[C_out, C_in*T*P*P]``).
+    ``model.visual.`` prefix stripped; see ``adapt_vision_tensor`` for the one shape change
+    applied along the way).
     """
     from safetensors import safe_open
 
@@ -371,10 +392,9 @@ def load_visual_state_dict(model_dir: str, dtype: torch.dtype = torch.bfloat16) 
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
 
-    prefix = "model.visual."
     by_file: dict[str, list[str]] = {}
     for key, fname in weight_map.items():
-        if key.startswith(prefix):
+        if key.startswith(_VISUAL_HF_PREFIX):
             by_file.setdefault(fname, []).append(key)
 
     out: dict[str, torch.Tensor] = {}
@@ -382,11 +402,9 @@ def load_visual_state_dict(model_dir: str, dtype: torch.dtype = torch.bfloat16) 
         with safe_open(os.path.join(model_dir, fname), framework="pt") as f:
             for key in keys:
                 tensor = f.get_tensor(key).to(dtype)
-                short = key[len(prefix):]
-                if short == "patch_embed.proj.weight":
-                    tensor = tensor.reshape(tensor.shape[0], -1)
-                out[short] = tensor
+                short = key[len(_VISUAL_HF_PREFIX):]
+                out[short] = adapt_vision_tensor(short, tensor)
     return out
 
 
-__all__ = ["Qwen4VisionModel", "load_visual_state_dict"]
+__all__ = ["Qwen4VisionModel", "adapt_vision_tensor", "load_visual_state_dict"]
