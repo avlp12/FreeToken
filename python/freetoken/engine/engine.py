@@ -449,6 +449,45 @@ def _highwater_prefill_len(
     return length if length >= 2 else None
 
 
+# Empirical VRAM-headroom danger band for the prefill high-water warmup, from
+# RTX 5090 / WSL2 measurements at an 8192-token prefill (configuration and
+# pre-boot free memory otherwise identical across runs): free-after-warmup
+# readings from 0.93 GiB down to 0.08 GiB ran healthy across many boots; 0.04
+# and 0.03 GiB free showed a 19%-down prefill twice, later not reproducible;
+# 0.00 GiB free was healthy on two boots and, on a third, produced a 34x
+# decode collapse (1.15 tok/s against a normal ~39 tok/s). The warmup
+# *succeeds* in this whole band -- the failure crawls rather than crashing,
+# so it is easy to miss in the field. 0.1 GiB sits just above the highest
+# free reading that ever showed trouble.
+_VRAM_HEADROOM_WARN_THRESHOLD_BYTES = int(0.1 * 1024**3)
+
+
+def _vram_headroom_warning(free_after_bytes: int) -> str | None:
+    """Return a warning string when post-warmup free VRAM is dangerously thin.
+
+    Pure and GPU-free: takes the measured free-byte count, returns warning
+    text or ``None``. Below ``_VRAM_HEADROOM_WARN_THRESHOLD_BYTES`` the
+    warmup has still *succeeded* -- this is not the "does not fit" failure
+    path -- but has left almost nothing free to the driver, and that band has
+    produced unpredictable behaviour up to and including a 34x decode
+    collapse. Warn, do not fail: most boots in this band run fine, and
+    turning it into a hard error would break setups that work today.
+    """
+    if free_after_bytes >= _VRAM_HEADROOM_WARN_THRESHOLD_BYTES:
+        return None
+    return (
+        f"Post-warmup free VRAM is {mem_GB(free_after_bytes)}, below the "
+        f"{mem_GB(_VRAM_HEADROOM_WARN_THRESHOLD_BYTES)} headroom-warning "
+        "threshold. This configuration will boot and often runs fine, but "
+        "this band has also produced a 34x decode collapse (1.15 tok/s "
+        "against a normal ~39 tok/s) on one boot with an otherwise "
+        "identical configuration and the same free memory before boot -- "
+        "the failure crawls rather than crashing, so it is easy to miss in "
+        "the field. Remedy: lower --moe-cache-size to buy VRAM headroom "
+        "(roughly 220 slots buys about 0.84 GiB)."
+    )
+
+
 def _dummy_vram_bytes_from_env() -> int:
     """Parse ``FREETOKEN_DUMMY_VRAM_MIB`` into a byte count.
 
@@ -2105,6 +2144,9 @@ class Engine:
             "do not torch.cuda.empty_cache() -- that would return the high-water "
             "to the driver and re-open the dxgk make_resident crash)"
         )
+        headroom_warning = _vram_headroom_warning(free_after)
+        if headroom_warning is not None:
+            logger.warning_rank0(headroom_warning)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
