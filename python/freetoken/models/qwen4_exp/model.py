@@ -13,6 +13,7 @@ from .gdn import Qwen4GatedDeltaNet
 from .hyperconnect import Qwen4GatedResidual
 from .moe import Qwen4ExpMoE
 from .ngram import Qwen4PLELayer
+from .vision import Qwen4VisionModel
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -116,7 +117,25 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             tie_word_embeddings=False,
             tied_embedding=None,
         )
+        if config.is_multimodal:
+            self.vision_tower = Qwen4VisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the vision tower + merger. Returns ``[num_valid_soft_tokens, hidden_size]``.
+
+        Unlike Gemma4, the merger already projects to the text hidden size, so there is no
+        separate multimodal-embedder stage -- ``vision_tower.forward`` is the whole thing.
+
+        ``pixel_values``: ``[num_images, num_patches, in_channels*temporal_patch_size*patch_size**2]``;
+        ``image_position_ids``: ``[num_images, num_patches, 2]`` raw ``(row, col)`` patch-grid
+        coordinates (0-indexed, pre-merge resolution), ``(-1, -1)`` padding. See
+        ``Qwen4VisionModel`` (vision.py) for the full contract.
+        """
+        return self.vision_tower.forward(pixel_values, image_position_ids)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
