@@ -209,6 +209,33 @@ def test_mtp_visual_experts_and_table_never_loaded(loaded):
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
 
 
+def test_visual_loaded_and_renamed_when_flag_set(checkpoint, monkeypatch):
+    """FREETOKEN_LOAD_VISION=1 flips ``model.visual.*`` from dropped to renamed
+    ``vision_tower.*`` -- independent of the (always-dropped) ``mtp.*`` gate."""
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    folder, raw = checkpoint
+    loaded_with_vision = {
+        name: tensor
+        for name, tensor in iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        )
+    }
+    assert "vision_tower.blocks.0.attn.qkv.weight" in loaded_with_vision
+    assert torch.equal(
+        loaded_with_vision["vision_tower.blocks.0.attn.qkv.weight"],
+        raw["model.visual.blocks.0.attn.qkv.weight"],
+    )
+    assert "vision_tower.merger.norm.weight" in loaded_with_vision
+    assert torch.equal(
+        loaded_with_vision["vision_tower.merger.norm.weight"],
+        raw["model.visual.merger.norm.weight"],
+    )
+    # mtp.* stays dropped regardless of the vision flag -- separate gate.
+    for name in loaded_with_vision:
+        assert not name.startswith("mtp.")
+        assert not name.startswith("model.visual.")  # renamed away, none left with the raw prefix
+
+
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
     _folder, raw = checkpoint
     key = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"

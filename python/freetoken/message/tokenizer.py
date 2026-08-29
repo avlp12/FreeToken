@@ -72,6 +72,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Raw encoded image bytes, in message order (server/openai_api.py's
+    # _messages_and_images collects them). None (the default) is the text-only path
+    # every non-OpenAI adapter still takes.
+    images: List[bytes] | None = None
 
 
 @dataclass

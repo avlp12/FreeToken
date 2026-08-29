@@ -168,3 +168,66 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+# --------------------------------------------------------------------------------------
+# vision_config / is_multimodal: opt-in gated on FREETOKEN_LOAD_VISION, shaped like the
+# real checkpoint's vision_config (see vision.py's module docstring for the Qwen3-VL
+# schema this mirrors).
+# --------------------------------------------------------------------------------------
+
+
+def _vision_config():
+    return SimpleNamespace(
+        depth=27,
+        hidden_size=1152,
+        num_heads=16,
+        intermediate_size=4304,
+        in_channels=3,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=2304,
+        out_hidden_size=2560,
+        hidden_act="gelu_pytorch_tanh",
+        deepstack_visual_indexes=[],
+    )
+
+
+def test_vision_config_defaults_to_none_when_flag_unset(monkeypatch):
+    """Production default (`ft serve` boot, no FREETOKEN_LOAD_VISION): even a checkpoint
+    that ships a vision_config must build text-only, so a multimodal checkpoint served
+    without opting in stays byte-for-byte the old text-only boot."""
+    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
+    hf = _hf_config()
+    hf.vision_config = _vision_config()
+    cfg = parse_config(hf)
+    assert cfg.vision_config is None
+    assert not cfg.is_multimodal
+
+
+def test_vision_config_parsed_when_flag_set(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    hf = _hf_config()
+    hf.vision_config = _vision_config()
+    cfg = parse_config(hf)
+    assert cfg.is_multimodal
+    vc = cfg.vision_config
+    assert vc.hidden_size == 1152
+    assert vc.num_layers == 27  # HF's "depth"
+    assert vc.num_heads == 16
+    assert vc.head_dim == 72  # hidden_size // num_heads
+    assert vc.out_hidden_size == 2560
+    assert vc.text_hidden_size == cfg.hidden_size
+    assert vc.rope_theta == 10000.0  # hardcoded: Qwen3VLVisionConfig carries no such field
+    assert vc.deepstack_visual_indexes == ()
+
+
+def test_vision_config_none_when_checkpoint_has_no_vision_config(monkeypatch):
+    """A text-only checkpoint (no vision_config attribute at all) stays text-only even
+    with the flag on -- the flag only stops FreeToken from dropping a tower the
+    checkpoint actually ships, it cannot conjure one that isn't there."""
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    cfg = parse_config(_hf_config())
+    assert cfg.vision_config is None
+    assert not cfg.is_multimodal

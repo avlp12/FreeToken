@@ -6,7 +6,10 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``).
+``model.visual.*`` / ``visual.*`` (the vision tower) is also dropped UNLESS
+``FREETOKEN_LOAD_VISION=1`` (see ``vision_load_enabled``), in which case it is renamed to
+``vision_tower.*`` and streamed like any other dense tensor -- served text-only by default.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.models.config import vision_load_enabled
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -30,6 +34,8 @@ from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+from .vision import adapt_vision_tensor
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -98,10 +104,31 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
+_VISION_PREFIXES = ("model.visual.", "visual.")
+
+
+def _rename_vision(raw_name: str) -> str:
+    """``model.visual.<rest>`` / ``visual.<rest>`` -> ``vision_tower.<rest>`` -- the prefix
+    ``Qwen4ExpForCausalLM``'s ``vision_tower`` submodule puts on its own state-dict keys
+    (see vision.py's ``Qwen4VisionModel``). Only called once a caller has already matched
+    ``_VISION_PREFIXES``, so the fallthrough is unreachable."""
+    for prefix in _VISION_PREFIXES:
+        if raw_name.startswith(prefix):
+            return "vision_tower." + raw_name[len(prefix) :]
+    raise AssertionError(f"not a vision tensor name: {raw_name!r}")
+
+
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    if raw_name.startswith(_VISION_PREFIXES):
+        # Vision is opt-in (default OFF): the tower is ~0.836 GiB of never-quantized bf16
+        # weights that text-only serving never touches (model.py only builds the
+        # vision_tower submodule under the same flag). Same switch Gemma4 uses.
+        if not vision_load_enabled():
+            return None
+        return _rename_vision(raw_name)
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -174,6 +201,11 @@ def iter_weights(
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
+                if name.startswith("vision_tower."):
+                    # Not a fusion candidate (no vision key matches _FUSIONS); apply the
+                    # one shape change the tower needs (Conv3d -> Linear-equivalent) here.
+                    yield name, adapt_vision_tensor(name[len("vision_tower.") :], tensor)
+                    continue
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete

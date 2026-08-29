@@ -43,6 +43,11 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    # OpenAI image_url content parts: data: URIs and local filesystem paths are always
+    # accepted; http(s):// URLs are fetched by this server only when this is set. Off by
+    # default -- the server fetching an arbitrary client-supplied URL on the client's
+    # behalf is a request-forgery hazard.
+    allow_remote_images: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -404,6 +409,18 @@ def parse_args(
             "usage.cache_read_input_tokens, Responses usage.input_tokens_details.cached_tokens). "
             "On /v1/messages this also makes input_tokens EXCLUDE the cached prefix, matching "
             "Anthropic billing semantics."
+        ),
+    )
+
+    parser.add_argument(
+        "--allow-remote-images",
+        action="store_true",
+        default=ServerArgs.allow_remote_images,
+        help=(
+            "Fetch http(s):// image_url content parts on the client's behalf. Off by "
+            "default (data: URIs and local filesystem paths are always accepted "
+            "regardless of this flag) -- the server fetching an arbitrary "
+            "client-supplied URL is a request-forgery hazard."
         ),
     )
 

@@ -27,6 +27,7 @@ from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+from .vision import Qwen4VisionModel
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -89,6 +90,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -105,8 +107,39 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
+    def _merge_multimodal(
+        self, input_ids: torch.Tensor, x: torch.Tensor, batch: Batch
+    ) -> torch.Tensor:
+        """Scatter precomputed image soft-token embeddings at image-token positions.
+
+        ``batch.mm_embeds`` (set by the scheduler from each request's vision features,
+        see ``scheduler/scheduler.py``'s ``_gather_multimodal``) is a
+        ``[num_image_tokens, hidden]`` tensor whose rows replace the placeholder
+        embeddings produced for ``image_token_id``. Only runs during prefill batches
+        that carry images; text-only batches (``mm_embeds is None``, the production
+        default) return ``x`` unchanged.
+
+        Must be called on ``x`` BEFORE the hyper-connection replication
+        (``x.repeat(1, self.hc_count)`` in ``forward`` below) -- splicing after the
+        repeat would scatter each image embedding into only one of the ``hc_count``
+        replicated copies instead of all of them, corrupting every hyper-connection
+        stream but the first.
+        """
+        mm_embeds = getattr(batch, "mm_embeds", None)
+        if mm_embeds is None or self._image_token_id is None:
+            return x
+        mask = input_ids == self._image_token_id
+        n_slots = int(mask.sum().item())
+        assert n_slots == mm_embeds.shape[0], (
+            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
+            "image tokens must not be split across prefill chunks"
+        )
+        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        x = self.embed_tokens.forward(input_ids)
+        x = self._merge_multimodal(input_ids, x, batch)
+        hidden = x.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -141,7 +174,26 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if config.is_multimodal:
+            self.vision_tower = Qwen4VisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the vision tower + merger. Returns ``[num_valid_soft_tokens, hidden_size]``.
+
+        The merger already projects to the text hidden size (see vision.py's
+        ``Qwen4VisionMerger``), so there is no separate multimodal-embedder stage --
+        ``vision_tower.forward`` is the whole thing.
+
+        ``pixel_values``: ``[num_images, num_patches, in_channels*temporal_patch_size*patch_size**2]``;
+        ``image_position_ids``: ``[num_images, num_patches, 2]`` raw ``(row, col)`` patch-grid
+        coordinates (0-indexed, pre-merge resolution), ``(-1, -1)`` padding. See
+        ``Qwen4VisionModel`` (vision.py) for the full contract.
+        """
+        return self.vision_tower.forward(pixel_values, image_position_ids)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
