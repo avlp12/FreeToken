@@ -40,6 +40,11 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # ``text_config.mtp.rope_theta``: the draft head's own rope base (FREETOKEN_LOAD_MTP=1
+    # only -- see .mtp.Qwen4ExpMTPHead). Falls back to the base model's rope_theta when the
+    # checkpoint has no ``mtp`` section, so this field is always populated and harmless
+    # (unread) on the default text-only path.
+    mtp_rope_theta: float
 
     @property
     def index_topk_blocks(self) -> int:
@@ -233,6 +238,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
+    # ``text_config.mtp`` (a dict on this checkpoint's PretrainedConfig, not a sub-object)
+    # carries the draft head's own rope base; fall back to the base model's when the
+    # checkpoint ships no ``mtp`` section (FREETOKEN_LOAD_MTP path never runs then anyway).
+    mtp_section = getattr(text, "mtp", None)
+    if isinstance(mtp_section, dict):
+        mtp_rope_theta = mtp_section.get("rope_theta", rope_theta)
+    else:
+        mtp_rope_theta = getattr(mtp_section, "rope_theta", rope_theta)
+
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -251,6 +265,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mtp_rope_theta=float(mtp_rope_theta),
     )
 
     return ModelConfig(

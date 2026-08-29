@@ -6,7 +6,10 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) unless
+``FREETOKEN_LOAD_MTP=1`` (see :func:`load_mtp_enabled`; default OFF -- 31 BF16 tensors, ~4.86 GiB,
+that a text-only serve has no use for), and ``model.visual.*`` (served text-only, always dropped;
+a different worktree owns vision).
 """
 
 from __future__ import annotations
@@ -98,9 +101,20 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
+def load_mtp_enabled() -> bool:
+    """``FREETOKEN_LOAD_MTP=1`` gate for the speculative-head tensors (see :mod:`.mtp`).
+
+    Default OFF: the text-only serving path must be structurally unchanged (no extra
+    tensors read, no extra module built -- see ``model.py``) when this is unset.
+    """
+    return os.environ.get("FREETOKEN_LOAD_MTP") == "1"
+
+
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith(("model.visual.", "visual.")):
+        return None  # vision tower: served text-only, out of scope regardless of the MTP gate
+    if raw_name.startswith("mtp.") and not load_mtp_enabled():
         return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table

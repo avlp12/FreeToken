@@ -141,6 +141,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        # FREETOKEN_LOAD_MTP=1 only (default OFF): the draft head is a separate attribute,
+        # never constructed otherwise, so the text-only state dict/forward path is
+        # byte-for-byte unchanged when unset. See .mtp.Qwen4ExpMTPHead and .weight
+        # .load_mtp_enabled for what this loads and why.
+        from .weight import load_mtp_enabled
+
+        if load_mtp_enabled():
+            from .mtp import Qwen4ExpMTPHead
+
+            self.mtp = Qwen4ExpMTPHead(
+                config, layer_id=config.num_layers, rope_theta=config.qwen4_args.mtp_rope_theta
+            )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
