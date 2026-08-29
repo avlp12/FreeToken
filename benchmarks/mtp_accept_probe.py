@@ -88,6 +88,16 @@ Methodology
    stddev, and a 95% Wilson confidence interval (safe at small n, unlike the normal
    approximation) -- never just a bare percentage.
 
+Step 3 calls ``model.mtp.forward(..., lm_head=None)`` -- NOT with ``lm_head=model.lm_head``
+-- and instead applies ``_lm_head_logits`` below. Reason: this script scores the MTP head
+*after* the live engine forward call that generated each prompt has already returned, so
+there is no ``get_global_ctx().batch`` for ``ParallelLMHead.forward`` to read (it asserts
+``"No active batch in context"`` otherwise -- this is exactly the crash a first GPU run of
+an earlier version of this script hit). ``_lm_head_logits`` reproduces the one line of
+``ParallelLMHead.forward`` that is not batch-dependent; see its docstring for the read of
+``freetoken/layers/embedding.py`` that justifies this is exact (not approximate) for how
+this script calls it.
+
 Run (advisor, on a free GPU; this script never runs itself):
 
     FREETOKEN_LOAD_MTP=1 /root/ftenv/bin/python benchmarks/mtp_accept_probe.py \\
@@ -336,6 +346,49 @@ def build_llm(args: argparse.Namespace):
     return LLM(**kwargs)
 
 
+def _lm_head_logits(lm_head: Any, hidden: Any) -> Any:
+    """``logits = hidden @ lm_head.weight.T (+ bias)`` -- the batch-context-free subset of
+    ``ParallelLMHead.forward`` (``freetoken/layers/embedding.py``), for callers (this
+    script) that run outside a live engine forward call and so have no
+    ``get_global_ctx().batch`` for the real ``forward`` to read.
+
+    Read of that method (as of this file's commit -- re-check if it changes):
+
+        ctx = get_global_ctx(); batch = ctx.batch
+        bs = batch.size
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(bs)
+            x = x[indices].contiguous()
+        module = self.tied_embedding or self
+        logits = F.linear(x, module.weight, self.bias)
+        if self.tp_size == 1:
+            return logits
+        ... (tp_size > 1 all-gather) ...
+
+    Two things read the batch, neither applies here:
+      - the ``is_prefill`` gather keeps only each request's LAST prefill position out of a
+        multi-position-per-request batch. This script only ever calls the head with
+        ``hidden`` already reduced to exactly the rows it wants scored (one per evaluated
+        position) -- there is nothing to gather down further. (Proved wrong to skip in
+        general, not just asserted: see tests/models/qwen4_exp/test_mtp.py's
+        ``test_probe_lm_head_bypass_would_diverge_on_a_mixed_prefill_batch``, which
+        constructs exactly that batch shape and shows the two DO diverge there -- this
+        script just never produces that shape.)
+      - the ``tp_size > 1`` all-gather. ``qwen4_exp/weight.py``'s ``iter_weights`` asserts
+        TP=1 for this model family, so ``tp_size == 1`` always and that branch never runs.
+
+    What is left is exactly the ``F.linear`` line, reproduced directly below so it runs
+    with no batch context at all. See
+    ``test_mtp.py::test_probe_lm_head_bypass_matches_the_real_forward_for_a_decode_batch``
+    for a byte-identical-output proof against the real ``forward`` under a decode batch
+    (the shape this script's usage actually looks like).
+    """
+    import torch.nn.functional as F
+
+    module = lm_head.tied_embedding or lm_head
+    return F.linear(hidden, module.weight, lm_head.bias)
+
+
 def _assert_eager(llm: Any) -> None:
     """Loud, specific failure instead of a silently-too-small sample: if CUDA graphs
     somehow got enabled anyway, most decode steps would bypass the capture hook and this
@@ -397,7 +450,12 @@ def run_prompt(
     prev_r = r_all[idx]
 
     with torch.inference_mode():
-        logits = model.mtp.forward(next_ids, prev_r, positions, model.model.embed_tokens, model.lm_head)
+        # lm_head=None: this runs after llm.generate() has already returned, outside any
+        # live engine forward call, so there is no get_global_ctx().batch for
+        # ParallelLMHead.forward to read. See _lm_head_logits and this file's module
+        # docstring (Methodology, step 3) for why applying it ourselves is exact here.
+        hidden = model.mtp.forward(next_ids, prev_r, positions, model.model.embed_tokens, lm_head=None)
+        logits = _lm_head_logits(model.lm_head, hidden)
     preds = logits.argmax(dim=-1).tolist()
 
     return [

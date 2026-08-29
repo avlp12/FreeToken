@@ -253,3 +253,125 @@ def test_hidden_side_fusion_is_cpu_safe_up_to_fc_hidden(toy_config):
     h = head.fc_hidden.forward(h_mix)
     assert h.shape == (5, H)
     assert torch.isfinite(h).all()
+
+
+# ======================================================================================
+# GPU crash regression: Qwen4ExpMTPHead.forward's lm_head must be optional, and the
+# probe's ctx-free bypass must be provably equivalent to the real, batch-aware
+# ParallelLMHead.forward for how the probe actually calls it. See mtp_accept_probe.py's
+# module docstring (Methodology, step 3) and _lm_head_logits for the narrative.
+# ======================================================================================
+
+
+def test_forward_lm_head_none_returns_hidden_and_skips_lm_head(toy_config):
+    """Qwen4ExpMTPHead.forward(..., lm_head=None) must return the pre-lm_head hidden
+    tensor without touching lm_head at all -- stubbing out the CUDA-only stages
+    (fuse_inputs, the decoder layer) isolates just this branch on CPU."""
+    with torch_dtype(torch.float32):
+        head = Qwen4ExpMTPHead(
+            toy_config, layer_id=toy_config.num_layers, rope_theta=toy_config.qwen4_args.mtp_rope_theta
+        )
+    for tensor in head.hyper_connection_mixer.state_dict().values():
+        tensor.normal_(0, 0.05)
+
+    fake_r0 = torch.randn(3, HCH)
+    fake_r1 = torch.randn(3, HCH)
+    head.fuse_inputs = lambda *a, **k: fake_r0
+    head.layers.op_list[0].forward = lambda r0, positions: fake_r1
+    expected_hidden, _ = head.hyper_connection_mixer.mix(fake_r1)
+
+    dummy_ids = torch.zeros(3, dtype=torch.long)
+    dummy_pos = torch.arange(3)
+
+    hidden = head.forward(dummy_ids, fake_r0, dummy_pos, embed_tokens=None, lm_head=None)
+    torch.testing.assert_close(hidden, expected_hidden)
+
+    class _FakeLMHead:
+        def __init__(self):
+            self.calls = []
+
+        def forward(self, x):
+            self.calls.append(x)
+            return "SENTINEL_LOGITS"
+
+    fake_lm_head = _FakeLMHead()
+    out = head.forward(dummy_ids, fake_r0, dummy_pos, embed_tokens=None, lm_head=fake_lm_head)
+    assert out == "SENTINEL_LOGITS"
+    assert len(fake_lm_head.calls) == 1
+    torch.testing.assert_close(fake_lm_head.calls[0], expected_hidden)
+
+
+def test_probe_lm_head_bypass_matches_the_real_forward_for_a_decode_batch():
+    """The safety claim behind mtp_accept_probe.py's _lm_head_logits: for a decode-phase
+    batch (one row per request, no prefill last-token gather to apply -- exactly the
+    shape the probe always calls it with), the ctx-free bypass is byte-identical to the
+    real, batch-aware ParallelLMHead.forward."""
+    from freetoken.core import Batch
+    from freetoken.layers.embedding import ParallelLMHead
+
+    from .common import fresh_ctx
+
+    probe = _load_probe_module()
+
+    torch.manual_seed(0)
+    vocab, hidden = 11, 6
+    with torch_dtype(torch.float32):
+        head = ParallelLMHead(num_embeddings=vocab, embedding_dim=hidden, tie_word_embeddings=False)
+    head.weight.normal_()
+    x = torch.randn(3, hidden)
+
+    batch = Batch(reqs=[None, None, None], phase="decode")
+    ctx = fresh_ctx()
+    with ctx.forward_batch(batch):
+        real = head.forward(x)
+
+    bypass = probe._lm_head_logits(head, x)
+    torch.testing.assert_close(bypass, real)
+
+
+def test_probe_lm_head_bypass_would_diverge_on_a_mixed_prefill_batch():
+    """Negative control: the bypass is only valid because the probe never feeds it a
+    genuine multi-position-per-request prefill batch. If it did, the real
+    ParallelLMHead.forward's last-token gather would select a strict subset of rows;
+    this proves that difference is real (not hand-waved) and pins down exactly which
+    rows -- so nobody "simplifies" the probe to call this on a raw prefill batch."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Batch
+    from freetoken.layers.embedding import ParallelLMHead
+
+    from .common import fresh_ctx
+
+    probe = _load_probe_module()
+
+    torch.manual_seed(0)
+    vocab, hidden = 5, 4
+    with torch_dtype(torch.float32):
+        head = ParallelLMHead(num_embeddings=vocab, embedding_dim=hidden, tie_word_embeddings=False)
+    head.weight.normal_()
+    x = torch.randn(4, hidden)  # e.g. 2 requests' prefill rows, 2 positions each
+
+    batch = Batch(reqs=[None, None], phase="prefill")
+    batch.attn_metadata = SimpleNamespace(get_last_indices=lambda bs: torch.tensor([1, 3]))
+    ctx = fresh_ctx()
+    with ctx.forward_batch(batch):
+        real = head.forward(x)
+
+    bypass = probe._lm_head_logits(head, x)
+    assert real.shape[0] == 2
+    assert bypass.shape[0] == 4
+    torch.testing.assert_close(real, bypass[[1, 3]])
+    assert not torch.allclose(real, bypass[:2])
+
+
+def _load_probe_module():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "benchmarks" / "mtp_accept_probe.py"
+    spec = importlib.util.spec_from_file_location("mtp_accept_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["mtp_accept_probe"] = module
+    spec.loader.exec_module(module)
+    return module

@@ -327,16 +327,33 @@ class Qwen4ExpMTPHead(BaseOP):
         prev_layer_r: torch.Tensor,
         positions: torch.Tensor,
         embed_tokens: VocabParallelEmbedding,
-        lm_head: ParallelLMHead,
+        lm_head: ParallelLMHead | None = None,
     ) -> torch.Tensor:
         """Predict the token after ``next_token_ids`` given ``prev_layer_r`` (the base
-        model's raw last-layer hyper-connection R at the same positions). Returns
-        ``[T, vocab]`` logits from the shared ``lm_head`` -- callers take ``argmax`` for
-        the depth-1 top-1 draft. Requires CUDA (rope/gemma-norm kernels have no CPU path;
-        see the executor's report)."""
+        model's raw last-layer hyper-connection R at the same positions). With ``lm_head``
+        given, returns ``[T, vocab]`` logits from it -- callers take ``argmax`` for the
+        depth-1 top-1 draft. Requires CUDA either way (rope/gemma-norm kernels have no CPU
+        path; see the executor's report).
+
+        ``lm_head=None`` (default) returns the pre-lm_head ``[T, hidden]`` tensor instead
+        of calling ``lm_head.forward``. This is not a convenience default: ``ParallelLMHead
+        .forward`` (``freetoken/layers/embedding.py``) reads ``get_global_ctx().batch`` to
+        find each request's last prefill position, and that context only exists inside a
+        live engine forward call. A retrospective, out-of-batch-context caller (e.g. the
+        offline accept-rate probe) that calls it anyway hits ``AssertionError: No active
+        batch in context`` -- this signature exists so such a caller instead gets ``hidden``
+        and projects it to logits itself, with its own justification for why doing so is
+        safe for how *it* is calling this (see ``benchmarks/mtp_accept_probe.py``'s
+        ``_lm_head_logits``). A live serving integration (out of scope, not written yet)
+        should keep passing ``lm_head`` so it gets ``ParallelLMHead``'s real batch-aware
+        behavior unchanged -- this is why the parameter was made optional instead of
+        deleting the ``lm_head.forward`` call from this file.
+        """
         r0 = self.fuse_inputs(next_token_ids, prev_layer_r, embed_tokens)
         r1 = self.layers.op_list[0].forward(r0, positions)
         hidden, _ = self.hyper_connection_mixer.mix(r1)
+        if lm_head is None:
+            return hidden
         return lm_head.forward(hidden)
 
 
