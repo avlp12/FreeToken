@@ -375,3 +375,173 @@ def _load_probe_module():
     sys.modules["mtp_accept_probe"] = module
     spec.loader.exec_module(module)
     return module
+
+
+# ======================================================================================
+# Diagnostic sweep added after the first GPU run's pooled p_hat=0.163 landed far below an
+# external comparable-model figure (83.4%, ik_llama.cpp PR #1698 depth-1 MTP): distinguish
+# "wiring bug" from "genuinely weak head" by scoring every captured position against
+# full_ids[i+1]/[i+2]/[i+3] and against several readings of the captured hidden state,
+# instead of trusting the single (raw R, offset +2) cell the first run reported.
+# ======================================================================================
+
+
+def test_hidden_candidates_shapes_and_relationships(toy_config):
+    """CPU-testable in full (unlike Qwen4ExpMTPHead.forward): GatedResidual.mix falls back
+    to plain torch on a non-cuda tensor, so this exercises the real hc.py code, not a
+    stub, for the 'collapsed_then_repeat' candidate."""
+    probe = _load_probe_module()
+
+    from freetoken.models.qwen4_exp.hc import GatedResidual
+
+    torch.manual_seed(0)
+    mixer = GatedResidual(toy_config, use_combine=False)
+    for tensor in mixer.state_dict().values():
+        tensor.normal_(0, 0.05)
+
+    class _FakeBaseModel:
+        def __init__(self, mixer):
+            self.model = type("M", (), {"hyper_connection_mixer": mixer})()
+
+    model = _FakeBaseModel(mixer)
+    t = 5
+    r_selected = torch.randn(t, HCH)
+
+    cands = probe.hidden_candidates(model, r_selected, HC, H)
+    assert set(cands) == {"raw_blocked", "stream_hidden_swapped", "collapsed_then_repeat"}
+
+    # raw_blocked is exactly the input, unmodified.
+    torch.testing.assert_close(cands["raw_blocked"], r_selected)
+
+    # stream_hidden_swapped is a genuine reshuffle of the SAME values (same shape, same
+    # total), not a no-op and not data loss.
+    swapped = cands["stream_hidden_swapped"]
+    assert swapped.shape == r_selected.shape
+    torch.testing.assert_close(swapped.sum(), r_selected.sum())
+    assert not torch.allclose(swapped, r_selected)
+
+    # collapsed_then_repeat: repeat(1, hc_count) means every one of the hc_count blocks
+    # along the last dim must be identical to each other.
+    collapsed = cands["collapsed_then_repeat"]
+    assert collapsed.shape == (t, HCH)
+    blocks = collapsed.view(t, HC, H)
+    for g in range(1, HC):
+        torch.testing.assert_close(blocks[:, 0], blocks[:, g])
+    # and it must actually be model.model.hyper_connection_mixer.mix(r_selected)[0]
+    # repeated, not some other transform.
+    expected, _ = mixer.mix(r_selected)
+    torch.testing.assert_close(blocks[:, 0], expected)
+
+
+def test_run_prompt_offset_and_hidden_candidate_sweep():
+    """Mocked-engine regression for the sweep bookkeeping added on top of the original
+    position-alignment logic (already covered by this project's earlier ad hoc mock, now
+    folded in here): every (position, hidden_candidate, offset) cell that should exist
+    does, out-of-range offsets near the end of the trace are skipped (not padded with
+    wrong data), and -- using a fake MTP head that is deliberately "correct" only two
+    steps ahead -- offset+2 is the one column that lands at 100% while +1 and +3 land at
+    0%, exactly the "one offset jumps, the others don't" signature the sweep exists to
+    surface, reproduced here as a known-answer case."""
+    probe = _load_probe_module()
+
+    HIDDEN = 4
+    full_ids = [10, 11, 12, 20, 21, 22, 23, 24]  # prompt=[10,11,12], generated=[20..24]
+    prompt_len = 3
+
+    class FakeStatus:
+        input_ids = full_ids[:prompt_len]
+        output_ids = full_ids[prompt_len:]
+
+    class FakeLayer:
+        def __init__(self):
+            self.forward = self._orig_forward
+
+        def _orig_forward(self, hidden, batch):
+            return hidden
+
+    class FakeMixer:
+        def mix(self, r):
+            return r[:, : HIDDEN // 2], None  # arbitrary deterministic [T, hidden_size] collapse
+
+    class FakeInnerModel:
+        def __init__(self, layer, mixer):
+            self.layers = type("L", (), {"op_list": [layer]})()
+            self.embed_tokens = object()
+            self.hyper_connection_mixer = mixer
+
+    VOCAB = 40
+
+    class FakeMTP:
+        hc_count = 2
+        hidden_size = HIDDEN // 2
+
+        def forward(self, next_ids, prev_r, positions, embed_tokens, lm_head=None):
+            assert lm_head is None  # run_prompt must call with lm_head=None, see mtp.py
+            # "correct" exactly two steps ahead of next_ids, independent of prev_r on
+            # purpose: this test is about the sweep's bookkeeping, not about
+            # hidden_candidates()'s own numerics (covered separately above). Returns
+            # "hidden" that is really already the desired logits -- FakeLMHead below is
+            # the identity, so _lm_head_logits passes it through unchanged.
+            preds = [int(nid) + 1 for nid in next_ids.tolist()]
+            hidden = torch.full((len(preds), VOCAB), -10.0)
+            for k, p in enumerate(preds):
+                hidden[k, p] = 100.0
+            return hidden
+
+    class FakeLMHead:
+        tied_embedding = None
+        weight = torch.eye(VOCAB)
+        bias = None
+
+    class FakeModel:
+        def __init__(self, layer, mixer):
+            self.model = FakeInnerModel(layer, mixer)
+            self.mtp = FakeMTP()
+            self.lm_head = FakeLMHead()
+
+    class FakeEngine:
+        def __init__(self, model):
+            self.model = model
+
+    class FakeLLM:
+        def __init__(self, model):
+            self.engine = FakeEngine(model)
+            self.status_map = {0: FakeStatus()}
+
+        def generate(self, prompts, sampling_params):
+            layer = self.engine.model.model.layers.op_list[0]
+            prefill = torch.arange(3 * HIDDEN, dtype=torch.float32).reshape(3, HIDDEN)
+            layer.forward(prefill, batch=None)
+            for step in range(5):
+                row = torch.full((1, HIDDEN), float(100 + step))
+                layer.forward(row, batch=None)
+            return [{"text": "", "token_ids": FakeStatus.output_ids}]
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt, enable_thinking):
+            return "<fake prompt>"
+
+    layer = FakeLayer()
+    model = FakeModel(layer, FakeMixer())
+    llm = FakeLLM(model)
+    tok = FakeTokenizer()
+
+    rows = probe.run_prompt(llm, tok, "prose", "fake", "irrelevant", max_tokens=64, warmup=0)
+
+    candidates_seen = {r.hidden_candidate for r in rows}
+    assert candidates_seen == {"raw_blocked", "stream_hidden_swapped", "collapsed_then_repeat"}
+    assert {r.offset for r in rows} == set(probe.OFFSETS)
+    assert len(rows) == 3 * 12  # 3 candidates x (5 + 4 + 3) valid (position, offset) pairs
+
+    # Out-of-range ground truth is skipped, never scored with wrong data.
+    assert not any(r.position == 6 and r.offset in (2, 3) for r in rows)
+    assert not any(r.position == 5 and r.offset == 3 for r in rows)
+
+    for cand in candidates_seen:
+        cand_rows = [r for r in rows if r.hidden_candidate == cand]
+        off1 = [r for r in cand_rows if r.offset == 1]
+        off2 = [r for r in cand_rows if r.offset == 2]
+        off3 = [r for r in cand_rows if r.offset == 3]
+        assert len(off1) == 5 and not any(r.match for r in off1)
+        assert len(off2) == 4 and all(r.match for r in off2)
+        assert len(off3) == 3 and not any(r.match for r in off3)
