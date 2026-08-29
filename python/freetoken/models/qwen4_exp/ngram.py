@@ -42,11 +42,22 @@ _NGRAM_STUB = int(os.environ.get("FREETOKEN_NGRAM_STUB", "0") or 0)
 # freetoken/models/qwen4_exp/ple.py, kernel/triton/ple.py) adapted for this fork's
 # IQ4_NL table format instead of upstream's FP8+scalar-scale one -- see
 # _PLEUVABackend and freetoken.kernel.triton.ple's module docstring for the block
-# layout. Default OFF: the existing mmap path is untouched and still the only path
-# taken when this is unset, when the source isn't IQ4_NL/FTW, when the ids are not
-# on a CUDA device, or if backend construction fails for any reason (pin budget,
-# missing extension, ...) -- see _NGramTable._uva_backend_for.
-_PLE_UVA = os.environ.get("FREETOKEN_PLE_UVA", "0") == "1"
+# layout.
+#
+# DEFAULT ON since 2026-08-29. Set FREETOKEN_PLE_UVA=0 to force the mmap path back.
+# The gather it replaces was measured at 0.8390 ms median against a 24.372 ms decode
+# step, and the replacement runs it in 0.0688 -- 12.2x, and the worst-case 43 ms
+# page-fault spike becomes 0.15. missing_per_layer was identical to fifteen decimals
+# across the A/B, so routing does not move. The cost is host memory: core RSS 106.6 ->
+# 148.2 GiB, since the table stops being page cache the kernel can reclaim and becomes
+# a pinned allocation it cannot. Both shipping launchers were checked at that size and
+# keep 70 GiB free.
+#
+# The mmap path is still the fallback and is taken whenever this is 0, when the source
+# isn't IQ4_NL/FTW, when the ids are not on a CUDA device, or if backend construction
+# fails for any reason (pin budget, missing extension, ...) -- see
+# _NGramTable._uva_backend_for. Nothing about that path changed.
+_PLE_UVA = os.environ.get("FREETOKEN_PLE_UVA", "1") == "1"
 
 # Reference: transformers modeling_qwen4_exp (Qwen4ExpTextNGramEmbedding /
 # Qwen4ExpTextPLELayer), read 2026-08-26. Faithful naive port:
