@@ -35,6 +35,19 @@ _NGRAM_TIMING = int(os.environ.get("FREETOKEN_NGRAM_TIMING", "0") or 0)
 _NGRAM_TIMING_SKIP = int(os.environ.get("FREETOKEN_NGRAM_TIMING_SKIP", "8") or 0)
 _NGRAM_STUB = int(os.environ.get("FREETOKEN_NGRAM_STUB", "0") or 0)
 
+# FREETOKEN_PLE_UVA=1 -> replace the mmap-per-decode-step gather (host sync +
+# python shard loop + unpinned H2D, see _NGramTable.gather()'s docstring and
+# precompute_decode_ngram's) with a pinned-host-memory + UVA Triton gather,
+# mirroring upstream's PinnedUVATable/ple_gather_rows (/root/ft-upstream/python/
+# freetoken/models/qwen4_exp/ple.py, kernel/triton/ple.py) adapted for this fork's
+# IQ4_NL table format instead of upstream's FP8+scalar-scale one -- see
+# _PLEUVABackend and freetoken.kernel.triton.ple's module docstring for the block
+# layout. Default OFF: the existing mmap path is untouched and still the only path
+# taken when this is unset, when the source isn't IQ4_NL/FTW, when the ids are not
+# on a CUDA device, or if backend construction fails for any reason (pin budget,
+# missing extension, ...) -- see _NGramTable._uva_backend_for.
+_PLE_UVA = os.environ.get("FREETOKEN_PLE_UVA", "0") == "1"
+
 # Reference: transformers modeling_qwen4_exp (Qwen4ExpTextNGramEmbedding /
 # Qwen4ExpTextPLELayer), read 2026-08-26. Faithful naive port:
 #   * hash n-gram ids = XOR of (shifted token id * per-position multiplier), one prime
@@ -168,6 +181,36 @@ class _NGramTable:
             shard0 = self._shard(0)
             self.rows_per_shard = shard0.shape[0]
             self.head_dim = shard0.shape[1]
+        # FREETOKEN_PLE_UVA lazy backend (see module docstring / _PLEUVABackend):
+        # built on first CUDA gather, not here -- construction pins ~27 GiB of host
+        # memory (cudaHostAlloc), which is expensive and requires a live CUDA
+        # context, so it must not happen just because a _NGramTable was
+        # constructed (e.g. under a CPU-only test).
+        self._uva_backend: "_PLEUVABackend | None" = None
+        self._uva_failed = False
+
+    def _uva_backend_for(self, device: torch.device) -> "_PLEUVABackend | None":
+        """Build (once) or return the cached UVA backend, or None if unusable.
+
+        None is cached forever after the first failure (self._uva_failed): a
+        pin-budget miss or a missing compiled extension is a boot-time property of
+        this box/checkpoint, not something a retry fixes, and gather() must fall
+        back to the mmap path every time, not just once, when this is None."""
+        if self._uva_backend is not None:
+            return self._uva_backend
+        if self._uva_failed:
+            return None
+        try:
+            self._uva_backend = _PLEUVABackend(self, device)
+        except Exception:
+            logger.warning_rank0(
+                "[ple-uva] backend construction failed, falling back to the mmap "
+                "n-gram gather for the rest of this process (layer=%s)",
+                self.key_base, exc_info=True,
+            )
+            self._uva_failed = True
+            return None
+        return self._uva_backend
 
     def _load_ftw_ngram_locs(self) -> dict[str, tuple]:
         """Index FTW ``kind=ngram``/``kind=ngram_iq4nl`` tensors without reading
@@ -316,6 +359,28 @@ class _NGramTable:
             # (host sync, data-dependent shard loop, unpinned H2D) entirely and
             # returns zeros of the correct shape. Output is WRONG under this flag.
             return torch.zeros(*ids.shape, self.head_dim, dtype=out_dtype, device=device)
+        if (
+            _PLE_UVA
+            and self._iq4nl
+            and self._ftw_locs is not None
+            and device.type == "cuda"
+        ):
+            # See the module docstring / _PLEUVABackend: pinned-host + UVA Triton
+            # gather, no host sync / shard loop / unpinned H2D. Falls through to
+            # the mmap path below (unchanged) whenever the source isn't IQ4_NL/FTW,
+            # ids aren't on a CUDA device, or backend construction ever failed for
+            # this table (pin budget, missing extension, ...).
+            backend = self._uva_backend_for(device)
+            if backend is not None:
+                # No separate `* self.weight_scale` here (unlike the mmap path
+                # below): IQ4_NL has no per-tensor scale -- __init__ pins
+                # self.weight_scale == 1.0 whenever self._iq4nl is True (this
+                # branch's own guard), and the backend's kernel already applies
+                # each row's per-block scale (block_iq4_nl.d), same as
+                # _dequantize_iq4nl_rows does for the mmap path.
+                flat_dev = ids.reshape(-1)
+                rows = backend.gather(flat_dev, out_dtype)
+                return rows.reshape(*ids.shape, self.head_dim)
         flat = ids.reshape(-1).cpu()
         shard_idx = torch.div(flat, self.rows_per_shard, rounding_mode="floor")
         local = flat - shard_idx * self.rows_per_shard
@@ -325,6 +390,95 @@ class _NGramTable:
             rows = self._rows(int(s), local[mask])
             out[mask] = rows.to(out_dtype) * self.weight_scale
         return out.to(device).reshape(*ids.shape, self.head_dim)
+
+
+class _PLEUVABackend:
+    """Pinned-host + UVA Triton gather for the IQ4_NL n-gram table (FREETOKEN_PLE_UVA=1).
+
+    Mirrors upstream's ``PinnedUVATable`` / ``ple_gather_rows`` contract
+    (``/root/ft-upstream/python/freetoken/models/qwen4_exp/ple.py`` +
+    ``kernel/triton/ple.py``) but for this fork's IQ4_NL table instead of
+    upstream's FP8-e4m3 + one scalar scale -- see
+    ``freetoken.kernel.triton.ple``'s module docstring for the block layout the
+    kernel dequantizes.
+
+    Built lazily, once, by ``_NGramTable._uva_backend_for`` on the first CUDA
+    gather request (never at ``_NGramTable.__init__`` time -- see that method's
+    comment): copies every FTW ngram shard's raw bytes into ONE pinned host
+    buffer ``[num_rows, row_bytes]`` so a global row id addresses it directly
+    (``table_ptr + row_id * row_bytes``, no per-call shard lookup), then leaves
+    that buffer alive for the process's lifetime (device_ptr into it is handed to
+    the Triton kernel every gather).
+
+    WDDM (WSL) note (mirrors upstream ``PinnedUVATable``'s ``self._table_ptr``
+    comment): registered host memory is mapped at a DIFFERENT address for the GPU
+    to dereference than the host tensor's own ``data_ptr()`` under WDDM; on
+    Linux/UVA the two coincide. ``freetoken.kernel.pinned.device_ptr`` is the
+    address that is actually safe to hand to the kernel on both -- never
+    ``pinned.data_ptr()`` directly.
+    """
+
+    def __init__(self, table: "_NGramTable", device: torch.device) -> None:
+        from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+        from freetoken.kernel.triton.ple import KVALUES_IQ4NL
+
+        assert table._iq4nl and table._ftw_locs is not None, (
+            "PLE UVA backend only supports the GGUF-sourced IQ4_NL table (FTW "
+            "kind=ngram_iq4nl); the fp8 safetensors source is not implemented "
+            "here (see the assignment's option (b))"
+        )
+        self.head_dim = table.head_dim
+        assert self.head_dim % _IQ4NL_BLOCK_ELEMS == 0, self.head_dim
+        self.row_bytes = (self.head_dim // _IQ4NL_BLOCK_ELEMS) * _IQ4NL_BLOCK_BYTES
+        self.num_rows = table.rows_per_shard * table.split_parts
+
+        needed_bytes = self.num_rows * self.row_bytes
+        budget = _pin_budget_bytes_or_none()
+        if budget is not None and needed_bytes > budget:
+            raise RuntimeError(
+                f"PLE UVA table needs {needed_bytes / 2**30:.2f} GiB pinned host "
+                f"memory, over the {budget / 2**30:.2f} GiB budget "
+                f"(FREETOKEN_PIN_BUDGET_GB / WSL's default 40% of RAM)"
+            )
+
+        pinned = alloc_pinned_tensor(self.num_rows, self.row_bytes, dtype=torch.uint8)
+        for i in range(table.split_parts):
+            file, file_off, shape, dtype, nbytes = table._ftw_locs[
+                f"{table.key_base}.shard_{i}.weight"
+            ]
+            raw = table._ftw_u8(file)[file_off:file_off + nbytes].view(
+                table.rows_per_shard, self.row_bytes
+            )
+            pinned[i * table.rows_per_shard:(i + 1) * table.rows_per_shard].copy_(raw)
+        self._pinned = pinned  # keep alive: the kernel dereferences it by raw address
+        self._table_ptr = device_ptr(pinned)
+        self._device = device
+        self._lut = torch.tensor(KVALUES_IQ4NL, dtype=torch.float32, device=device)
+
+    def gather(self, ids_flat: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows_iq4nl
+
+        out = torch.empty(
+            ids_flat.numel(), self.head_dim, dtype=torch.float32, device=self._device
+        )
+        ple_gather_rows_iq4nl(
+            self._table_ptr, self.num_rows, self.head_dim, ids_flat, out, self._lut,
+        )
+        return out.to(out_dtype)
+
+
+def _pin_budget_bytes_or_none() -> int | None:
+    """Best-effort pin-budget query (see ``freetoken.engine.engine._pin_budget_bytes``).
+
+    Failure to import is non-fatal here: it just means this best-effort guard is
+    skipped and ``alloc_pinned_tensor`` is left to fail on its own (caught by
+    ``_NGramTable._uva_backend_for``) if the box genuinely can't pin this much."""
+    try:
+        from freetoken.engine.engine import _pin_budget_bytes
+
+        return _pin_budget_bytes()
+    except Exception:
+        return None
 
 
 def _shift_right_ignore_eos(token_ids: torch.Tensor, shift: int, eos: int) -> torch.Tensor:
